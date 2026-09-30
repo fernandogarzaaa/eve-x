@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EVE-X · Live Computer</title>
+<style>
+  :root { --bg:#0b0e13; --panel:#141a23; --line:#232c3a; --txt:#e8edf3; --mut:#93a1b5; --acc:#4da3ff; --ok:#3ecf8e; --warn:#ffb224; --bad:#ff5d5d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:15px; margin:0; letter-spacing:.04em; }
+  header .pill { font-size:12px; padding:2px 10px; border:1px solid var(--line); border-radius:999px; color:var(--mut); }
+  header .pill.live { color:var(--ok); border-color:var(--ok); }
+  main { display:grid; grid-template-columns: 1fr 340px; gap:12px; padding:12px; max-width:1400px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  #stage { position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:420px; }
+  #screen { width:100%; display:block; background:#000; }
+  #overlay { position:absolute; inset:0; pointer-events:none; }
+  .bbox { position:absolute; border:2px solid var(--acc); border-radius:4px; }
+  .bbox span { position:absolute; top:-20px; left:0; font-size:11px; background:var(--acc); color:#001; padding:0 6px; border-radius:4px; white-space:nowrap; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
+  button { background:#1d2634; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 12px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); color:#001a33; font-weight:600; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button:disabled { opacity:.45; cursor:default; }
+  #timeline { display:flex; gap:4px; overflow-x:auto; padding:8px 0; }
+  #timeline .tick { min-width:34px; text-align:center; font-size:11px; padding:6px 4px; border:1px solid var(--line); border-radius:6px; cursor:pointer; color:var(--mut); }
+  #timeline .tick.cur { border-color:var(--acc); color:var(--txt); }
+  #timeline .tick.human { border-color:var(--warn); }
+  #log { height:180px; overflow:auto; font-family:ui-monospace, Consolas, monospace; font-size:12px; background:#0a0d12; border:1px solid var(--line); border-radius:8px; padding:8px; }
+  label { font-size:12px; color:var(--mut); display:block; margin:8px 0 4px; }
+  input, select, textarea { width:100%; background:#0d1219; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  .kv { display:flex; justify-content:space-between; font-size:12px; color:var(--mut); padding:2px 0; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>EVE-X · Live Computer</h1>
+  <span class="pill" id="conn">disconnected</span>
+  <span class="pill" id="sessPill">no session</span>
+  <span style="flex:1"></span>
+  <span class="pill" id="clock">—</span>
+</header>
+<main>
+  <section>
+    <div class="card">
+      <div class="row">
+        <div><label>API base</label><input id="apiBase" value="http://localhost:8080" /></div>
+        <div><label>Session id</label><input id="sessionId" placeholder="sess-xxxxxxxx" /></div>
+        <div><label>Auth token</label><input id="token" type="password" placeholder="EVEX_AUTH_TOKEN" /></div>
+      </div>
+      <div class="toolbar">
+        <button id="btnConnect" class="primary">Connect stream</button>
+        <button id="btnObserve">Observe</button>
+        <button id="btnPause">Pause</button>
+        <button id="btnStep">Step</button>
+        <button id="btnTakeover">Takeover</button>
+        <button id="btnRelease">Release</button>
+        <button id="btnStop" class="danger">Stop</button>
+      </div>
+      <div id="stage">
+        <canvas id="screen" width="960" height="540"></canvas>
+        <div id="overlay"></div>
+      </div>
+      <div class="toolbar">
+        <button id="btnReplay">Replay</button>
+        <button id="btnTrace">Load trace</button>
+        <button id="btnReport">Report</button>
+        <button id="btnSnap">VM snapshot</button>
+      </div>
+      <div id="timeline"></div>
+      <div id="log"></div>
+    </div>
+  </section>
+  <aside>
+    <div class="card">
+      <h3 style="margin:0 0 8px">Session</h3>
+      <div class="kv"><span>Status</span><b id="kStatus">—</b></div>
+      <div class="kv"><span>Steps</span><b id="kSteps">0</b></div>
+      <div class="kv"><span>Human control</span><b id="kHuman">no</b></div>
+      <div class="kv"><span>Frame</span><b id="kFrame">—</b></div>
+      <label>Goal</label><textarea id="goal" rows="3" placeholder="What should the agent do?"></textarea>
+      <div class="toolbar"><button id="btnCreate">Create session</button></div>
+      <label>Act (type / click)</label>
+      <div class="row">
+        <input id="actType" value="click" />
+        <input id="actX" type="number" value="640" />
+        <input id="actY" type="number" value="400" />
+      </div>
+      <label>Text (for type)</label><input id="actText" placeholder="hello" />
+      <div class="toolbar"><button id="btnAct">Send act</button></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h3 style="margin:0 0 8px">Blind review</h3>
+      <label>Step id</label><input id="jStep" placeholder="step-xxxxxxxx" />
+      <div class="row">
+        <select id="jReasonable"><option value="true">reasonable</option><option value="false">not reasonable</option></select>
+        <select id="jTarget"><option value="true">target ok</option><option value="false">target wrong</option></select>
+      </div>
+      <label>Note</label><input id="jNote" placeholder="optional note" />
+      <div class="toolbar"><button id="btnJudge">Submit judgment</button></div>
+      <div class="kv"><span>Reviewer is blinded: action source hidden until submit.</span></div>
+    </div>
+  </aside>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

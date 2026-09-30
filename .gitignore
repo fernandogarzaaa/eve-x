@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.env
+artifacts/
+data/
+models/
+*.qcow2
+*.png
+coverage/

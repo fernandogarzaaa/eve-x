@@ -1,0 +1,144 @@
+name: eve-x
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: evex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evex}
+      POSTGRES_DB: evex
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evex"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-evex}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-evexevexevex}
+    volumes:
+      - miniadata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  inference:
+    build:
+      context: ../..
+      dockerfile: infra/vm-images/Dockerfile.inference
+    restart: unless-stopped
+    environment:
+      INFERENCE_PORT: 8090
+    ports:
+      - "${INFERENCE_PORT:-8090}:8090"
+    command: ["python", "ml/inference/server.py", "--host", "0.0.0.0", "--port", "8090", "--cpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health').status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/vm-images/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://evex:${POSTGRES_PASSWORD:-evex}@postgres:5432/evex
+      REDIS_URL: redis://redis:6379
+      OBJECT_ENDPOINT: http://minio:9000
+      INFERENCE_URL: http://inference:8090
+      EVEX_AUTH_TOKEN: ${EVEX_AUTH_TOKEN:-change-me}
+      DATA_DIR: /data
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - evexdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8080/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/vm-images/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://evex:${POSTGRES_PASSWORD:-evex}@postgres:5432/evex
+      REDIS_URL: redis://redis:6379
+      INFERENCE_URL: http://inference:8090
+      EVEX_AUTH_TOKEN: ${EVEX_AUTH_TOKEN:-change-me}
+      DATA_DIR: /data
+    command: ["node", "dist/apps/worker/index.js"]
+    volumes:
+      - evexdata:/data
+
+  mcp:
+    build:
+      context: ../..
+      dockerfile: infra/vm-images/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      EVEX_CONTROL_PLANE_URL: http://api:8080
+      EVEX_AUTH_TOKEN: ${EVEX_AUTH_TOKEN:-change-me}
+    command: ["node", "dist/apps/mcp/index.js"]
+    ports:
+      - "${MCP_PORT:-8081}:8081"
+
+  console:
+    build:
+      context: ../..
+      dockerfile: infra/vm-images/Dockerfile.console
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      EVEX_API_URL: http://api:8080
+    ports:
+      - "${CONSOLE_PORT:-3000}:3000"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniadata:
+  evexdata:

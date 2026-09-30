@@ -1,0 +1,40 @@
+{
+  "name": "eve-x",
+  "version": "1.0.0",
+  "description": "EVE-X: isolated-VM computer-use experience validation platform",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-static.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test dist/tests/*.test.js",
+    "test:all": "node --test dist/tests/*.test.js",
+    "doctor": "node dist/apps/cli/src/index.js doctor",
+    "server": "node dist/apps/api/src/index.js",
+    "worker": "node dist/apps/worker/src/index.js",
+    "mcp": "node dist/apps/mcp/src/index.js",
+    "cli": "node dist/apps/cli/src/index.js",
+    "benchmark": "node dist/apps/cli/src/index.js benchmark run",
+    "security:audit": "node scripts/security-audit.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0"
+  },
+  "bin": {
+    "eve-x": "dist/apps/cli/src/index.js"
+  }
+}

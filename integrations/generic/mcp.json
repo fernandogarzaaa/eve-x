@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "eve-x-stdio": {
+      "command": "node",
+      "args": ["dist/apps/mcp/index.js"],
+      "env": {
+        "EVEX_API_URL": "http://localhost:8080",
+        "EVEX_AUTH_TOKEN": "${EVEX_AUTH_TOKEN}"
+      }
+    },
+    "eve-x-http": {
+      "type": "streamable-http",
+      "url": "http://localhost:8091/mcp",
+      "headers": {
+        "Authorization": "Bearer ${EVEX_AUTH_TOKEN}"
+      }
+    }
+  }
+}
