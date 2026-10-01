@@ -15,7 +15,7 @@ Codex loads MCP servers from `~/.codex/config.toml`. Append
 ```toml
 [mcp_servers.eve-x]
 command = "node"
-args = ["dist/apps/mcp/index.js"]
+args = ["dist/apps/mcp/src/index.js"]
 ```
 
 Set `EVEX_API_URL` / `EVEX_AUTH_TOKEN` in the environment before `codex`.

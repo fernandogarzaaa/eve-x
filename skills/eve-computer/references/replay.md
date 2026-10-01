@@ -1,12 +1,17 @@
 # Deterministic replay
 
-Every step records `seed`, `candidate_actions`, `selected_action`, and
-`screens`. Replay re-runs the trace with the same seed:
+Every step records `seq`, `candidate_actions`, `selected_action`,
+`screen_before`/`screen_after`, and provenance. Replay re-checks the stored
+trace for continuity:
 
-```text
-eve_replay(sessionId, seed=42) → { replayed, verdict }
+```bash
+node skills/eve-computer/scripts/replay.mjs <sessionId>
+# → POST /v1/replay/{sessionId} → {sessionId, replayed, verdict, issues}
 ```
 
-Verdicts: `deterministic-replay-ok` means every reselected action matched the
-recorded one. Mismatches list diverging `seq` numbers — inspect those frames
-before trusting the run. Replay never touches the live VM.
+Or via MCP: `eve_replay({ sessionId })`.
+
+Verdicts: `deterministic-replay-ok` means seqs are contiguous from 0 with no
+duplicates or digest-chain breaks. `replay-divergent` lists the offending
+`issues` (gaps, duplicates, missing fields) — inspect those frames before
+trusting the run. Replay never touches the live VM.

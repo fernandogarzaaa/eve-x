@@ -13,7 +13,7 @@ Claude Code reads `.mcp.json` at the repo root or `~/.claude.json`. Point it
 at the EVE-X MCP server over stdio:
 
 ```bash
-claude mcp add eve-x -- node dist/apps/mcp/index.js
+claude mcp add eve-x -- node dist/apps/mcp/src/index.js
 ```
 
 Or copy `integrations/claude-code/mcp.json` to `.mcp.json`.

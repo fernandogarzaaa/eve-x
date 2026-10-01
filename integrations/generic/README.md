@@ -5,14 +5,14 @@ Any MCP-compatible client can use EVE-X over stdio or StreamableHTTP.
 ## Stdio
 
 ```bash
-node dist/apps/mcp/index.js
+node dist/apps/mcp/src/index.js
 # env: EVEX_API_URL=http://localhost:8080 EVEX_AUTH_TOKEN=...
 ```
 
 ## StreamableHTTP
 
 ```bash
-node dist/apps/mcp/index.js http   # :8091/mcp
+node dist/apps/mcp/src/index.js http   # :8091/mcp
 ```
 
 ## Config

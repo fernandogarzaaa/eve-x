@@ -12,7 +12,7 @@ eve-x doctor
 Hermes connects over StreamableHTTP for fleet use:
 
 ```bash
-node dist/apps/mcp/index.js http
+node dist/apps/mcp/src/index.js http
 ```
 
 then register `http://localhost:8091/mcp` with the Hermes router
@@ -22,4 +22,6 @@ then register `http://localhost:8091/mcp` with the Hermes router
 ## Invocation
 
 Create sessions per tenant, stream frames via `/v1/stream/:sessionId`, and
-collect judgments blind through `POST /v1/judgments`.
+collect judgments blind: `POST /v1/reviews` to enqueue (server strips
+confidence/rationale/prediction), then `POST /v1/judgments` with the
+`reviewId` to submit and unlock the full step.

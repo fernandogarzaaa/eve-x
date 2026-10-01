@@ -6,8 +6,13 @@ scores the experience with statistical rigor plus blinded human judgment.
 
 ## What it does
 
-1. **Provisions isolated guests** — every evaluation task boots from a clean,
-   reproducible qcow2 snapshot (see `VM.md`, `infra/vm-images/build.sh`).
+1. **Provisions isolated guests** — on Linux production hosts, every
+   evaluation task boots from a clean, reproducible qcow2 snapshot (see
+   `VM.md`, `infra/vm-images/build.sh`, `infra/deployment/linux-bootstrap.sh`
+   for the KVM/QEMU setup). On Windows dev machines there is no KVM/QEMU
+   backend, so the platform runs against the synthetic/process fallback —
+   guest isolation there is *not* VM-grade. Do not treat dev-host runs as
+   isolation evidence.
 2. **Drives computer use** — the agent observes screenshots with detected UI
    regions and emits `ActionIR` actions (click, type, drag, …) that the
    verifier grounds before execution (see `COMPUTER_USE.md`).
@@ -71,3 +76,12 @@ python --version  # sanity: scripts target stock Python 3.10+
 
 Further reading: `ARCHITECTURE.md` → `DEPLOYMENT.md` → `OPERATIONS.md`.
 Security posture: `SECURITY.md` + `THREAT_MODEL.md`.
+
+## Platform split
+
+- **Windows (dev):** `npm run build`, `npx tsc --noEmit`, `node --test`,
+  `eve-x doctor`, ML smoke tests. No KVM, no systemd, no containers required.
+- **Linux (prod):** `infra/deployment/linux-bootstrap.sh` (Ubuntu 24.04+,
+  KVM/QEMU, systemd units `evex-api/worker/mcp/console`), plus the compose
+  stack in `infra/deployment/docker-compose.yml`. Only Linux hosts provide
+  real VM isolation.

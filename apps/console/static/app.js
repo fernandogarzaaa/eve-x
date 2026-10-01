@@ -177,14 +177,42 @@ $("btnSnap").onclick = async () => {
 };
 $("btnJudge").onclick = async () => {
   const body = {
-    stepId: $("jStep").value.trim(), reviewer: "console",
+    stepId: $("jStep").value.trim(), reviewer: ($("jReviewer") ? $("jReviewer").value.trim() : "") || "console",
     reasonable: $("jReasonable").value === "true",
     targetCorrect: $("jTarget").value === "true",
     understandable: true, expected: true, recoveryOk: true,
     note: $("jNote").value || undefined,
   };
+  // Blind-mode: when a blind review was enqueued, submit against its reviewId.
+  // The server 409s a double-submit and returns the FULL step (unlock) on success.
+  if (pendingReviewId) body.reviewId = pendingReviewId;
   const r = await call(`/v1/judgments`, { method: "POST", body: JSON.stringify(body) }).catch((e) => { log(String(e.message || e)); return null; });
-  if (r) log(`judgment recorded ${r.id} (was blind until submit)`);
+  if (r) {
+    log(`judgment recorded ${r.id}${r.reviewId ? ` (review ${r.reviewId} complete — full step unlocked)` : " (direct submit, was NOT blinded)"}`);
+    if (r.full) {
+      const sel = r.full.selected_action || {};
+      log(`unlocked: type=${sel.type || "?"} confidence=${sel.confidence ?? "?"} outcome=${r.full.outcome || ""}`);
+    }
+    pendingReviewId = null;
+    $("kReview").textContent = "none";
+  }
+};
+// Server-side blind review: enqueue first (blind artifact has no confidence),
+// judge second. Never judge from a raw trace read — that is not blind.
+let pendingReviewId = null;
+$("btnBlind").onclick = async () => {
+  const sid = $("sessionId").value.trim();
+  const stepId = $("jStep").value.trim();
+  const r = await call(`/v1/reviews`, { method: "POST", body: JSON.stringify({ sessionId: sid, ...(stepId ? { stepId } : {}) }) }).catch((e) => { log(String(e.message || e)); return null; });
+  if (r) {
+    pendingReviewId = r.reviewId;
+    $("kReview").textContent = r.reviewId;
+    const b = r.blind || {};
+    const leaked = ["confidence", "rationale", "prediction", "verification", "score"].filter((k) => JSON.stringify(b).includes(`"${k}"`));
+    $("blindBox").textContent = `Blind ${r.reviewId} · step ${b.stepId || "?"} · ` +
+      (leaked.length === 0 ? "clean (no model-revealing fields)" : `LEAKED FIELDS: ${leaked.join(",")}`);
+    log(`blind review ${r.reviewId} enqueued — judge what you see, then Submit judgment`);
+  }
 };
 setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
 log("console ready — create a session, then Connect stream.");

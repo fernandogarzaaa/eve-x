@@ -6,20 +6,59 @@ Version: `mcp/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`).
 
 | Tool | Input | Effect |
 |---|---|---|
-| `vm.create` | image/snapshot/size/locale/network | Provision an isolated guest |
-| `vm.control` | vmId, op (boot/shutdown/reboot/pause/resume/snapshot/restore/fork/destroy) | Lifecycle transition |
-| `computer.observe` | vmId, includeScreenshot, maxWidth | Capture frame + regions |
-| `computer.act` | vmId, taskId, ActionIR, idempotencyKey | Execute one validated action |
-| `task.execute` | full `TaskSpec` | Launch a seeded evaluation task |
-| `trace.read` | sessionId, fromSeq, limit | Paginated trace read |
-| `trace.export` | sessionId, format | Full trace export |
-| `human.takeover` | sessionId, stepId, reason | Escalate to an operator |
-| `model.invoke` | modelId, frame, goal, regions, timeout | Route a percept to inference |
+| `eve_session_create` | goal (≤2000), persona, seed, maxSteps | `POST /v1/sessions` — create session + VM |
+| `eve_session_status` | sessionId | `GET /v1/sessions/:id` |
+| `eve_session_stop` | sessionId | `POST /v1/sessions/:id/stop` |
+| `eve_vm_create` | image, cpu, memoryMb | `POST /v1/vms` — provision a guest |
+| `eve_vm_status` | vmId | `GET /v1/vms/:id/status` |
+| `eve_vm_snapshot` | vmId, label? | `POST /v1/vms/:id/snapshot` |
+| `eve_vm_restore` | vmId, snapshot? | `POST /v1/vms/:id/restore` |
+| `eve_vm_fork` | vmId | `POST /v1/vms/:id/fork` |
+| `eve_computer_observe` | sessionId | `GET /v1/computer/:sessionId/observe` |
+| `eve_computer_act` | sessionId, 17-action `type`, x/y/text/keys (≤8)/ms/confidence/frameId/idempotencyKey | `POST /v1/computer/:sessionId/act` (flat body) |
+| `eve_human_request` | sessionId, reason? | `POST /v1/human/request` |
+| `eve_human_takeover` | sessionId | `POST /v1/human/takeover` |
+| `eve_human_release` | sessionId | `POST /v1/human/release` |
+| `eve_task_start` | goal (≤2000), persona, seed | `POST /v1/tasks/start` |
+| `eve_task_status` | taskId | `GET /v1/tasks/:id/status` |
+| `eve_task_validate` | taskId | `POST /v1/tasks/:id/validate` |
+| `eve_trace_get` | sessionId | `GET /v1/trace/:sessionId` |
+| `eve_replay` | sessionId, seed | `POST /v1/replay/:sessionId` |
+| `eve_report` | sessionId | `GET /v1/report/:sessionId` |
+| `eve_benchmark` | name, size | `POST /v1/benchmarks` |
+| `eve_model_status` | (none) | `GET /v1/models/status` |
 
-All inputs are zod schemas in `TOOL_SCHEMAS`; `parseToolInput` throws on
-violation, `safeParseToolInput` returns structured issues. Both the MCP
-server and clients import these from `packages/mcp-shared`, so the wire
-contract has exactly one definition.
+All inputs are strict zod schemas in `TOOL_SCHEMAS`; unknown fields, wrong
+types, oversized strings (`goal` ≤ 2000, `text` ≤ 4096, `keys` ≤ 8), and
+off-charset ids (`[A-Za-z0-9_-]{1,128}`) are rejected as `invalid-params`
+before any fetch. `parseToolInput` throws on violation,
+`safeParseToolInput` returns structured issues. Both the MCP server and
+clients import these from `packages/mcp-shared`, so the wire contract has
+exactly one definition.
+
+## Transport & auth
+
+- Default transport is `stdio`: `node dist/apps/mcp/src/index.js`. Stdio
+  tools authenticate to the control plane with the server-side
+  `EVEX_AUTH_TOKEN`.
+- `http` argv (`node …/index.js http`, `MCP_PORT` override, default `:8091`)
+  serves StreamableHTTP at `/mcp` plus a public `GET /health` probe.
+- HTTP `/mcp` requires an `Authorization` bearer matching
+  `EVEX_MCP_TOKEN ?? EVEX_AUTH_TOKEN` whenever either is set (401
+  otherwise). When neither is set the endpoint stays open for single-user
+  local use and stamps `x-evex-dev: 1` on responses.
+- The CALLER's bearer is forwarded to the control plane on every tool call;
+  only when the caller sent none is `EVEX_AUTH_TOKEN` used as a fallback.
+  Token values are never logged.
+- There is no loopback stub: every tool requires a reachable control plane
+  at `EVEX_API_URL` (default `http://localhost:8080`). API unreachable →
+  a clear `{error: "unreachable"}` result; hung API → `{error: "timeout"}`
+  after 30 s (`EVEX_API_TIMEOUT_MS` overrides).
+- API statuses map to MCP error classes: 400 `invalid-params`, 401
+  `unauthorized`, 403 `forbidden`, 404 `not-found`, 409 `conflict` (with a
+  `stale_perception` re-observe hint when applicable), 429 `rate-limited`
+  (retryable), 5xx `internal` as a one-line summary with no body internals
+  and no stack traces.
 
 ## Client (`ControlPlaneClient`)
 
@@ -31,8 +70,15 @@ Fetch-based, no SDK:
 - Per-request `AbortController` timeout (default 15 s) mapped to a
   `ControlPlaneError(status 0)` timeout error; HTTP errors map to
   `ControlPlaneError` with status + body preserved.
-- `act()` sends the `idempotency-key` header; `readTrace()` encodes
-  pagination; `observe()`/`act()` validate inputs before sending.
+- Typed helpers mirror the real routes exactly: root probes (`health`,
+  `ready`, `metricsText`), sessions (`list/create/get/pause/step/stop`),
+  VMs (`list/create/get/status/snapshot/restore/fork/delete`), computer
+  (`observe`, `act` with a flat body), human
+  (`request/takeover/release`), tasks (`start/status/validate`),
+  `readTrace`/`replaySession`/`sessionReport`, `submitJudgment`,
+  `runBenchmark`/`benchmarkStatus`, `modelStatus`, plus `streamPath` for
+  `WS /v1/stream/:sessionId`. `act()` sends the `idempotency-key` header;
+  ids are charset-validated before sending.
 
 ## Versioning (ADR-10)
 

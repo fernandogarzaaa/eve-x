@@ -2,7 +2,7 @@
   "mcp": {
     "eve-x": {
       "type": "local",
-      "command": ["node", "dist/apps/mcp/index.js"],
+      "command": ["node", "dist/apps/mcp/src/index.js"],
       "environment": {
         "EVEX_API_URL": "http://localhost:8080",
         "EVEX_AUTH_TOKEN": "${EVEX_AUTH_TOKEN}"

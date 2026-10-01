@@ -14,7 +14,7 @@ OpenCode reads `opencode.json`. Merge `integrations/opencode/mcp.json`:
 ```json
 {
   "mcp": {
-    "eve-x": { "type": "local", "command": ["node", "dist/apps/mcp/index.js"],
+    "eve-x": { "type": "local", "command": ["node", "dist/apps/mcp/src/index.js"],
       "environment": { "EVEX_API_URL": "http://localhost:8080" } }
   }
 }

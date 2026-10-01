@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, rmSync, statSync } from "node:fs";
-import { join, basename } from "node:path";
+import {
+  appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync,
+  writeFileSync, rmSync, statSync, openSync, readSync, closeSync,
+} from "node:fs";
+import { join, basename, resolve, sep } from "node:path";
 
 // NOTE: optional `pg`/`redis` driver types live in ./opt-deps.d.ts (ambient,
 // global script). Runtime always resolves lazily with file fallback.
@@ -26,6 +29,9 @@ const COLLECTIONS: CollectionName[] = [
   "sessions", "tasks", "vms", "users", "models",
   "experiments", "judgments", "trace-meta", "benchmarks", "leases",
 ];
+
+const TRACE_TAIL_BYTES = 256 * 1024;
+const TRACE_MAX_BYTES = 256 * 1024 * 1024;
 
 function dataDir(): string {
   return process.env["DATA_DIR"] ?? "./data";
@@ -119,6 +125,25 @@ export class DataStore {
     return this.put(coll, { ...cur, ...patch, id });
   }
 
+  /**
+   * Optimistic-concurrency patch: applies `patch` only when the stored
+   * document's `updatedAt` still equals `expectedUpdatedAt`. Returns the
+   * updated doc, null when the doc is missing, and throws on conflict.
+   */
+  compareAndSwap(
+    coll: CollectionName,
+    id: string,
+    expectedUpdatedAt: string,
+    patch: Record<string, unknown>,
+  ): StoreDoc | null {
+    const cur = this.get(coll, id);
+    if (!cur) return null;
+    if (cur["updatedAt"] !== expectedUpdatedAt) {
+      throw new Error(`CAS_CONFLICT: ${coll}/${id} changed (expected updatedAt ${expectedUpdatedAt})`);
+    }
+    return this.put(coll, { ...cur, ...patch, id });
+  }
+
   remove(coll: CollectionName, id: string): boolean {
     try {
       const p = docPath(coll, id);
@@ -139,13 +164,49 @@ export class DataStore {
 
   appendTrace(sessionId: string, step: Record<string, unknown>): void {
     ensureDirs();
-    appendFileSync(this.tracePath(sessionId), JSON.stringify(step) + "\n", "utf8");
+    const p = this.tracePath(sessionId);
+    try {
+      if (existsSync(p) && statSync(p).size > TRACE_MAX_BYTES) {
+        throw new Error(`trace file for ${sessionId} exceeds 256MB cap; refusing append`);
+      }
+    } catch (err) {
+      // Re-throw cap violations and unexpected stat failures alike: callers
+      // map this to 507/500. Never silently drop trace data.
+      if (err instanceof Error && /exceeds 256MB/.test(err.message)) throw err;
+      throw err;
+    }
+    appendFileSync(p, JSON.stringify(step) + "\n", "utf8");
   }
 
+  /**
+   * Tail-read: scan only the last ~256KB (back to the first newline) instead
+   * of loading the whole file, then parse up to `limit` trailing lines.
+   */
   readTrace(sessionId: string, limit = 1000): Array<Record<string, unknown>> {
     const p = this.tracePath(sessionId);
     if (!existsSync(p)) return [];
-    const lines = readFileSync(p, "utf8").split("\n").filter(Boolean);
+    let text: string;
+    try {
+      const size = statSync(p).size;
+      if (size <= TRACE_TAIL_BYTES + 4096) {
+        text = readFileSync(p, "utf8");
+      } else {
+        const fd = openSync(p, "r");
+        try {
+          const buf = Buffer.alloc(TRACE_TAIL_BYTES);
+          readSync(fd, buf, 0, TRACE_TAIL_BYTES, size - TRACE_TAIL_BYTES);
+          let s = buf.toString("utf8");
+          const nl = s.indexOf("\n");
+          if (nl >= 0) s = s.slice(nl + 1); // drop the partial first line
+          text = s;
+        } finally {
+          closeSync(fd);
+        }
+      }
+    } catch {
+      return [];
+    }
+    const lines = text.split("\n").filter(Boolean);
     const tail = lines.slice(Math.max(0, lines.length - limit));
     const out: Array<Record<string, unknown>> = [];
     for (const l of tail) {
@@ -175,13 +236,26 @@ export class DataStore {
     return { blobId, kind, bytes: st.size, path: rel };
   }
 
+  /**
+   * Resolve a blob pointer/relative path inside the object dir. Normalizes
+   * and enforces containment — throws on any path escape (e.g. "../..").
+   */
   blobFullPath(pointerOrRel: BlobPointer | string): string {
     const rel = typeof pointerOrRel === "string" ? pointerOrRel : pointerOrRel.path;
-    return join(objectDir(), rel);
+    const base = resolve(objectDir());
+    const full = resolve(base, rel);
+    if (full !== base && !full.startsWith(base + sep)) {
+      throw new Error(`blob path escapes object dir: ${rel}`);
+    }
+    return full;
   }
 
   blobExists(pointerOrRel: BlobPointer | string): boolean {
-    return existsSync(this.blobFullPath(pointerOrRel));
+    try {
+      return existsSync(this.blobFullPath(pointerOrRel));
+    } catch {
+      return false;
+    }
   }
 }
 

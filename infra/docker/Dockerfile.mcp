@@ -1,0 +1,19 @@
+# EVE-X MCP server image (stdio by default; `http` arg serves :8091/mcp).
+# Build from the repo root: docker build -f infra/docker/Dockerfile.mcp .
+FROM node:20-slim AS base
+ENV NODE_ENV=production \
+    MCP_PORT=8091 \
+    EVEX_API_URL=http://api:8080
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev --no-audit --no-fund \
+  && npm cache clean --force
+COPY dist ./dist
+RUN useradd --system --create-home --home-dir /home/evex evex \
+  && chown -R evex:evex /app
+EXPOSE 8091
+USER evex
+# stdio servers expose no port: health = bundle loads cleanly.
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD node --check dist/apps/mcp/src/index.js
+CMD ["node", "dist/apps/mcp/src/index.js"]

@@ -276,6 +276,7 @@ export class ComputerRuntime {
   private readonly clipboard: ClipboardHooks | null;
   private readonly opts: ComputerRuntimeOptions;
   private cursor = { x: 0, y: 0 };
+  private lastFrameId: string | null = null;
 
   constructor(frame: FrameSource, input: VncInput, clipboard: ClipboardHooks | null, optsInput: unknown = {}) {
     if (!(frame instanceof FrameSource)) throw new EveError("BAD_ARG", "frame must be a FrameSource");
@@ -297,6 +298,7 @@ export class ComputerRuntime {
     let png = this.frame.latest();
     if (!png) png = await this.frame.pollOnce();
     const frameId = uid("frame");
+    this.lastFrameId = frameId;
     const a = analyzePng(png, this.opts.channel);
     return ComputerPercept.parse({
       frameId,
@@ -320,7 +322,29 @@ export class ComputerRuntime {
   async screenshot(): Promise<string> {
     let png = this.frame.latest();
     if (!png) png = await this.frame.pollOnce();
+    this.lastFrameId = uid("frame");
     return png.toString("base64");
+  }
+
+  /** Last frameId from observe()/screenshot(), or null before first perception. */
+  observedFrameId(): string | null {
+    return this.lastFrameId;
+  }
+
+  /**
+   * Stale-perception guard: when the caller passes the frameId it grounded
+   * against, refuse to touch input if perception has moved on. Never throws
+   * when no expectation is given (backward compatible).
+   */
+  private checkFresh(expectedFrameIdInput?: string): void {
+    if (expectedFrameIdInput === undefined) return;
+    const expectedFrameId = z.string().min(1).max(128).parse(expectedFrameIdInput);
+    if (expectedFrameId !== this.lastFrameId) {
+      throw new EveError(
+        "STALE_PERCEPTION",
+        `Stale perception: grounded on ${expectedFrameId} but last observed is ${this.lastFrameId ?? "none"}; re-observe before acting`,
+      );
+    }
   }
 
   async movePointer(xInput: number, yInput: number): Promise<void> {
@@ -329,7 +353,8 @@ export class ComputerRuntime {
     this.cursor = p;
   }
 
-  async click(xInput: number, yInput: number, button: "left" | "right" | "middle" = "left"): Promise<void> {
+  async click(xInput: number, yInput: number, button: "left" | "right" | "middle" = "left", expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const p = this.clamp(Point.parse({ x: xInput, y: yInput }));
     const mask = button === "right" ? 2 : button === "middle" ? 4 : 1;
     await this.input.pointer(p.x, p.y, 0);
@@ -338,7 +363,8 @@ export class ComputerRuntime {
     this.cursor = p;
   }
 
-  async doubleClick(xInput: number, yInput: number): Promise<void> {
+  async doubleClick(xInput: number, yInput: number, expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const p = this.clamp(Point.parse({ x: xInput, y: yInput }));
     for (let i = 0; i < 2; i++) {
       await this.input.pointer(p.x, p.y, 1);
@@ -347,7 +373,8 @@ export class ComputerRuntime {
     this.cursor = p;
   }
 
-  async drag(fromInput: { x: number; y: number }, toInput: { x: number; y: number }): Promise<void> {
+  async drag(fromInput: { x: number; y: number }, toInput: { x: number; y: number }, expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const from = this.clamp(Point.parse(fromInput));
     const to = this.clamp(Point.parse(toInput));
     await this.input.pointer(from.x, from.y, 0);
@@ -357,7 +384,8 @@ export class ComputerRuntime {
     this.cursor = to;
   }
 
-  async type(textInput: string): Promise<void> {
+  async type(textInput: string, expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const text = z.string().max(4096).parse(textInput);
     for (const ch of text) {
       if (ch === "\n") {
@@ -374,7 +402,8 @@ export class ComputerRuntime {
     }
   }
 
-  async key(nameInput: string): Promise<void> {
+  async key(nameInput: string, expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const name = z.string().min(1).max(64).parse(nameInput);
     const sym = KEYSYMS[name];
     if (sym === undefined) throw new EveError("BAD_KEY", `Unknown key: ${name}`);
@@ -382,7 +411,8 @@ export class ComputerRuntime {
     await this.input.key(sym, false);
   }
 
-  async hotkey(namesInput: string[]): Promise<void> {
+  async hotkey(namesInput: string[], expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const names = z.array(z.string().min(1).max(64)).min(1).max(4).parse(namesInput);
     const syms = names.map((n) => {
       const s = KEYSYMS[n];
@@ -393,7 +423,8 @@ export class ComputerRuntime {
     for (let i = syms.length - 1; i >= 0; i--) await this.input.key(syms[i] ?? 0, false);
   }
 
-  async scroll(dxInput: number, dyInput: number): Promise<void> {
+  async scroll(dxInput: number, dyInput: number, expectedFrameId?: string): Promise<void> {
+    this.checkFresh(expectedFrameId);
     const dx = z.number().int().min(-20).max(20).parse(dxInput);
     const dy = z.number().int().min(-20).max(20).parse(dyInput);
     const steps = Math.max(Math.abs(dx), Math.abs(dy));

@@ -159,7 +159,10 @@ export class SafetyPolicyVerifier {
   check(taskInput: unknown, actionInput: unknown): SafetyVerdict {
     const task = TaskSpec.parse(taskInput);
     const action = ActionIR.parse(actionInput);
-    const hay = `${action.intent ?? ""}\n${action.text ?? ""}\n${action.type}`;
+    const target = (action.target ?? {}) as { label?: unknown };
+    // NOTE: key names are deliberately excluded: a lone "Delete" keypress is
+    // ordinary editing, and key names cannot express destructive commands.
+    const hay = `${action.intent ?? ""}\n${action.text ?? ""}\n${action.type}\n${typeof target.label === "string" ? target.label : ""}`;
     for (const rule of CATEGORY_RULES) {
       if (!rule.patterns.some((p) => p.test(hay))) continue;
       if (task.policy.requireApprovalFor.includes(rule.approvalKey)) {

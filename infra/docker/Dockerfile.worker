@@ -1,0 +1,21 @@
+# EVE-X worker image (shares the node bundle with the API; runs the worker entry).
+# Build from the repo root: docker build -f infra/docker/Dockerfile.worker .
+FROM node:20-slim AS base
+ENV NODE_ENV=production \
+    DATA_DIR=/data \
+    OBJECT_DIR=/data/objects \
+    EVEX_API_URL=http://api:8080
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev --no-audit --no-fund \
+  && npm cache clean --force
+COPY dist ./dist
+RUN useradd --system --create-home --home-dir /home/evex evex \
+  && mkdir -p /data /data/objects \
+  && chown -R evex:evex /app /data
+VOLUME ["/data"]
+USER evex
+# The worker serves no HTTP: health = control-plane reachability from this host.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD node -e "fetch((process.env.EVEX_API_URL||'http://api:8080')+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+CMD ["node", "dist/apps/worker/src/index.js"]

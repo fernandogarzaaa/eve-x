@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-// Replay helper: replay.mjs <sessionId> [seed].
-const base = (process.env.EVEX_API_URL ?? "http://localhost:8080").replace(/\/$/, "");
+// Replay helper: POST /v1/replay/:sessionId (body {seed} is accepted and
+// ignored by the deterministic checker) → {sessionId, replayed, verdict, issues}.
+const base = (process.env.EVEX_API_URL ?? process.env.EVEX_CONTROL_PLANE_URL ?? "http://localhost:8080").replace(/\/$/, "");
 const token = process.env.EVEX_AUTH_TOKEN ?? "";
-const sessionId = process.argv[2];
-const seed = Number(process.argv[3] ?? 42);
-if (!sessionId) {
+
+const raw = process.argv.slice(2);
+if (raw.length === 0 || raw.includes("--help") || raw.includes("-h")) {
   console.error("usage: replay.mjs <sessionId> [seed]");
+  process.exit(2);
+}
+const sessionId = raw[0];
+const seed = Number(raw[1] ?? 42);
+if (!Number.isInteger(seed)) {
+  console.error("replay.mjs: seed must be an integer");
   process.exit(2);
 }
 const res = await fetch(`${base}/v1/replay/${encodeURIComponent(sessionId)}`, {

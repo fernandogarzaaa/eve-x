@@ -1,0 +1,22 @@
+# EVE-X control-plane API image.
+# Build from the repo root: docker build -f infra/docker/Dockerfile.api .
+FROM node:20-slim AS base
+ENV NODE_ENV=production \
+    PORT=8080 \
+    DATA_DIR=/data \
+    OBJECT_DIR=/data/objects
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev --no-audit --no-fund \
+  && npm cache clean --force
+COPY dist ./dist
+COPY apps/console/static ./apps/console/static
+RUN useradd --system --create-home --home-dir /home/evex evex \
+  && mkdir -p /data /data/objects \
+  && chown -R evex:evex /app /data
+VOLUME ["/data"]
+EXPOSE 8080
+USER evex
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD node -e "fetch('http://localhost:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+CMD ["node", "dist/apps/api/src/index.js"]

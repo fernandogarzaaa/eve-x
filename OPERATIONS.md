@@ -2,12 +2,33 @@
 
 ## Daily rhythm
 
-- Check `/v1/health` on api + inference `/health`; confirm `/ready` is 200
+- Check `/health` on api + inference `/health`; confirm `/ready` is 200
   (unready means degraded heuristic mode — serving, but investigate).
 - Review worker backlog (Redis queue depth) and VM fleet states; any VM in
   `FAILED` longer than 15 min gets destroyed and reprovisioned.
 - Scan the governance audit log for 403/409 spikes — a burst of policy
   denials usually means a misconfigured task policy, not an attack.
+
+## Systemd (Linux prod, installed by `infra/deployment/linux-bootstrap.sh`)
+
+Units (all `Restart=always`, `NoNewPrivileges=true`, `ProtectSystem=strict`,
+read-write only on `/var/lib/evex`):
+
+- `evex-api.service` — `node dist/apps/api/src/index.js` (`PORT=8080`)
+- `evex-worker.service` — `node dist/apps/worker/src/index.js`
+- `evex-mcp.service` — `node dist/apps/mcp/src/index.js` (stdio; `MCP_PORT=8091` for `http` mode)
+- `evex-console.service` — `node dist/apps/console/src/index.js` (`CONSOLE_PORT=3000`)
+
+```bash
+systemctl status evex-api evex-worker evex-mcp evex-console
+journalctl -u evex-api -f
+systemctl restart evex-worker   # picks up a fresh dist bundle
+```
+
+The bootstrap script is idempotent — re-run it after pulling a new release,
+then restart the units. Sysctl baseline lives in
+`/etc/sysctl.d/99-evex.conf` (`fs.file-max`, `net.core.somaxconn`,
+`vm.max_map_count`).
 
 ## Runbooks
 
@@ -24,8 +45,9 @@ Trace reads are seq-paginated — cap `--limit`, add retention on screenshots
 older than the configured window, and confirm `pgdata` volume growth.
 
 **Stuck VM.**
-`vm control <id> --op shutdown --reason …`; on 409, follow the legal edge
-(e.g. `STOPPING` → `STOPPED`, then destroy). Never delete overlays by hand.
+`eve-x vm status <id>` to confirm state; stop the session
+(`eve-x session stop <id>`), then `eve-x vm rm <id>` and reprovision from
+the clean snapshot. Never delete overlays by hand.
 
 ## Backups
 

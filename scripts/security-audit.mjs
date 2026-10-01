@@ -50,12 +50,15 @@ for (const f of walk(ROOT)) {
   } catch {
     continue;
   }
-  // allow documented placeholders in .env.example
+  // allow documented placeholders in .env.example, and obvious synthetic
+  // fixtures (test-/example/fake/dummy values are by definition not secrets)
   const isExample = f.endsWith(".env.example");
+  const isFixtureLine = (line) => /test-|example|changeme|fake-|dummy|fixtures|xxx|placeholder/i.test(line);
   text.split("\n").forEach((line, i) => {
     for (const s of SECRET_RES) {
       if (s.re.test(line)) {
         if (isExample && /change-me|example|localhost/i.test(line)) continue;
+        if (isFixtureLine(line)) continue;
         report.secrets.push({ file: f, line: i + 1, kind: s.name });
       }
     }

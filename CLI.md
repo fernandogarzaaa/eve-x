@@ -1,28 +1,37 @@
 # CLI
 
-Binary: `eve-x` (`dist/apps/cli/index.js`). All commands honor `--json` for
+Binary: `eve-x` (`dist/apps/cli/src/index.js`). All commands honor `--json` for
 scripting and exit non-zero with `{code, message}` on failure.
 
 ## Commands
 
 ```
-eve-x doctor                        # environment + dependency sanity report
-eve-x vm create --image ubuntu-desktop-v1 --cpu 4 --mem 8192
-eve-x vm control <vmId> --op pause --reason "operator hold"
-eve-x vm destroy <vmId>
-eve-x task run --goal "open settings" --seed 42 --persona first-time-user
-eve-x trace read <sessionId> --from 0 --limit 100
-eve-x trace export <sessionId> --format jsonl --out session.jsonl
-eve-x benchmark run --benchmark eve-ground-v1 --split test
-eve-x model list | register | promote --approval-token <token>
-eve-x skill install ./my-skill --platform opencode
-eve-x skill verify pdf-triage --platform opencode
-eve-x server | worker | mcp          # run plane components in foreground
+eve-x init [--dir <path>]               scaffold data dirs + .env
+eve-x doctor                            environment + dependency sanity report
+eve-x vm create [--image N] [--cpu N]   create a VM
+eve-x vm status <id>                    VM status
+eve-x vm rm <id> | vm destroy <id>      destroy a VM
+eve-x session create --goal "..."       create session
+eve-x session status <id>               session status
+eve-x session stop <id>                 stop a session
+eve-x benchmark run [--size N]          run benchmark suite
+eve-x report <sessionId>                print session report
+eve-x model status                      inference backend status
+eve-x dataset ls                        list sessions (dataset helper)
+eve-x dataset trace <sessionId>         print session trace
+eve-x server | console | worker | mcp   run plane components in foreground
+                                        (delegates to dist bundles; see package.json scripts)
 ```
+
+Computer observe/act over HTTP is covered by the skill scripts
+(`skills/eve-computer/scripts/observe.mjs`, `act.mjs`, `replay.mjs`) and the
+MCP tools (`eve_computer_observe`, `eve_computer_act`); the CLI has no
+`task run`, `trace read/export`, `model list/register/promote`, or
+`skill install/verify` subcommands.
 
 ## Environment
 
-`EVEX_CONTROL_PLANE_URL` (default `http://localhost:8080`),
+`EVEX_API_URL` (default `http://localhost:8080`),
 `EVEX_AUTH_TOKEN` (required for every command except `doctor`),
 `EVEX_CONTROL_PLANE_TIMEOUT_MS` (default 15000).
 

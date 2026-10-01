@@ -67,6 +67,23 @@ export interface VmDriver {
 
 export const SnapshotName = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/);
 
+// V13: single snapshot-label validator shared by every driver. Rejects empty
+// and overlong labels (regex requires 1–64 chars); drivers must call this
+// instead of inlining their own checks.
+export function validateSnapshotLabel(name: string): string {
+  return SnapshotName.parse(name);
+}
+
+// V7: docker image names are interpolated into `docker run` argv. Constrain
+// the alphabet so a hostile spec cannot smuggle flags or shell metacharacters.
+const DOCKER_IMAGE_RE = /^[a-z0-9._/:~-]{1,128}$/i;
+export function validateDockerImage(image: string): string {
+  if (!DOCKER_IMAGE_RE.test(image)) {
+    throw new EveError("BAD_IMAGE", `Illegal docker image name: ${image}`);
+  }
+  return image;
+}
+
 // ── Small process helper (real spawn, no shell) ──────────────────────────────
 
 export interface CmdResult {
@@ -106,6 +123,10 @@ export async function hasBinary(cmd: string, probeArgs: readonly string[] = ["--
 
 type QmpResponse = Record<string, unknown>;
 
+// V11: hard cap on buffered inbound QMP bytes; a chatty or hostile peer must
+// not be able to grow memory without bound.
+const QMP_MAX_BUF = 4 * 1024 * 1024;
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -118,45 +139,64 @@ export class QmpConnection {
 
   connect(sockPath: string, timeoutMs = 15000): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      this.buf = "";
       const sock: Socket = createConnection({ path: sockPath });
       const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
-        sock.destroy();
-        reject(new EveError("QMP_TIMEOUT", `QMP connect timed out: ${sockPath}`));
+        try { sock.destroy(); } catch { /* already gone */ }
+        finish(() => reject(new EveError("QMP_TIMEOUT", `QMP connect timed out: ${sockPath}`)));
       }, timeoutMs);
       let greeted = false;
       let done = false;
       const finish = (fn: () => void): void => {
         if (!done) { done = true; clearTimeout(timer); fn(); }
       };
-      sock.on("error", (err: Error) => {
-        finish(() => reject(new EveError("QMP_CONNECT", `QMP socket error: ${err.message}`)));
-      });
+      // V1: exactly ONE data listener for the life of the socket. Before the
+      // greeting it scans for the banner; after the greeting the same listener
+      // pumps replies. A second listener would buffer every post-greeting
+      // chunk twice and corrupt JSON framing, so it must never be added.
       sock.on("data", (chunk: Buffer) => {
         this.buf += chunk.toString("utf8");
+        if (this.buf.length > QMP_MAX_BUF) {
+          const flood = new EveError("QMP_FLOOD", "QMP buffer exceeded 4MB; closing connection");
+          this.buf = "";
+          this.failAll(flood);
+          try { sock.destroy(); } catch { /* already gone */ }
+          finish(() => reject(flood));
+          return;
+        }
         if (!greeted) {
           const nl = this.buf.indexOf("\n");
           if (nl < 0) return;
           const line = this.buf.slice(0, nl);
           this.buf = this.buf.slice(nl + 1);
           if (!line.includes("\"QMP\"")) {
+            this.buf = "";
+            try { sock.destroy(); } catch { /* already gone */ }
             finish(() => reject(new EveError("QMP_GREETING", "Unexpected QMP greeting")));
-            sock.destroy();
             return;
           }
           greeted = true;
           this.sock = sock;
-          sock.on("data", (c: Buffer) => {
-            this.buf += c.toString("utf8");
-            this.pump();
-          });
-          sock.on("error", (err: Error) => this.failAll(err));
           // negotiate capabilities, then resolve
           this.commandRaw("qmp_capabilities").then(
             () => finish(() => resolve()),
-            (err: Error) => finish(() => reject(err)),
+            (err: Error) => {
+              try { sock.destroy(); } catch { /* already gone */ }
+              finish(() => reject(err));
+            },
           );
-          return;
         }
+        this.pump();
+      });
+      sock.on("error", (err: Error) => {
+        if (!greeted) {
+          finish(() => reject(new EveError("QMP_CONNECT", `QMP socket error: ${err.message}`)));
+        } else {
+          this.failAll(err);
+        }
+      });
+      sock.on("close", () => {
+        this.failAll(new EveError("QMP_CLOSED", "QMP socket closed"));
       });
     });
   }
@@ -189,7 +229,9 @@ export class QmpConnection {
     this.pending.clear();
   }
 
-  private commandRaw(execute: string, args?: Record<string, unknown>): Promise<QmpResponse> {
+  // V12: callers that drive slow monitor operations (savevm/loadvm) pass a
+  // larger timeout instead of sharing the 10s interactive default.
+  private commandRaw(execute: string, args?: Record<string, unknown>, timeoutMs = 10000): Promise<QmpResponse> {
     const sock = this.sock;
     if (!sock || sock.destroyed) return Promise.reject(new EveError("QMP_CLOSED", "QMP socket is closed"));
     const id = this.nextId++;
@@ -198,7 +240,7 @@ export class QmpConnection {
       const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
         this.pending.delete(id);
         reject(new EveError("QMP_TIMEOUT", `QMP command timed out: ${execute}`));
-      }, 10000);
+      }, timeoutMs);
       this.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
@@ -213,8 +255,12 @@ export class QmpConnection {
     });
   }
 
-  command(execute: string, args?: Record<string, unknown>): Promise<QmpResponse> {
-    return this.commandRaw(execute, args);
+  command(execute: string, args?: Record<string, unknown>, timeoutMs = 10000): Promise<QmpResponse> {
+    return this.commandRaw(execute, args, timeoutMs);
+  }
+
+  bufferedBytesForTest(): number {
+    return this.buf.length;
   }
 
   close(): void {
@@ -277,6 +323,78 @@ function cellOrThrow(cells: Map<string, VmCell>, vmId: string): VmCell {
   return cell;
 }
 
+// V5: per-cell async op mutex. Each driver holds a locks map keyed by vmId and
+// funnels every mutating op through this chain, so destroy (or shutdown) can
+// never interleave with an in-flight boot/restore/pause on the same cell — it
+// queues behind it instead. Lock entries are reaped when their tail settles.
+async function runWithCellLock<T>(
+  locks: Map<string, Promise<void>>,
+  vmId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = locks.get(vmId) ?? Promise.resolve();
+  let release: () => void = () => undefined;
+  const mine = new Promise<void>((res) => { release = res; });
+  const tail = prev.catch(() => undefined).then(() => mine);
+  locks.set(vmId, tail);
+  await prev.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (locks.get(vmId) === tail) locks.delete(vmId);
+  }
+}
+
+// Best-effort transition to FAILED with an audit note. Used on command-phase
+// failures so cells never sit in a transient state (BOOTING/PAUSING/STOPPING/
+// RESTORING) after the operation that owned it has died.
+function failCell(cell: VmCell, detail: string): void {
+  cell.note("failed", detail);
+  try {
+    cell.go("FAILED", detail);
+  } catch { /* state cannot take FAILED; destroy() drives it instead */ }
+}
+
+// V5: drive any pre-DESTROYING state to a DESTROYING-eligible one
+// (CREATED/STOPPED/FAILED) without ever throwing, so destroy() always reaches
+// DESTROYING -> DESTROYED. DESTROYED is entered only via DESTROYING.
+const DESTROY_ELIGIBLE: ReadonlySet<VmStateT> = new Set(["CREATED", "STOPPED", "FAILED"]);
+
+function driveToDestroyable(cell: VmCell, reason: string): void {
+  if (cell.sm.state === "DESTROYING" || cell.sm.state === "DESTROYED") return;
+  if (DESTROY_ELIGIBLE.has(cell.sm.state)) return;
+  try {
+    if (cell.sm.state === "RUNNING" || cell.sm.state === "PAUSED" || cell.sm.state === "READY") {
+      cell.go("STOPPING", `${reason}: force-stop`);
+    }
+  } catch { /* keep driving */ }
+  try {
+    if (cell.sm.state === "STOPPING") cell.go("STOPPED", `${reason}: stopped`);
+  } catch { /* keep driving */ }
+  try {
+    if (!DESTROY_ELIGIBLE.has(cell.sm.state) && cell.sm.can("FAILED")) {
+      cell.go("FAILED", `${reason}: abort-inflight`);
+    }
+  } catch { /* destroy() surfaces any residual error */ }
+}
+
+// V4: classify restore/snapshot-load failures. A missing snapshot becomes
+// SNAPSHOT_NOT_FOUND; every other error propagates unchanged (after the
+// caller has moved the cell to FAILED with an audit note).
+function asMissingSnapshot(err: unknown, tag: string): EveError | null {
+  if (err instanceof EveError && err.code === "SNAPSHOT_NOT_FOUND") return err;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/no such|not found|does not exist|unknown snapshot|ENOENT/i.test(msg)) {
+    return new EveError("SNAPSHOT_NOT_FOUND", `Snapshot not found: ${tag}`);
+  }
+  return null;
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function waitExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
   return new Promise<void>((resolve) => {
     if (proc.exitCode !== null || proc.signalCode !== null) { resolve(); return; }
@@ -301,12 +419,53 @@ export interface QemuDriverOpts {
 export class QemuDriver implements VmDriver {
   readonly backend = "qemu";
   private readonly cells = new Map<string, VmCell>();
+  private readonly locks = new Map<string, Promise<void>>();
+  // V2: allocated VNC displays; boot holds one per running cell so two cells
+  // can never share a display. displayOf keys the holder for release.
+  private readonly displays = new Set<number>();
+  private readonly displayOf = new Map<string, number>();
   private readonly imagesDir: string;
   private readonly vncBase: number;
 
   constructor(opts: QemuDriverOpts = {}) {
     this.imagesDir = opts.imagesDir ?? join(tmpdir(), "eve-x", "images");
     this.vncBase = opts.vncBase ?? 10;
+  }
+
+  private withCellLock<T>(cell: VmCell, fn: () => Promise<T>): Promise<T> {
+    return runWithCellLock(this.locks, cell.record.vmId, fn);
+  }
+
+  // V2 test hook + boot primitive: claim a free display in
+  // [vncBase, vncBase+40), or throw NO_DISPLAY when exhausted. Idempotent per
+  // vmId so a retry after FAILED reuses its own claim instead of leaking one.
+  allocateDisplay(vmId: string): number {
+    const existing = this.displayOf.get(vmId);
+    if (existing !== undefined) return existing;
+    for (let d = this.vncBase; d < this.vncBase + 40; d++) {
+      if (!this.displays.has(d)) {
+        this.displays.add(d);
+        this.displayOf.set(vmId, d);
+        return d;
+      }
+    }
+    throw new EveError("NO_DISPLAY", `No free VNC display in [${this.vncBase}, ${this.vncBase + 40})`);
+  }
+
+  releaseDisplay(vmId: string): void {
+    const d = this.displayOf.get(vmId);
+    if (d !== undefined) {
+      this.displayOf.delete(vmId);
+      this.displays.delete(d);
+    }
+  }
+
+  cellCountForTest(): number {
+    return this.cells.size;
+  }
+
+  transitionForTest(vmId: string, to: VmStateT): void {
+    cellOrThrow(this.cells, vmId).go(to, "test-hook");
   }
 
   private qcow2(cell: VmCell): string {
@@ -337,67 +496,81 @@ export class QemuDriver implements VmDriver {
 
   async boot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("BOOTING", "boot-requested");
-    const spec = cell.record.spec;
-    const qmpSock = this.qmpPath(cell);
-    const display = this.vncBase + (Math.abs(hashStr(vmId)) % 40);
-    const args: string[] = [
-      "-m", String(spec.memoryMb),
-      "-smp", String(spec.cpu),
-      "-drive", `file=${this.qcow2(cell)},format=qcow2,if=virtio`,
-      "-qmp", `unix:${qmpSock},server=on,wait=off`,
-      "-display", "none",
-      "-vnc", `127.0.0.1:${display}`,
-      "-k", "en-us",
-      "-rtc", "base=utc",
-    ];
-    if (spec.network === "none") {
-      args.push("-net", "none");
-    } else {
-      args.push("-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0");
-    }
-    let proc: ChildProcess;
-    try {
-      proc = spawn("qemu-system-x86_64", args, { stdio: ["ignore", "pipe", "pipe"] });
-    } catch (err) {
-      cell.go("FAILED", `spawn failed: ${err instanceof Error ? err.message : String(err)}`);
-      throw new EveError("QEMU_SPAWN", "qemu-system-x86_64 spawn failed");
-    }
-    cell.proc = proc;
-    cell.record.pid = proc.pid;
-    proc.stdout?.on("data", () => undefined);
-    proc.stderr?.on("data", () => undefined);
-    proc.on("error", () => {
-      try { cell.go("FAILED", "qemu process error"); } catch { /* terminal */ }
-    });
-    proc.on("exit", () => {
-      cell.qmp?.close();
-      cell.qmp = null;
-    });
-    // wait for the QMP socket to appear, then handshake
-    const qmp = new QmpConnection();
-    let connected = false;
-    for (let i = 0; i < 50; i++) {
-      try {
-        await qmp.connect(qmpSock, 2000);
-        connected = true;
-        break;
-      } catch {
-        if (proc.exitCode !== null) break;
-        await sleep(200);
+    return this.withCellLock(cell, async () => {
+      // Allocated before any transition: NO_DISPLAY leaves state untouched.
+      const display = this.allocateDisplay(cell.record.vmId);
+      // V3: a crashed previous boot leaves qmp.sock behind and the next bind
+      // fails; remove it best-effort before spawning.
+      await fs.rm(this.qmpPath(cell), { force: true }).catch(() => undefined);
+      // V6: a FAILED cell re-enters the creation pipeline with an audit trail.
+      // CREATING cannot go straight to BOOTING, so it passes via CREATED.
+      if (cell.sm.state === "FAILED") {
+        cell.go("CREATING", "boot-retry: failed-requeue");
+        cell.go("CREATED", "boot-retry: recreated");
       }
-    }
-    if (!connected) {
-      try { proc.kill("SIGKILL"); } catch { /* gone */ }
-      cell.proc = null;
-      cell.go("FAILED", "qmp-handshake-failed");
-      throw new EveError("QMP_HANDSHAKE", "QEMU started but QMP handshake failed");
-    }
-    cell.qmp = qmp;
-    cell.startedAtMs = Date.now();
-    cell.note("boot", `pid=${proc.pid ?? -1} vnc=127.0.0.1:${display} qmp=${qmpSock}`);
-    cell.go("READY", "qmp-handshake-ok");
-    cell.go("RUNNING", "boot-complete");
+      cell.go("BOOTING", "boot-requested");
+      const spec = cell.record.spec;
+      const qmpSock = this.qmpPath(cell);
+      const args: string[] = [
+        "-m", String(spec.memoryMb),
+        "-smp", String(spec.cpu),
+        "-drive", `file=${this.qcow2(cell)},format=qcow2,if=virtio`,
+        "-qmp", `unix:${qmpSock},server=on,wait=off`,
+        "-display", "none",
+        "-vnc", `127.0.0.1:${display}`,
+        "-k", "en-us",
+        "-rtc", "base=utc",
+      ];
+      if (spec.network === "none") {
+        args.push("-net", "none");
+      } else {
+        args.push("-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0");
+      }
+      let proc: ChildProcess;
+      try {
+        proc = spawn("qemu-system-x86_64", args, { stdio: ["ignore", "pipe", "pipe"] });
+      } catch (err) {
+        this.releaseDisplay(cell.record.vmId);
+        failCell(cell, `spawn failed: ${errMsg(err)}`);
+        throw new EveError("QEMU_SPAWN", "qemu-system-x86_64 spawn failed");
+      }
+      cell.proc = proc;
+      cell.record.pid = proc.pid;
+      proc.stdout?.on("data", () => undefined);
+      proc.stderr?.on("data", () => undefined);
+      proc.on("error", () => {
+        failCell(cell, "qemu process error");
+      });
+      proc.on("exit", () => {
+        cell.qmp?.close();
+        cell.qmp = null;
+      });
+      // wait for the QMP socket to appear, then handshake
+      const qmp = new QmpConnection();
+      let connected = false;
+      for (let i = 0; i < 50; i++) {
+        try {
+          await qmp.connect(qmpSock, 2000);
+          connected = true;
+          break;
+        } catch {
+          if (proc.exitCode !== null) break;
+          await sleep(200);
+        }
+      }
+      if (!connected) {
+        try { proc.kill("SIGKILL"); } catch { /* gone */ }
+        cell.proc = null;
+        this.releaseDisplay(cell.record.vmId);
+        failCell(cell, "qmp-handshake-failed");
+        throw new EveError("QMP_HANDSHAKE", "QEMU started but QMP handshake failed");
+      }
+      cell.qmp = qmp;
+      cell.startedAtMs = Date.now();
+      cell.note("boot", `pid=${proc.pid ?? -1} vnc=127.0.0.1:${display} qmp=${qmpSock}`);
+      cell.go("READY", "qmp-handshake-ok");
+      cell.go("RUNNING", "boot-complete");
+    });
   }
 
   private async qmpOf(cell: VmCell): Promise<QmpConnection> {
@@ -408,82 +581,111 @@ export class QemuDriver implements VmDriver {
 
   async shutdown(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("STOPPING", "shutdown-requested");
-    try {
-      const q = await this.qmpOf(cell);
-      if (cell.sm.state === "STOPPING" && cell.record.state === "STOPPING") {
+    return this.withCellLock(cell, async () => {
+      cell.go("STOPPING", "shutdown-requested");
+      try {
+        const q = await this.qmpOf(cell);
         // best-effort graceful powerdown (PAUSED vms need cont first)
         try { await q.command("cont"); } catch { /* maybe already running */ }
         await q.command("system_powerdown");
+      } catch { /* fall through to SIGTERM */ }
+      if (cell.proc) {
+        try { cell.proc.kill("SIGTERM"); } catch { /* gone */ }
+        await waitExit(cell.proc, 8000);
+        cell.proc = null;
       }
-    } catch { /* fall through to SIGTERM */ }
-    if (cell.proc) {
-      try { cell.proc.kill("SIGTERM"); } catch { /* gone */ }
-      await waitExit(cell.proc, 8000);
-      cell.proc = null;
-    }
-    cell.qmp?.close();
-    cell.qmp = null;
-    cell.startedAtMs = null;
-    cell.go("STOPPED", "shutdown-complete");
+      cell.qmp?.close();
+      cell.qmp = null;
+      cell.startedAtMs = null;
+      this.releaseDisplay(cell.record.vmId);
+      try {
+        cell.go("STOPPED", "shutdown-complete");
+      } catch (err) {
+        failCell(cell, `shutdown-complete failed: ${errMsg(err)}`);
+        throw err;
+      }
+    });
   }
 
   async pause(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("PAUSING", "pause-requested");
-    const q = await this.qmpOf(cell);
-    await q.command("stop");
-    cell.go("PAUSED", "qmp-stop-ok");
+    return this.withCellLock(cell, async () => {
+      cell.go("PAUSING", "pause-requested");
+      try {
+        const q = await this.qmpOf(cell);
+        await q.command("stop");
+      } catch (err) {
+        failCell(cell, `pause failed: ${errMsg(err)}`);
+        throw err;
+      }
+      cell.go("PAUSED", "qmp-stop-ok");
+    });
   }
 
   async resume(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    if (cell.sm.state !== "PAUSED") throw new EveError("INVALID_TRANSITION", `Cannot resume from ${cell.sm.state}`);
-    const q = await this.qmpOf(cell);
-    await q.command("cont");
-    cell.go("RUNNING", "qmp-cont-ok");
+    return this.withCellLock(cell, async () => {
+      if (cell.sm.state !== "PAUSED") throw new EveError("INVALID_TRANSITION", `Cannot resume from ${cell.sm.state}`);
+      const q = await this.qmpOf(cell);
+      await q.command("cont");
+      cell.go("RUNNING", "qmp-cont-ok");
+    });
   }
 
   async reboot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot reboot from ${cell.sm.state}`);
-    const q = await this.qmpOf(cell);
-    await q.command("system_reset");
-    cell.note("reboot", "qmp-system_reset-ok");
+    return this.withCellLock(cell, async () => {
+      if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot reboot from ${cell.sm.state}`);
+      const q = await this.qmpOf(cell);
+      await q.command("system_reset");
+      cell.note("reboot", "qmp-system_reset-ok");
+    });
   }
 
   async snapshot(vmId: string, name: string): Promise<string> {
     const cell = cellOrThrow(this.cells, vmId);
-    const tag = SnapshotName.parse(name);
-    if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
-    const q = await this.qmpOf(cell);
-    await q.command("human-monitor-command", { "command-line": `savevm ${tag}` });
-    const id = `${vmId}@${tag}`;
-    cell.note("snapshot", id);
-    return id;
+    return this.withCellLock(cell, async () => {
+      const tag = validateSnapshotLabel(name);
+      if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
+      const q = await this.qmpOf(cell);
+      // Snapshot ops never change state: failure is noted and rethrown with
+      // the cell untouched.
+      try {
+        await q.command("human-monitor-command", { "command-line": `savevm ${tag}` }, 120000);
+      } catch (err) {
+        cell.note("snapshot-failed", `savevm ${tag}: ${errMsg(err)}`);
+        throw err;
+      }
+      const id = `${vmId}@${tag}`;
+      cell.note("snapshot", id);
+      return id;
+    });
   }
 
   async restore(vmId: string, name: string): Promise<string> {
-    void 0;
     const cell = cellOrThrow(this.cells, vmId);
-    const tag = SnapshotName.parse(name);
-    if (cell.sm.state === "PAUSED") {
-      const q = await this.qmpOf(cell);
+    return this.withCellLock(cell, async () => {
+      const tag = validateSnapshotLabel(name);
+      if (cell.sm.state !== "PAUSED" && cell.sm.state !== "RUNNING") {
+        throw new EveError("INVALID_TRANSITION", `Cannot restore from ${cell.sm.state}`);
+      }
+      const wasPaused = cell.sm.state === "PAUSED";
       cell.go("RESTORING", `restore ${tag}`);
-      await q.command("human-monitor-command", { "command-line": `loadvm ${tag}` });
-      await q.command("cont");
+      // V4: a loadvm failure must land in FAILED (never back in RUNNING) with
+      // an audit note; a missing snapshot maps to SNAPSHOT_NOT_FOUND.
+      try {
+        const q = await this.qmpOf(cell);
+        await q.command("human-monitor-command", { "command-line": `loadvm ${tag}` }, 120000);
+        if (wasPaused) await q.command("cont");
+      } catch (err) {
+        failCell(cell, `restore failed: ${tag}: ${errMsg(err)}`);
+        throw asMissingSnapshot(err, tag) ?? err;
+      }
       cell.go("RUNNING", "restore-complete");
-    } else if (cell.sm.state === "RUNNING") {
-      const q = await this.qmpOf(cell);
-      cell.go("RESTORING", `restore ${tag}`);
-      await q.command("human-monitor-command", { "command-line": `loadvm ${tag}` });
-      cell.go("RUNNING", "restore-complete");
-    } else {
-      throw new EveError("INVALID_TRANSITION", `Cannot restore from ${cell.sm.state}`);
-    }
-    const id = `${vmId}@${tag}`;
-    cell.note("restore", id);
-    return id;
+      const id = `${vmId}@${tag}`;
+      cell.note("restore", id);
+      return id;
+    });
   }
 
   async clone(vmId: string, newOwner: string): Promise<VmRecord> {
@@ -506,35 +708,55 @@ export class QemuDriver implements VmDriver {
 
   async fork(vmId: string, newOwner: string): Promise<VmRecord> {
     const src = cellOrThrow(this.cells, vmId);
-    if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
-    // QEMU fork = clone the disk image, then boot the copy independently.
-    const rec = await this.clone(vmId, newOwner);
-    const dst = cellOrThrow(this.cells, rec.vmId);
-    dst.go("BOOTING", "fork-boot");
-    // fork goes through the normal boot path but keeps FORKING visible in audit
-    dst.note("fork", `forked from ${vmId}`);
-    dst.sm.transition("CREATED", "fork-rebase");
-    dst.record.state = dst.sm.state;
-    await this.boot(dst.record.vmId);
-    return dst.snapshotRecord();
+    // The source cell is locked for the whole fork; clone/boot below only
+    // ever lock the *destination* cell, so no lock nesting can occur.
+    return this.withCellLock(src, async () => {
+      if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
+      if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
+      // QEMU fork = clone the disk image, then boot the copy independently.
+      const rec = await this.clone(vmId, newOwner);
+      src.note("fork", `forked to ${rec.vmId}`);
+      const dst = cellOrThrow(this.cells, rec.vmId);
+      // fork goes through the normal boot path but keeps FORKING visible in audit
+      dst.note("fork", `forked from ${vmId}`);
+      await this.boot(dst.record.vmId);
+      return cellOrThrow(this.cells, rec.vmId).snapshotRecord();
+    });
   }
 
   async destroy(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    const st = cell.sm.state;
-    if (st === "RUNNING" || st === "PAUSED" || st === "READY" || st === "PAUSING") {
-      await this.shutdown(vmId);
-    }
-    cell.go("DESTROYING", "destroy-requested");
-    if (cell.proc) {
-      try { cell.proc.kill("SIGKILL"); } catch { /* gone */ }
-      cell.proc = null;
-    }
-    cell.qmp?.close();
-    cell.qmp = null;
-    await fs.rm(cell.record.workdir, { recursive: true, force: true });
-    cell.go("DESTROYED", "destroy-complete");
-    this.cells.delete(vmId);
+    return this.withCellLock(cell, async () => {
+      // V5: best-effort stop from ANY state. Transition errors here are caught
+      // so destroy can never be aborted by an in-flight op's leftovers.
+      try {
+        const q = cell.qmp;
+        const st = cell.sm.state;
+        if (q && (st === "RUNNING" || st === "PAUSED" || st === "READY")) {
+          try {
+            try { await q.command("cont"); } catch { /* maybe already running */ }
+            await q.command("system_powerdown");
+          } catch { /* fall through to signals */ }
+          if (cell.proc) {
+            try { cell.proc.kill("SIGTERM"); } catch { /* gone */ }
+            await waitExit(cell.proc, 3000);
+          }
+        }
+      } catch { /* best effort only */ }
+      if (cell.proc) {
+        try { cell.proc.kill("SIGKILL"); } catch { /* gone */ }
+        cell.proc = null;
+      }
+      cell.qmp?.close();
+      cell.qmp = null;
+      cell.startedAtMs = null;
+      this.releaseDisplay(cell.record.vmId);
+      await fs.rm(cell.record.workdir, { recursive: true, force: true });
+      driveToDestroyable(cell, "destroy");
+      cell.go("DESTROYING", "destroy-requested");
+      cell.go("DESTROYED", "destroy-complete");
+      this.cells.delete(vmId);
+    });
   }
 
   async screendump(vmId: string): Promise<Buffer> {
@@ -569,15 +791,38 @@ export class QemuDriver implements VmDriver {
   }
 }
 
-function hashStr(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
-  return h;
-}
-
 // ── DockerDesktopDriver (real docker CLI: run/start/stop/commit/cp/exec/logs) ─
 
 const DEFAULT_DOCKER_IMAGE = "dorowu/ubuntu-desktop-lxde-vnc:latest";
+
+// V7: hardening + network flags shared by boot and restore so a restored
+// container can never come back less isolated than a fresh boot.
+function dockerRunHardening(spec: VmSpecT): { args: string[]; isolation: string; detail: string } {
+  const harden = ["--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--pids-limit", "256"];
+  if (spec.network === "none") {
+    return {
+      args: ["--network", "none", ...harden],
+      isolation: "network=none+cap-drop+pids-limit",
+      detail: "isolation: network=none, cap-drop ALL, no-new-privileges, pids-limit 256",
+    };
+  }
+  if (spec.network === "allowlisted") {
+    // Documented constraint: the allowlist is enforced at the proxy layer,
+    // not by docker networking. The container itself runs fully offline
+    // (--network none); this records that instead of claiming full
+    // allowlisting at the container boundary.
+    return {
+      args: ["--network", "none", ...harden],
+      isolation: "network=none+cap-drop+pids-limit(proxy-allowlist)",
+      detail: "isolation: allowlisted egress enforced at proxy layer (documented constraint); container runs --network none, cap-drop ALL, no-new-privileges, pids-limit 256",
+    };
+  }
+  return {
+    args: [...harden],
+    isolation: "bridge+cap-drop+pids-limit",
+    detail: "isolation: default bridge, cap-drop ALL, no-new-privileges, pids-limit 256",
+  };
+}
 
 export interface DockerDriverOpts {
   workdirBase?: string;
@@ -587,12 +832,25 @@ export interface DockerDriverOpts {
 export class DockerDesktopDriver implements VmDriver {
   readonly backend = "docker";
   private readonly cells = new Map<string, VmCell>();
+  private readonly locks = new Map<string, Promise<void>>();
   private readonly base: string;
   private readonly defaultImage: string;
 
   constructor(opts: DockerDriverOpts = {}) {
     this.base = opts.workdirBase ?? join(tmpdir(), "eve-x", "docker");
     this.defaultImage = opts.defaultImage ?? DEFAULT_DOCKER_IMAGE;
+  }
+
+  private withCellLock<T>(cell: VmCell, fn: () => Promise<T>): Promise<T> {
+    return runWithCellLock(this.locks, cell.record.vmId, fn);
+  }
+
+  cellCountForTest(): number {
+    return this.cells.size;
+  }
+
+  transitionForTest(vmId: string, to: VmStateT): void {
+    cellOrThrow(this.cells, vmId).go(to, "test-hook");
   }
 
   private imageFor(spec: VmSpecT): string {
@@ -612,6 +870,7 @@ export class DockerDesktopDriver implements VmDriver {
   async create(specInput: unknown, owner: string): Promise<VmRecord> {
     const spec = VmSpec.parse(specInput);
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
+    validateDockerImage(this.imageFor(spec));
     const vmId = uid("vm");
     const workdir = join(this.base, vmId);
     await fs.mkdir(workdir, { recursive: true });
@@ -625,88 +884,149 @@ export class DockerDesktopDriver implements VmDriver {
 
   async boot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("BOOTING", "boot-requested");
-    const spec = cell.record.spec;
-    const name = this.cname(cell);
-    // reuse an existing stopped container when present, else run a fresh xfce+x11vnc guest
-    const inspect = await runCmd("docker", ["inspect", name], 15000);
-    if (inspect.code === 0) {
-      await this.docker(["start", name]);
-    } else {
-      const args = [
-        "run", "-d", "--name", name,
-        "--memory", `${spec.memoryMb}m`,
-        "--cpus", String(spec.cpu),
-        "-e", `VNC_RESOLUTION=${spec.width}x${spec.height}`,
-        "-e", `TZ=${spec.timezone}`,
-        this.imageFor(spec),
-      ];
-      await this.docker(args, 120000);
-    }
-    cell.startedAtMs = Date.now();
-    cell.note("boot", `container=${name} image=${this.imageFor(spec)}`);
-    cell.go("READY", "container-running");
-    cell.go("RUNNING", "boot-complete");
+    return this.withCellLock(cell, async () => {
+      const spec = cell.record.spec;
+      const image = validateDockerImage(this.imageFor(spec));
+      // V6: FAILED retry re-enters the creation pipeline (via CREATED, since
+      // CREATING cannot transition straight to BOOTING).
+      if (cell.sm.state === "FAILED") {
+        cell.go("CREATING", "boot-retry: failed-requeue");
+        cell.go("CREATED", "boot-retry: recreated");
+      }
+      cell.go("BOOTING", "boot-requested");
+      const name = this.cname(cell);
+      const harden = dockerRunHardening(spec);
+      try {
+        // reuse an existing stopped container when present, else run a fresh xfce+x11vnc guest
+        const inspect = await runCmd("docker", ["inspect", name], 15000);
+        if (inspect.code === 0) {
+          await this.docker(["start", name]);
+        } else {
+          const args = [
+            "run", "-d", "--name", name,
+            "--memory", `${spec.memoryMb}m`,
+            "--cpus", String(spec.cpu),
+            ...harden.args,
+            "-e", `VNC_RESOLUTION=${spec.width}x${spec.height}`,
+            "-e", `TZ=${spec.timezone}`,
+            image,
+          ];
+          await this.docker(args, 120000);
+        }
+      } catch (err) {
+        failCell(cell, `boot failed: ${errMsg(err)}`);
+        throw err;
+      }
+      cell.record.detail = harden.detail;
+      cell.startedAtMs = Date.now();
+      cell.note("boot", `container=${name} image=${image} isolation=${harden.isolation}`);
+      cell.go("READY", "container-running");
+      cell.go("RUNNING", "boot-complete");
+    });
   }
 
   async shutdown(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("STOPPING", "shutdown-requested");
-    await this.docker(["stop", "-t", "10", this.cname(cell)], 60000);
-    cell.startedAtMs = null;
-    cell.go("STOPPED", "container-stopped");
+    return this.withCellLock(cell, async () => {
+      cell.go("STOPPING", "shutdown-requested");
+      try {
+        await this.docker(["stop", "-t", "10", this.cname(cell)], 60000);
+      } catch (err) {
+        failCell(cell, `shutdown failed: ${errMsg(err)}`);
+        throw err;
+      }
+      cell.startedAtMs = null;
+      cell.go("STOPPED", "container-stopped");
+    });
   }
 
   async pause(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("PAUSING", "pause-requested");
-    await this.docker(["pause", this.cname(cell)]);
-    cell.go("PAUSED", "container-paused");
+    return this.withCellLock(cell, async () => {
+      cell.go("PAUSING", "pause-requested");
+      try {
+        await this.docker(["pause", this.cname(cell)]);
+      } catch (err) {
+        failCell(cell, `pause failed: ${errMsg(err)}`);
+        throw err;
+      }
+      cell.go("PAUSED", "container-paused");
+    });
   }
 
   async resume(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    if (cell.sm.state !== "PAUSED") throw new EveError("INVALID_TRANSITION", `Cannot resume from ${cell.sm.state}`);
-    await this.docker(["unpause", this.cname(cell)]);
-    cell.go("RUNNING", "container-unpaused");
+    return this.withCellLock(cell, async () => {
+      if (cell.sm.state !== "PAUSED") throw new EveError("INVALID_TRANSITION", `Cannot resume from ${cell.sm.state}`);
+      await this.docker(["unpause", this.cname(cell)]);
+      cell.go("RUNNING", "container-unpaused");
+    });
   }
 
   async reboot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot reboot from ${cell.sm.state}`);
-    await this.docker(["restart", "-t", "10", this.cname(cell)], 90000);
-    cell.startedAtMs = Date.now();
-    cell.note("reboot", "container-restarted");
+    return this.withCellLock(cell, async () => {
+      if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot reboot from ${cell.sm.state}`);
+      await this.docker(["restart", "-t", "10", this.cname(cell)], 90000);
+      cell.startedAtMs = Date.now();
+      cell.note("reboot", "container-restarted");
+    });
   }
 
   async snapshot(vmId: string, name: string): Promise<string> {
     const cell = cellOrThrow(this.cells, vmId);
-    const tag = SnapshotName.parse(name);
-    if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
-      throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
-    }
-    const ref = `${this.cname(cell)}:${tag}`;
-    await this.docker(["commit", "-p", this.cname(cell), ref], 120000);
-    cell.note("snapshot", ref);
-    return `${vmId}@${tag}`;
+    return this.withCellLock(cell, async () => {
+      const tag = validateSnapshotLabel(name);
+      if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
+        throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
+      }
+      const ref = `${this.cname(cell)}:${tag}`;
+      // Snapshot ops never change state: failure is noted and rethrown with
+      // the cell untouched.
+      try {
+        await this.docker(["commit", "-p", this.cname(cell), ref], 120000);
+      } catch (err) {
+        cell.note("snapshot-failed", `commit ${ref}: ${errMsg(err)}`);
+        throw err;
+      }
+      cell.note("snapshot", ref);
+      return `${vmId}@${tag}`;
+    });
   }
 
   async restore(vmId: string, name: string): Promise<string> {
-    void 0;
     const cell = cellOrThrow(this.cells, vmId);
-    const tag = SnapshotName.parse(name);
-    if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED" && cell.sm.state !== "STOPPED") {
-      throw new EveError("INVALID_TRANSITION", `Cannot restore from ${cell.sm.state}`);
-    }
-    cell.go("RESTORING", `restore ${tag}`);
-    const ref = `${this.cname(cell)}:${tag}`;
-    await runCmd("docker", ["rm", "-f", this.cname(cell)], 60000);
-    await this.docker(["run", "-d", "--name", this.cname(cell), ref], 120000);
-    cell.startedAtMs = Date.now();
-    cell.go("RUNNING", "restore-complete");
-    const id = `${vmId}@${tag}`;
-    cell.note("restore", id);
-    return id;
+    return this.withCellLock(cell, async () => {
+      const tag = validateSnapshotLabel(name);
+      if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED" && cell.sm.state !== "STOPPED") {
+        throw new EveError("INVALID_TRANSITION", `Cannot restore from ${cell.sm.state}`);
+      }
+      cell.go("RESTORING", `restore ${tag}`);
+      // V4: run failure must land in FAILED (never back in RUNNING) with an
+      // audit note; a missing snapshot image maps to SNAPSHOT_NOT_FOUND.
+      const ref = `${this.cname(cell)}:${tag}`;
+      const harden = dockerRunHardening(cell.record.spec);
+      try {
+        const insp = await runCmd("docker", ["image", "inspect", ref], 30000);
+        if (insp.code !== 0) throw new EveError("SNAPSHOT_NOT_FOUND", `Snapshot not found: ${tag}`);
+        await runCmd("docker", ["rm", "-f", this.cname(cell)], 60000);
+        await this.docker(["run", "-d", "--name", this.cname(cell),
+          "--memory", `${cell.record.spec.memoryMb}m`,
+          "--cpus", String(cell.record.spec.cpu),
+          ...harden.args,
+          ref,
+        ], 120000);
+      } catch (err) {
+        failCell(cell, `restore failed: ${tag}: ${errMsg(err)}`);
+        throw asMissingSnapshot(err, tag) ?? err;
+      }
+      cell.record.detail = harden.detail;
+      cell.startedAtMs = Date.now();
+      cell.go("RUNNING", "restore-complete");
+      const id = `${vmId}@${tag}`;
+      cell.note("restore", id);
+      return id;
+    });
   }
 
   async clone(vmId: string, newOwner: string): Promise<VmRecord> {
@@ -720,25 +1040,33 @@ export class DockerDesktopDriver implements VmDriver {
 
   async fork(vmId: string, newOwner: string): Promise<VmRecord> {
     const src = cellOrThrow(this.cells, vmId);
-    if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
-    const rec = await this.clone(vmId, newOwner);
-    await this.boot(rec.vmId);
-    const dst = cellOrThrow(this.cells, rec.vmId);
-    dst.note("fork", `forked from ${vmId}`);
-    return dst.snapshotRecord();
+    // Source locked for the whole fork; clone/boot only lock the destination.
+    return this.withCellLock(src, async () => {
+      if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
+      if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
+      const rec = await this.clone(vmId, newOwner);
+      src.note("fork", `forked to ${rec.vmId}`);
+      await this.boot(rec.vmId);
+      const dst = cellOrThrow(this.cells, rec.vmId);
+      dst.note("fork", `forked from ${vmId}`);
+      return dst.snapshotRecord();
+    });
   }
 
   async destroy(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    const st = cell.sm.state;
-    if (st === "RUNNING" || st === "PAUSED" || st === "READY" || st === "PAUSING") {
-      await this.shutdown(vmId);
-    }
-    cell.go("DESTROYING", "destroy-requested");
-    await runCmd("docker", ["rm", "-f", this.cname(cell)], 60000);
-    await fs.rm(cell.record.workdir, { recursive: true, force: true });
-    cell.go("DESTROYED", "destroy-complete");
-    this.cells.delete(vmId);
+    return this.withCellLock(cell, async () => {
+      // V5: best-effort stop from ANY state; docker/shutdown transition errors
+      // are swallowed so destroy always reaches DESTROYING -> DESTROYED.
+      try { await runCmd("docker", ["stop", "-t", "5", this.cname(cell)], 30000); } catch { /* best effort */ }
+      driveToDestroyable(cell, "destroy");
+      cell.go("DESTROYING", "destroy-requested");
+      await runCmd("docker", ["rm", "-f", this.cname(cell)], 60000);
+      await fs.rm(cell.record.workdir, { recursive: true, force: true });
+      cell.startedAtMs = null;
+      cell.go("DESTROYED", "destroy-complete");
+      this.cells.delete(vmId);
+    });
   }
 
   async screendump(vmId: string): Promise<Buffer> {
@@ -773,18 +1101,22 @@ export class DockerDesktopDriver implements VmDriver {
 
   async status(vmId: string): Promise<VmStatus> {
     const cell = cellOrThrow(this.cells, vmId);
-    let detail = "container-state=unknown";
+    let containerState = "container-state=unknown";
     try {
       const r = await runCmd("docker", ["inspect", "--format", "{{.State.Status}} pid={{.State.Pid}}", this.cname(cell)], 15000);
-      if (r.code === 0) detail = r.stdout.trim();
+      if (r.code === 0) containerState = r.stdout.trim();
     } catch { /* keep unknown */ }
     return VmStatusSchema.parse({
       vmId: cell.record.vmId,
       backend: this.backend,
       state: cell.sm.state,
       uptimeMs: cell.startedAtMs ? Date.now() - cell.startedAtMs : 0,
-      detail,
+      detail: `${cell.record.detail || "isolation=unknown"}; ${containerState}`,
     });
+  }
+
+  auditLog(vmId: string): VmAuditEntry[] {
+    return [...cellOrThrow(this.cells, vmId).audit];
   }
 }
 
@@ -797,6 +1129,19 @@ export class DevFramebufferDriver implements VmDriver {
   readonly backend = "dev-framebuffer";
   readonly note = "Development framebuffer: no hypervisor present; lifecycle transitions are enforced, screen is a 1x1 sentinel.";
   private readonly cells = new Map<string, VmCell>();
+  private readonly locks = new Map<string, Promise<void>>();
+
+  private withCellLock<T>(cell: VmCell, fn: () => Promise<T>): Promise<T> {
+    return runWithCellLock(this.locks, cell.record.vmId, fn);
+  }
+
+  cellCountForTest(): number {
+    return this.cells.size;
+  }
+
+  transitionForTest(vmId: string, to: VmStateT): void {
+    cellOrThrow(this.cells, vmId).go(to, "test-hook");
+  }
 
   async create(specInput: unknown, owner: string): Promise<VmRecord> {
     const spec = VmSpec.parse(specInput);
@@ -812,63 +1157,99 @@ export class DevFramebufferDriver implements VmDriver {
 
   async boot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("BOOTING", "boot-requested");
-    cell.startedAtMs = Date.now();
-    cell.go("READY", "framebuffer-ready");
-    cell.go("RUNNING", "boot-complete");
+    return this.withCellLock(cell, async () => {
+      // V6: FAILED retry re-enters the creation pipeline (via CREATED).
+      if (cell.sm.state === "FAILED") {
+        cell.go("CREATING", "boot-retry: failed-requeue");
+        cell.go("CREATED", "boot-retry: recreated");
+      }
+      cell.go("BOOTING", "boot-requested");
+      cell.startedAtMs = Date.now();
+      cell.go("READY", "framebuffer-ready");
+      cell.go("RUNNING", "boot-complete");
+    });
   }
 
   async shutdown(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("STOPPING", "shutdown-requested");
-    cell.startedAtMs = null;
-    cell.go("STOPPED", "shutdown-complete");
+    return this.withCellLock(cell, async () => {
+      cell.go("STOPPING", "shutdown-requested");
+      cell.startedAtMs = null;
+      cell.go("STOPPED", "shutdown-complete");
+    });
   }
 
   async pause(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    cell.go("PAUSING", "pause-requested");
-    cell.go("PAUSED", "paused");
+    return this.withCellLock(cell, async () => {
+      cell.go("PAUSING", "pause-requested");
+      cell.go("PAUSED", "paused");
+    });
   }
 
   async resume(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    if (cell.sm.state !== "PAUSED") throw new EveError("INVALID_TRANSITION", `Cannot resume from ${cell.sm.state}`);
-    cell.go("RUNNING", "resumed");
+    return this.withCellLock(cell, async () => {
+      if (cell.sm.state !== "PAUSED") throw new EveError("INVALID_TRANSITION", `Cannot resume from ${cell.sm.state}`);
+      cell.go("RUNNING", "resumed");
+    });
   }
 
   async reboot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot reboot from ${cell.sm.state}`);
-    cell.startedAtMs = Date.now();
-    cell.note("reboot", "framebuffer-reset");
+    return this.withCellLock(cell, async () => {
+      if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot reboot from ${cell.sm.state}`);
+      cell.startedAtMs = Date.now();
+      cell.note("reboot", "framebuffer-reset");
+    });
   }
 
   async snapshot(vmId: string, name: string): Promise<string> {
     const cell = cellOrThrow(this.cells, vmId);
-    const tag = SnapshotName.parse(name);
-    if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
-      throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
-    }
-    const id = `${vmId}@${tag}`;
-    await fs.writeFile(join(cell.record.workdir, `${tag}.snap`), id, "utf8");
-    cell.note("snapshot", id);
-    return id;
+    return this.withCellLock(cell, async () => {
+      const tag = validateSnapshotLabel(name);
+      if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
+        throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
+      }
+      // Snapshot ops never change state: failure is noted and rethrown with
+      // the cell untouched.
+      const id = `${vmId}@${tag}`;
+      try {
+        await fs.writeFile(join(cell.record.workdir, `${tag}.snap`), id, "utf8");
+      } catch (err) {
+        cell.note("snapshot-failed", `write ${tag}: ${errMsg(err)}`);
+        throw err;
+      }
+      cell.note("snapshot", id);
+      return id;
+    });
   }
 
   async restore(vmId: string, name: string): Promise<string> {
-    void 0;
     const cell = cellOrThrow(this.cells, vmId);
-    const tag = SnapshotName.parse(name);
-    if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
-      throw new EveError("INVALID_TRANSITION", `Cannot restore from ${cell.sm.state}`);
-    }
-    cell.go("RESTORING", `restore ${tag}`);
-    await fs.readFile(join(cell.record.workdir, `${tag}.snap`), "utf8");
-    cell.go("RUNNING", "restore-complete");
-    const id = `${vmId}@${tag}`;
-    cell.note("restore", id);
-    return id;
+    return this.withCellLock(cell, async () => {
+      const tag = validateSnapshotLabel(name);
+      if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
+        throw new EveError("INVALID_TRANSITION", `Cannot restore from ${cell.sm.state}`);
+      }
+      cell.go("RESTORING", `restore ${tag}`);
+      // V4: a missing snapshot file mapped to SNAPSHOT_NOT_FOUND (never a raw
+      // ENOENT), any failure lands in FAILED with an audit note.
+      try {
+        await fs.readFile(join(cell.record.workdir, `${tag}.snap`), "utf8");
+      } catch (err) {
+        failCell(cell, `restore failed: ${tag}: ${errMsg(err)}`);
+        const code = (err as NodeJS.ErrnoException | null)?.code;
+        if (code === "ENOENT" || asMissingSnapshot(err, tag)) {
+          throw new EveError("SNAPSHOT_NOT_FOUND", `Snapshot not found: ${tag}`);
+        }
+        throw err instanceof EveError ? err : new EveError("RESTORE_FAILED", `Restore failed: ${errMsg(err)}`);
+      }
+      cell.go("RUNNING", "restore-complete");
+      const id = `${vmId}@${tag}`;
+      cell.note("restore", id);
+      return id;
+    });
   }
 
   async clone(vmId: string, newOwner: string): Promise<VmRecord> {
@@ -882,24 +1263,31 @@ export class DevFramebufferDriver implements VmDriver {
 
   async fork(vmId: string, newOwner: string): Promise<VmRecord> {
     const src = cellOrThrow(this.cells, vmId);
-    if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
-    const rec = await this.clone(vmId, newOwner);
-    await this.boot(rec.vmId);
-    const dst = cellOrThrow(this.cells, rec.vmId);
-    dst.note("fork", `forked from ${vmId}`);
-    return dst.snapshotRecord();
+    // Source locked for the whole fork; clone/boot only lock the destination.
+    return this.withCellLock(src, async () => {
+      if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
+      if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
+      const rec = await this.clone(vmId, newOwner);
+      src.note("fork", `forked to ${rec.vmId}`);
+      await this.boot(rec.vmId);
+      const dst = cellOrThrow(this.cells, rec.vmId);
+      dst.note("fork", `forked from ${vmId}`);
+      return dst.snapshotRecord();
+    });
   }
 
   async destroy(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
-    const st = cell.sm.state;
-    if (st === "RUNNING" || st === "PAUSED" || st === "READY" || st === "PAUSING") {
-      await this.shutdown(vmId);
-    }
-    cell.go("DESTROYING", "destroy-requested");
-    await fs.rm(cell.record.workdir, { recursive: true, force: true });
-    cell.go("DESTROYED", "destroy-complete");
-    this.cells.delete(vmId);
+    return this.withCellLock(cell, async () => {
+      // V5: tolerate any pre-DESTROYING state (e.g. RESTORING left behind by
+      // a failed restore racing this call) via driveToDestroyable.
+      cell.startedAtMs = null;
+      await fs.rm(cell.record.workdir, { recursive: true, force: true });
+      driveToDestroyable(cell, "destroy");
+      cell.go("DESTROYING", "destroy-requested");
+      cell.go("DESTROYED", "destroy-complete");
+      this.cells.delete(vmId);
+    });
   }
 
   async screendump(vmId: string): Promise<Buffer> {
@@ -919,6 +1307,10 @@ export class DevFramebufferDriver implements VmDriver {
       uptimeMs: cell.startedAtMs ? Date.now() - cell.startedAtMs : 0,
       detail: this.note,
     });
+  }
+
+  auditLog(vmId: string): VmAuditEntry[] {
+    return [...cellOrThrow(this.cells, vmId).audit];
   }
 }
 
@@ -974,11 +1366,42 @@ interface Lease {
   ttlMs: number;
 }
 
+// V10: durable registry record. workdir/pid/booted exist so recover() can kill
+// orphan QEMU children and decide which workdirs are safe to remove.
+const PersistedLeaseSchema = z.object({
+  owner: z.string(),
+  expiresAtMs: z.number(),
+  ttlMs: z.number(),
+});
+const PersistedEntrySchema = z.object({
+  owner: z.string(),
+  backend: z.string(),
+  spec: VmSpec,
+  workdir: z.string().default(""),
+  pid: z.number().optional(),
+  containerName: z.string().optional(),
+  booted: z.boolean().default(false),
+  lease: PersistedLeaseSchema.optional(),
+});
+const PersistedFileSchema = z.object({
+  version: z.literal(1),
+  entries: z.record(PersistedEntrySchema),
+});
+type PersistedEntry = z.infer<typeof PersistedEntrySchema>;
+
+export interface RecoveryReport {
+  recovered: number;
+  orphansKilled: number;
+  stale: string[];
+}
+
 export class VmManager {
   private readonly drivers = new Map<string, VmDriver>();
   private readonly primary: VmDriver;
   private readonly registry = new Map<string, RegistryEntry>();
   private readonly leases = new Map<string, Lease>();
+  private readonly persisted = new Map<string, PersistedEntry>();
+  private readonly stale = new Set<string>();
   private readonly quotas: QuotaConfig;
 
   constructor(primary: VmDriver, extraDrivers: VmDriver[] = [], quotasInput: unknown = {}) {
@@ -1002,6 +1425,42 @@ export class VmManager {
       throw new EveError("NOT_OWNER", `vm ${vmId} is owned by another tenant; double ownership denied`);
     }
     return found;
+  }
+
+  // V10: registry + leases live in DATA_DIR/vm-registry.json, written atomically
+  // (tmp + rename) on every mutation. Writes are best-effort: a persistence
+  // failure must never fail the VM operation itself.
+  private dataDir(): string {
+    return process.env["DATA_DIR"] ?? "./data";
+  }
+
+  private registryPath(): string {
+    return join(this.dataDir(), "vm-registry.json");
+  }
+
+  private async persist(): Promise<void> {
+    try {
+      const dir = this.dataDir();
+      await fs.mkdir(dir, { recursive: true });
+      const payload = { version: 1 as const, entries: Object.fromEntries(this.persisted) };
+      const tmp = join(dir, `vm-registry.${process.pid}.tmp`);
+      await fs.writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");
+      await fs.rename(tmp, this.registryPath());
+    } catch { /* in-memory registry remains the source of truth */ }
+  }
+
+  private trackPersisted(vmId: string, rec: VmRecord, owner: string, booted: boolean): void {
+    const lease = this.leases.get(vmId);
+    this.persisted.set(vmId, {
+      owner,
+      backend: rec.backend,
+      spec: rec.spec,
+      workdir: rec.workdir,
+      pid: rec.pid,
+      containerName: rec.containerName,
+      booted,
+      lease: lease ? { owner: lease.owner, expiresAtMs: lease.expiresAtMs, ttlMs: lease.ttlMs } : undefined,
+    });
   }
 
   private checkQuotas(owner: string, spec: VmSpecT): void {
@@ -1031,15 +1490,17 @@ export class VmManager {
   async create(owner: string, specInput: unknown, leaseTtlMs = 3600000): Promise<VmRecord> {
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
     const ttl = z.number().int().min(60000).max(86400000).parse(leaseTtlMs);
-    const rec = await this.primary.create(specInput, owner);
-    try {
-      this.checkQuotas(owner, rec.spec);
-    } catch (err) {
-      await this.primary.destroy(rec.vmId).catch(() => undefined);
-      throw err;
-    }
+    // V8: parse the spec and enforce quotas BEFORE driver.create, so a denied
+    // create never allocates a disk. Single-process scope: the registry only
+    // mutates inside this method, so check-then-create is race-free here
+    // (concurrent callers serialize on the event loop between these awaits).
+    const spec = VmSpec.parse(specInput);
+    this.checkQuotas(owner, spec);
+    const rec = await this.primary.create(spec, owner);
     this.registry.set(rec.vmId, { owner, backend: this.primary.backend, spec: rec.spec });
     this.leases.set(rec.vmId, { owner, expiresAtMs: Date.now() + ttl, ttlMs: ttl });
+    this.trackPersisted(rec.vmId, rec, owner, false);
+    await this.persist();
     return rec;
   }
 
@@ -1052,6 +1513,9 @@ export class VmManager {
     const ttl = ttlMs === undefined ? lease.ttlMs : z.number().int().min(60000).max(86400000).parse(ttlMs);
     lease.ttlMs = ttl;
     lease.expiresAtMs = Date.now() + ttl;
+    const persisted = this.persisted.get(vmId);
+    if (persisted) persisted.lease = { owner: lease.owner, expiresAtMs: lease.expiresAtMs, ttlMs: lease.ttlMs };
+    void this.persist();
     return lease.expiresAtMs;
   }
 
@@ -1064,8 +1528,11 @@ export class VmManager {
       try { await driver?.destroy(vmId); } catch { /* best effort */ }
       this.registry.delete(vmId);
       this.leases.delete(vmId);
+      this.persisted.delete(vmId);
+      this.stale.delete(vmId);
       dead.push(vmId);
     }
+    if (dead.length > 0) await this.persist();
     return dead;
   }
 
@@ -1079,9 +1546,65 @@ export class VmManager {
     return this.driverFor(vmId).entry.owner;
   }
 
+  isStale(vmId: string): boolean {
+    return this.stale.has(vmId);
+  }
+
+  staleIds(): string[] {
+    return [...this.stale];
+  }
+
+  // V10: reload registry+leases persisted by a previous process. A live
+  // ChildProcess handle cannot cross a process boundary, so live re-attach is
+  // explicitly unsupported: entries return as STALE metadata (visible via
+  // isStale/staleIds, operable only after fresh boot/destroy), orphan QEMU
+  // pids recorded in the file are SIGKILLed best-effort, and workdirs are
+  // removed ONLY for entries whose disk was never booted.
+  async recover(opts: { killOrphans?: boolean } = {}): Promise<RecoveryReport> {
+    const killOrphans = opts.killOrphans ?? true;
+    let parsed: z.infer<typeof PersistedFileSchema>;
+    try {
+      const raw = await fs.readFile(this.registryPath(), "utf8");
+      parsed = PersistedFileSchema.parse(JSON.parse(raw) as unknown);
+    } catch {
+      return { recovered: 0, orphansKilled: 0, stale: [] };
+    }
+    let orphansKilled = 0;
+    const stale: string[] = [];
+    for (const [vmId, e] of Object.entries(parsed.entries)) {
+      this.registry.set(vmId, { owner: e.owner, backend: e.backend, spec: e.spec });
+      if (e.lease) {
+        this.leases.set(vmId, { owner: e.lease.owner, expiresAtMs: e.lease.expiresAtMs, ttlMs: e.lease.ttlMs });
+      }
+      this.persisted.set(vmId, { ...e });
+      this.stale.add(vmId);
+      stale.push(vmId);
+      if (killOrphans && e.backend === "qemu" && typeof e.pid === "number") {
+        try {
+          process.kill(e.pid, 0);
+          try { process.kill(e.pid, "SIGKILL"); orphansKilled += 1; } catch { /* already exiting */ }
+        } catch { /* pid is not alive; nothing to reap */ }
+      }
+      if (!e.booted && e.workdir) {
+        try { await fs.rm(e.workdir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    }
+    await this.persist();
+    return { recovered: stale.length, orphansKilled, stale };
+  }
+
   async boot(vmId: string, owner: string): Promise<void> {
     const { driver } = this.mustOwn(vmId, owner);
     await driver.boot(vmId);
+    const persisted = this.persisted.get(vmId);
+    if (persisted) {
+      persisted.booted = true;
+      try {
+        const st = await driver.status(vmId);
+        if (st.pid !== undefined) persisted.pid = st.pid;
+      } catch { /* pid is best-effort metadata */ }
+      await this.persist();
+    }
   }
 
   async shutdown(vmId: string, owner: string): Promise<void> {
@@ -1117,10 +1640,15 @@ export class VmManager {
   async fork(vmId: string, owner: string, newOwner: string): Promise<VmRecord> {
     const { driver, entry } = this.mustOwn(vmId, owner);
     if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
-    if (newOwner === owner) throw new EveError("BAD_OWNER", "Fork target must be a different tenant");
+    // V9: newOwner === owner is allowed (same-tenant branch for
+    // human-branching and counterfactual runs); mustOwn still guards source.
     const rec = await driver.fork(vmId, newOwner);
+    const now = Date.now();
+    const ttl = 3600000;
     this.registry.set(rec.vmId, { owner: newOwner, backend: entry.backend, spec: rec.spec });
-    this.leases.set(rec.vmId, { owner: newOwner, expiresAtMs: Date.now() + 3600000, ttlMs: 3600000 });
+    this.leases.set(rec.vmId, { owner: newOwner, expiresAtMs: now + ttl, ttlMs: ttl });
+    this.trackPersisted(rec.vmId, rec, newOwner, true);
+    await this.persist();
     return rec;
   }
 
@@ -1129,6 +1657,9 @@ export class VmManager {
     await driver.destroy(vmId);
     this.registry.delete(vmId);
     this.leases.delete(vmId);
+    this.persisted.delete(vmId);
+    this.stale.delete(vmId);
+    await this.persist();
   }
 
   async screendump(vmId: string, owner: string): Promise<Buffer> {
