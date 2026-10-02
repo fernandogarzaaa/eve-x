@@ -8,3 +8,5 @@ models/
 *.qcow2
 *.png
 coverage/
+infra/deployment/tls/certs/
+gpu-ckpt.pt

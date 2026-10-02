@@ -81,35 +81,70 @@ export interface VncInput {
   disconnect(): void;
 }
 
-function readExactly(sock: Socket, n: number, timeoutMs = 8000): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
-    let acc = Buffer.alloc(0);
-    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
-      cleanup();
-      reject(new EveError("VNC_TIMEOUT", `VNC read timed out after ${n} bytes`));
-    }, timeoutMs);
-    const onData = (chunk: Buffer): void => {
-      acc = Buffer.concat([acc, chunk]);
-      if (acc.length >= n) {
-        cleanup();
-        const out = acc.subarray(0, n);
-        const rest = acc.subarray(n);
-        if (rest.length > 0) sock.unshift(rest);
-        resolve(out);
-      }
-    };
-    const onError = (err: Error): void => { cleanup(); reject(err); };
-    const onClose = (): void => { cleanup(); reject(new EveError("VNC_CLOSED", "VNC socket closed mid-read")); };
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      sock.off("data", onData);
-      sock.off("error", onError);
-      sock.off("close", onClose);
-    };
-    sock.on("data", onData);
-    sock.once("error", onError);
-    sock.once("close", onClose);
-  });
+/**
+ * Buffered socket reader with ONE permanent data listener. Sequential
+ * readExactly-style readers that attach/detach per read and use
+ * sock.unshift() for leftovers are broken: unshifted bytes are not
+ * re-emitted to subsequently attached 'data' listeners, so any read that
+ * follows a split delivery hangs forever. This reader never unshifts and
+ * never detaches until close.
+ */
+class SockReader {
+  private buf = Buffer.alloc(0);
+  private waiters: Array<() => void> = [];
+  private closed = false;
+  private failed: Error | null = null;
+
+  constructor(private readonly sock: Socket) {
+    sock.on("data", (chunk: Buffer) => {
+      this.buf = Buffer.concat([this.buf, chunk]);
+      const w = this.waiters;
+      this.waiters = [];
+      for (const fn of w) fn();
+    });
+    sock.once("error", (err: Error) => this.kill(err));
+    sock.once("close", () => this.kill(new EveError("VNC_CLOSED", "VNC socket closed mid-read")));
+  }
+
+  private kill(err: Error): void {
+    if (this.failed) return;
+    this.failed = err;
+    const w = this.waiters;
+    this.waiters = [];
+    for (const fn of w) fn();
+  }
+
+  read(n: number, timeoutMs = 8000): Promise<Buffer> {
+    if (this.buf.length >= n) {
+      const out = this.buf.subarray(0, n);
+      this.buf = this.buf.subarray(n);
+      return Promise.resolve(out);
+    }
+    return new Promise<Buffer>((resolve, reject) => {
+      const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+        const i = this.waiters.indexOf(waiter);
+        if (i >= 0) this.waiters.splice(i, 1);
+        reject(new EveError("VNC_TIMEOUT", `VNC read timed out after ${this.buf.length}/${n} bytes`));
+      }, timeoutMs);
+      const waiter = (): void => {
+        if (this.failed) {
+          clearTimeout(timer);
+          reject(this.failed);
+          return;
+        }
+        if (this.buf.length >= n) {
+          clearTimeout(timer);
+          const out = this.buf.subarray(0, n);
+          this.buf = this.buf.subarray(n);
+          resolve(out);
+          return;
+        }
+        // Still hungry: stay subscribed for the next arrival.
+        this.waiters.push(waiter);
+      };
+      this.waiters.push(waiter);
+    });
+  }
 }
 
 /** Real VNC RFB 3.8 client: version + None-auth handshake, then input events. */
@@ -133,25 +168,39 @@ export class VncRfbInput implements VncInput {
       sock.once("error", (err: Error) => { clearTimeout(timer); reject(err); });
     });
     // server version (12 bytes "RFB 003.008\n"), reply with same
-    const ver = await readExactly(sock, 12);
+    const rd = new SockReader(sock);
+    const ver = await rd.read(12);
     sock.write(ver);
-    // security: count + types; require None (1)
-    const countBuf = await readExactly(sock, 1);
+    // security: count + types; require None (1). Two server behaviors exist
+    // in the wild: standard RFB 3.8 (count immediately followed by the type
+    // list) and the x11vnc style (count alone, then the server waits for the
+    // client's selection before SecurityResult). Support both; anything else
+    // fails closed.
+    const countBuf = await rd.read(1);
     const count = countBuf[0] ?? 0;
     if (count === 0) {
-      const lenBuf = await readExactly(sock, 4);
+      const lenBuf = await rd.read(4);
       const len = lenBuf.readUInt32BE(0);
-      const reason = (await readExactly(sock, len)).toString("utf8");
+      const reason = (await rd.read(len)).toString("utf8");
       sock.destroy();
       throw new EveError("VNC_AUTH", `Server refused connection: ${reason}`);
     }
-    const types = await readExactly(sock, count);
-    if (!types.includes(1)) {
+    if (count !== 1) {
+      sock.destroy();
+      throw new EveError("VNC_AUTH", `Server offers ${count} security types; single None-auth type required`);
+    }
+    let types: Buffer;
+    try {
+      types = await rd.read(count, 1500);
+    } catch {
+      types = Buffer.alloc(0); // x11vnc style: list never sent; select below
+    }
+    if (types.length === count && !types.includes(1)) {
       sock.destroy();
       throw new EveError("VNC_AUTH", "Server requires auth; only None supported");
     }
     sock.write(Buffer.from([1]));
-    const secResult = await readExactly(sock, 4);
+    const secResult = await rd.read(4);
     if (secResult.readUInt32BE(0) !== 0) {
       sock.destroy();
       throw new EveError("VNC_AUTH", "Security handshake failed");
@@ -159,11 +208,11 @@ export class VncRfbInput implements VncInput {
     // ClientInit: shared flag
     sock.write(Buffer.from([1]));
     // ServerInit: w(2) h(2) pixfmt(16) namelen(4) name
-    const init = await readExactly(sock, 24);
+    const init = await rd.read(24);
     this.w = init.readUInt16BE(0);
     this.h = init.readUInt16BE(2);
     const nameLen = init.readUInt32BE(20);
-    if (nameLen > 0) await readExactly(sock, nameLen);
+    if (nameLen > 0) await rd.read(nameLen);
     // SetEncodings: Raw only
     const enc = Buffer.alloc(8);
     enc[0] = 2; enc[2] = 0; enc[3] = 1;

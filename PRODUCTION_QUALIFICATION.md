@@ -118,11 +118,43 @@ Every VERIFIED row ran on this machine; commands and artifacts are named.
 | Load | 50 sessions | NOT_AVAILABLE_IN_ENVIRONMENT | 10-session parallel done; 25–50 would trip local rate budget and lack VM backends |
 | Crash injection (API kill) | kill -9 during idle + restart | VERIFIED | sessions/traces rehydrated; in-flight single act is synchronous (no partial-write path) |
 
+## 9. Linux/KVM production path (WSL2 Ubuntu 24.04, /dev/kvm, QEMU 10.2.1)
+
+Environment: WSL 2.7.13 / kernel 6.18.33.2-microsoft-standard-WSL2 / i5-9300H
+(VT-x) / Docker Desktop 4.91.0 / RTX 2060 (CUDA 13.4). Evidence bundle:
+`artifacts/qualification/` (gitignored; provenance via this matrix + commits).
+
+| Capability | Test | Result | Evidence |
+|---|---|---|---|
+| KVM boot | overlay+seed+boot → RUNNING via OUR QemuDriver | VERIFIED | 23/23 `wsl-kvm-qual` phases, 178 s; boot 200–330 ms to QMP RUNNING |
+| Real QMP | version/status/screendump/savevm/loadvm/powerdown | VERIFIED | QMP 10.2.1 handshake; 1569-byte real PNG screendump |
+| Base immutability | digest before vs after full lifecycle | VERIFIED | identical sha256; `BASE_MUTATED` refusal path unit-tested |
+| Guest agent exec | hostname/write/read via direct QGA channel | VERIFIED | ~50 s to agent-up on first boot (cloud-init apt) |
+| savevm/loadvm proof | write → snapshot → delete → loadvm → file back | VERIFIED | `restore-proof` with real marker bytes |
+| Fork isolation | fork → A/B files independent | VERIFIED | `fork-isolation` BRANCH-A/B; child loadvm marker + `cont` |
+| Pause/resume/races | pause, resume, double-boot reject | VERIFIED | live + unit matrix |
+| Seed + secrets | seed.iso ro-attached, guest-secret 0600 | VERIFIED | cloud-init consumed seed (hostname `eve-qual-01`); secret file present |
+| Escape probes | metadata/QMP/secrets/loopback from inside guest | VERIFIED | `escape-probes.json`: metadata blocked, no QMP sock, no host secrets, host loopback blocked |
+| Docker backend | create/boot/exec/shot/snapshot/restore/destroy | VERIFIED | 14/14 `docker-qual` in 24 s; real 594 KB desktop PNG |
+| Docker hardening | inspect flags | VERIFIED | cap-drop ALL, pids 256, non-privileged, no host mounts; allowlisted→none + full→bridge both observed |
+| VNC/RFB input | handshake + Super_L + click/type with pixel proof | VERIFIED | 6/6 `vnc-qual`; menu opened (bytes differ); dual handshake styles unit-tested |
+| Postgres live | CRUD + pg_dump + drop + restore | VERIFIED | 2 rows restored; backup artifact saved; EVE-X unaffected by pg kill (file fallback) |
+| Redis live | SET/GET/EX lease pattern | VERIFIED | PONG + lease round-trip; EVE-X unaffected by redis kill |
+| MinIO | pull/run | NOT_AVAILABLE | registry denies `minio/minio` pulls from this network (3 attempts, 2 tags); backup/restore qualified at pg + filesystem level instead |
+| GPU training | 5-epoch bbox-regression on CUDA + resume | VERIFIED | `gpu.json`: loss 0.2044→0.0652, 1.15 s, infer 0.29 ms/batch, 21.5 MB VRAM (RTX 2060, torch 2.14+cu126) |
+| TLS termination | nginx sidecar, TLS 1.3, validated HTTPS + WSS | VERIFIED | `TLS_AES_256_GCM_SHA384`, CN=localhost; cert/key gitignored qual-only material |
+| WS upgrade router | exact/param/unknown paths | VERIFIED | 3 ws-stream tests (found + fixed double-handler 400) |
+| Clock skew | HMAC ±60 s, TTL bounds, epoch fencing, order check | VERIFIED | 16 clock-skew tests (found + fixed replay order-blindness) |
+| 50-session burst | 50 parallel creates | VERIFIED | 20 ok + 30 correct 429s, 0 errors, p95 221 ms, 73 MB RSS |
+| API kill -9 + restart | session create → act → kill → trace/replay | VERIFIED | steps 0,1 intact, replay ok |
+| linux-doctor/qualification | syntax + live run on WSL2 Ubuntu | VERIFIED | 13 pass / 0 fail / 2 honest warns (no iptables in WSL2, data dir) |
+| Graphical QEMU desktop | LXDE baked into KVM guest | NOT_AVAILABLE | KVM guest is server-minimal (cloud image); graphical proof via Docker backend; desktop bake remains the documented `build.sh` procedure |
+
 ## 8. Defect ledger (all fixed, retested)
 
 P0: none found (no secret material, no reachable isolation bypass, no unbounded destructive path).
-P1 (28): fabricated replay verdict; fabricated benchmark scores; fail-open VM transition; unconditional restore→RUNNING; missing rate limits; missing idempotency; missing stale-frame check; memory-only control-plane state; worker self-declared success; worker takeover blindness; non-atomic lease claim; QMP double-append; same-owner fork ban; quota-after-create race; destroy-vs-inflight abort; RESTORING stuck on failure; stale mcp-shared routes; MCP caller-auth conflation; MCP HTTP open mode; MCP per-request server (sessions could never persist); client-side-only blind review; tasks/validate auto-pass; memory-only session tokens; non-constant-time compare; blob path traversal; missing CORS; 500 message leak; fail-open `["*"]` fallback.
-P2 (31): VNC display collision; stale qmp.sock; QMP flood/timeouts; docker net/caps/image; FAILED boot retry; registry persistence; worker crash loop/seq collision; dev-cap overgrant; audit rotation; trace size cap + tail-read; CAS; label validation; judgment dedupe; request IDs; server timeouts; Dockerfiles; bootstrap; requirements; train resume; skill stales; integration entry drift; session-steps hydration; scanner precision; uuid removal; verifier label coverage.
+P1 (38): prior 28 + QMP `kvm,tcg` comma form rejected by QEMU 10; QMP guest-exec passthrough absent on Debian QEMU 10 (direct QGA channel built); QGA greeting assumption (agent stays silent until guest-sync); guest-exec `{return}` envelope misread; fork on live image refused by QEMU locks (quiesced stop→marker→copy→resume + child loadvm); fork child frozen (marker taken halted → `cont` after loadvm); WS competing upgrade handlers (parameterized stream 400); replay order-blindness (reordered log passed); VNC `unshift` hang (persistent buffered reader); fixed VNC agent port collision across VMs.
+P2 (36): prior 31 + display/port allocator TCP probing; configurable agent/SSH port bases; X-display discovery for screendump; X-readiness retry; actionable screenshot errors; cap-drop vs runtime-apt constraint (bake pattern); base-image Chrome key workaround (qual-only); guest SSH recovery forward; seed ISO + guest-secret provisioning; QEMU display/VNC localhost binding; qual orphan pre-flight; pgrep self-match guard.
 P3 (6): console static resolution; openapi/API.md drift; MCP stub comment; worker lint comment token; docs port/command drift; session GET steps display.
 
-FAILED rows: none. All P0/P1 fixed; P2 fixed where verifiable locally; externally-blocked items are named above with the exact missing infrastructure.
+FAILED rows: none. All P0/P1 fixed; externally-blocked items (MinIO pulls, graphical QEMU desktop) named with exact blockers.

@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { join } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import { VmSpec, VmState } from "../../protocol/src/index.js";
@@ -50,7 +51,7 @@ const TRANSITIONS = VM_TRANSITIONS as unknown as Record<VmStateT, VmStateT[]>;
 
 export interface VmDriver {
   readonly backend: string;
-  create(specInput: unknown, owner: string): Promise<VmRecord>;
+  create(specInput: unknown, owner: string, opts?: CreateOpts): Promise<VmRecord>;
   boot(vmId: string): Promise<void>;
   shutdown(vmId: string): Promise<void>;
   pause(vmId: string): Promise<void>;
@@ -67,6 +68,18 @@ export interface VmDriver {
 
 export const SnapshotName = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/);
 
+/** Optional per-create driver options. `baseImage` names a read-only base
+ *  qcow2 inside the driver's images directory; the VM gets a private
+ *  copy-on-write overlay and the base is never written. `seedUserData`
+ *  (cloud-config) and `sshKey` build a per-VM NoCloud seed ISO containing
+ *  the guest-agent secret; the seed is attached read-only at boot. */
+export interface CreateOpts {
+  baseImage?: string;
+  seedUserData?: string;
+  sshKey?: string;
+  hostname?: string;
+}
+
 // V13: single snapshot-label validator shared by every driver. Rejects empty
 // and overlong labels (regex requires 1–64 chars); drivers must call this
 // instead of inlining their own checks.
@@ -82,6 +95,107 @@ export function validateDockerImage(image: string): string {
     throw new EveError("BAD_IMAGE", `Illegal docker image name: ${image}`);
   }
   return image;
+}
+
+// ── Base-image overlays + guest-secret provisioning ─────────────────────────
+// Base images are read-only golden artifacts. Every VM boots a private
+// copy-on-write overlay; the base file itself is never opened for writing by
+// EVE-X. `backingDigest` fingerprints size + head/tail bytes (fast even for
+// multi-GB images) so boot can detect accidental or hostile base mutation.
+
+export interface BasePin {
+  base: string;
+  digest: string;
+  size: number;
+}
+
+export async function backingDigest(path: string): Promise<{ digest: string; size: number }> {
+  const fh = await fs.open(path, "r");
+  try {
+    const st = await fh.stat();
+    const h = createHash("sha256");
+    h.update(`size:${st.size}\n`);
+    const span = Math.min(65536, st.size);
+    if (span > 0) {
+      const head = Buffer.alloc(span);
+      await fh.read(head, 0, span, 0);
+      h.update(head);
+      if (st.size > span) {
+        const tail = Buffer.alloc(span);
+        await fh.read(tail, 0, span, st.size - span);
+        h.update(tail);
+      }
+    }
+    return { digest: h.digest("hex"), size: st.size };
+  } finally {
+    await fh.close();
+  }
+}
+
+/** Resolve a base-image name strictly inside `imagesDir` (no traversal). */
+export function resolveBaseImage(imagesDir: string, name: string): string {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name)) {
+    throw new EveError("BAD_IMAGE", `Illegal base image name: ${name}`);
+  }
+  const p = resolve(imagesDir, name);
+  if (p !== resolve(imagesDir, basename(p))) {
+    throw new EveError("BAD_IMAGE", `Base image escapes images dir: ${name}`);
+  }
+  return p;
+}
+
+/** Per-VM guest-agent HMAC secret, 0600 inside the VM workdir. The host
+ *  channel reads it back; cloud-init/seed injection carries it into the guest
+ *  (see infra/vm-images/build.sh --secret-file). Never logged. */
+export async function provisionGuestSecret(workdir: string): Promise<string> {
+  const secret = randomBytes(32).toString("hex");
+  const p = join(workdir, "guest-secret");
+  await fs.writeFile(p, secret + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    await fs.chmod(p, 0o600);
+  } catch { /* best effort on non-posix fs */ }
+  return secret;
+}
+
+export async function readGuestSecret(workdir: string): Promise<string | null> {
+  try {
+    const s = (await fs.readFile(join(workdir, "guest-secret"), "utf8")).trim();
+    return s.length >= 16 ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Default NoCloud user-data: locked guest account, qemu-guest-agent,
+ *  openssh, and the per-VM EVE agent secret written for the in-guest
+ *  runtime. The secret travels only inside the seed ISO, never in logs. */
+export function defaultSeedUserData(input: { hostname: string; sshKey?: string; guestSecret: string }): string {
+  const keyBlock = input.sshKey
+    ? `    ssh_authorized_keys:\n      - ${input.sshKey}\n`
+    : "";
+  return `#cloud-config
+hostname: ${input.hostname}
+manage_etc_hosts: true
+users:
+  - name: eveagent
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+${keyBlock}packages:
+  - qemu-guest-agent
+  - openssh-server
+write_files:
+  - path: /opt/eve-agent/secret
+    owner: root:root
+    permissions: '0600'
+    content: |
+      ${input.guestSecret}
+runcmd:
+  - [ systemctl, enable, --now, qemu-guest-agent ]
+  - [ systemctl, enable, --now, ssh ]
+  - [ mkdir, -p, /opt/eve-agent ]
+  - [ chmod, "0755", /opt/eve-agent ]
+`;
 }
 
 // ── Small process helper (real spawn, no shell) ──────────────────────────────
@@ -137,7 +251,77 @@ export class QmpConnection {
   private pending = new Map<number, { resolve: (v: QmpResponse) => void; reject: (e: Error) => void }>();
   private nextId = 1;
 
+  /**
+   * Connect to a QEMU QMP socket: greeting + qmp_capabilities handshake.
+   * Rejects on timeout, bad greeting, or failed handshake.
+   */
   connect(sockPath: string, timeoutMs = 15000): Promise<void> {
+    return this.handshake(sockPath, timeoutMs);
+  }
+
+  /**
+   * Connect to a qemu-guest-agent virtio-serial socket. Unlike QMP, QGA
+   * sends no greeting: the client must speak first. Liveness is proven by
+   * an immediate guest-sync round-trip. Used because QMP guest-exec
+   * passthrough is absent on some QEMU builds (e.g. Debian QEMU 10
+   * registers no guest-* QMP commands) — the direct QGA channel is the
+   * portable path.
+   */
+  async connectQga(sockPath: string, timeoutMs = 15000): Promise<void> {
+    await this.connectRaw(sockPath, timeoutMs);
+    const syncId = Math.floor(Math.random() * 1_000_000_000);
+    let res: QmpResponse;
+    try {
+      res = await this.commandRaw("guest-sync", { id: syncId });
+    } catch (err) {
+      this.close();
+      throw new EveError("QGA_ABSENT", `Guest agent sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const back = (res["return"] as number | undefined) ?? (res["result"] as number | undefined);
+    if (back !== syncId) {
+      this.close();
+      throw new EveError("QGA_ABSENT", "Guest agent sync mismatch (no live agent on channel)");
+    }
+  }
+
+  /** Attach to a socket with no greeting and no handshake (QGA-style peers
+   *  that stay silent until spoken to). Resolves once connected. */
+  private connectRaw(sockPath: string, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.buf = "";
+      const sock: Socket = createConnection({ path: sockPath });
+      const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+        try { sock.destroy(); } catch { /* already gone */ }
+        finish(() => reject(new EveError("QMP_TIMEOUT", `QGA connect timed out: ${sockPath}`)));
+      }, timeoutMs);
+      let done = false;
+      const finish = (fn: () => void): void => {
+        if (!done) { done = true; clearTimeout(timer); fn(); }
+      };
+      this.sock = sock;
+      sock.on("data", (chunk: Buffer) => {
+        this.buf += chunk.toString("utf8");
+        if (this.buf.length > QMP_MAX_BUF) {
+          const flood = new EveError("QMP_FLOOD", "QGA buffer exceeded 4MB; closing connection");
+          this.buf = "";
+          this.failAll(flood);
+          try { sock.destroy(); } catch { /* already gone */ }
+          return;
+        }
+        this.pump();
+      });
+      sock.on("connect", () => finish(() => resolve()));
+      sock.on("error", (err: Error) => {
+        this.failAll(err);
+        finish(() => reject(new EveError("QMP_CONNECT", `QGA socket error: ${err.message}`)));
+      });
+      sock.on("close", () => {
+        this.failAll(new EveError("QMP_CLOSED", "QGA socket closed"));
+      });
+    });
+  }
+
+  private handshake(sockPath: string, timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.buf = "";
       const sock: Socket = createConnection({ path: sockPath });
@@ -285,6 +469,7 @@ export class VmCell {
   readonly sm: StateMachine<VmStateT>;
   proc: ChildProcess | null = null;
   qmp: QmpConnection | null = null;
+  qga: QmpConnection | null = null;
   startedAtMs: number | null = null;
   readonly audit: VmAuditEntry[] = [];
 
@@ -395,6 +580,46 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Per-display host port triple. Agent/SSH forwards are derived (never a
+ *  fixed per-host port) so N concurrent guests cannot collide. Bases are
+ *  driver-configurable for test hermeticity (defaults = production). */
+export function portsForDisplay(
+  vncBase: number,
+  display: number,
+  agentBase = 18080,
+  sshBase = 22000,
+): { vnc: number; agent: number; ssh: number } {
+  const i = display - vncBase;
+  return { vnc: 5900 + display, agent: agentBase + i, ssh: sshBase + i };
+}
+
+/** True when something answers on host:port within `timeoutMs`. Used to
+ *  avoid claiming displays held by out-of-band processes. */
+export function tcpPortBusy(host: string, port: number, timeoutMs = 300): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    const finish = (busy: boolean): void => {
+      if (done) return;
+      done = true;
+      resolve(busy);
+    };
+    const timer = setTimeout(() => {
+      try { sock.destroy(); } catch { /* ignore */ }
+      finish(false);
+    }, timeoutMs);
+    const sock = createConnection({ host, port });
+    sock.on("connect", () => {
+      clearTimeout(timer);
+      try { sock.destroy(); } catch { /* ignore */ }
+      finish(true);
+    });
+    sock.on("error", () => {
+      clearTimeout(timer);
+      finish(false);
+    });
+  });
+}
+
 function waitExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
   return new Promise<void>((resolve) => {
     if (proc.exitCode !== null || proc.signalCode !== null) { resolve(); return; }
@@ -414,6 +639,10 @@ async function sleep(ms: number): Promise<void> {
 export interface QemuDriverOpts {
   imagesDir?: string;
   vncBase?: number;
+  /** First host port for per-VM agent forwards (default 18080). */
+  agentBase?: number;
+  /** First host port for per-VM SSH forwards (default 22000). */
+  sshBase?: number;
 }
 
 export class QemuDriver implements VmDriver {
@@ -426,10 +655,18 @@ export class QemuDriver implements VmDriver {
   private readonly displayOf = new Map<string, number>();
   private readonly imagesDir: string;
   private readonly vncBase: number;
+  private readonly agentBase: number;
+  private readonly sshBase: number;
 
   constructor(opts: QemuDriverOpts = {}) {
     this.imagesDir = opts.imagesDir ?? join(tmpdir(), "eve-x", "images");
     this.vncBase = opts.vncBase ?? 10;
+    this.agentBase = opts.agentBase ?? 18080;
+    this.sshBase = opts.sshBase ?? 22000;
+  }
+
+  private portsFor(d: number): { vnc: number; agent: number; ssh: number } {
+    return portsForDisplay(this.vncBase, d, this.agentBase, this.sshBase);
   }
 
   private withCellLock<T>(cell: VmCell, fn: () => Promise<T>): Promise<T> {
@@ -439,17 +676,38 @@ export class QemuDriver implements VmDriver {
   // V2 test hook + boot primitive: claim a free display in
   // [vncBase, vncBase+40), or throw NO_DISPLAY when exhausted. Idempotent per
   // vmId so a retry after FAILED reuses its own claim instead of leaking one.
-  allocateDisplay(vmId: string): number {
+  // The TCP probe guards against out-of-band holders (orphaned QEMU from a
+  // previous process, foreign services): a display whose VNC/agent/SSH ports
+  // answer is skipped, never stolen.
+  async allocateDisplay(vmId: string): Promise<number> {
     const existing = this.displayOf.get(vmId);
     if (existing !== undefined) return existing;
     for (let d = this.vncBase; d < this.vncBase + 40; d++) {
-      if (!this.displays.has(d)) {
-        this.displays.add(d);
-        this.displayOf.set(vmId, d);
-        return d;
-      }
+      if (this.displays.has(d)) continue;
+      const ports = this.portsFor(d);
+      if (await tcpPortBusy("127.0.0.1", ports.vnc)) continue;
+      if (await tcpPortBusy("127.0.0.1", ports.agent)) continue;
+      if (await tcpPortBusy("127.0.0.1", ports.ssh)) continue;
+      this.displays.add(d);
+      this.displayOf.set(vmId, d);
+      return d;
     }
     throw new EveError("NO_DISPLAY", `No free VNC display in [${this.vncBase}, ${this.vncBase + 40})`);
+  }
+
+  /** Host ports derived from a display claim. VNC 59xx is QEMU's own
+   *  mapping; agent/SSH forwards are per-VM so concurrent guests never
+   *  collide on a fixed port. */
+  guestAgentPort(vmId: string): number {
+    const d = this.displayOf.get(vmId);
+    if (d === undefined) throw new EveError("NO_DISPLAY", `No display claimed for ${vmId}`);
+    return this.portsFor(d).agent;
+  }
+
+  guestSshPort(vmId: string): number {
+    const d = this.displayOf.get(vmId);
+    if (d === undefined) throw new EveError("NO_DISPLAY", `No display claimed for ${vmId}`);
+    return this.portsFor(d).ssh;
   }
 
   releaseDisplay(vmId: string): void {
@@ -468,6 +726,13 @@ export class QemuDriver implements VmDriver {
     cellOrThrow(this.cells, vmId).go(to, "test-hook");
   }
 
+  /** Live QMP channel for a booted cell (qualification/diagnostics hook). */
+  qmpForTest(vmId: string): QmpConnection {
+    const cell = cellOrThrow(this.cells, vmId);
+    if (!cell.qmp) throw new EveError("QMP_CLOSED", `No live QMP channel for ${vmId}`);
+    return cell.qmp;
+  }
+
   private qcow2(cell: VmCell): string {
     return join(cell.record.workdir, "disk.qcow2");
   }
@@ -476,29 +741,85 @@ export class QemuDriver implements VmDriver {
     return join(cell.record.workdir, "qmp.sock");
   }
 
-  async create(specInput: unknown, owner: string): Promise<VmRecord> {
+  async create(specInput: unknown, owner: string, opts: CreateOpts = {}): Promise<VmRecord> {
     const spec = VmSpec.parse(specInput);
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
     const vmId = uid("vm");
     const workdir = join(this.imagesDir, vmId);
     await fs.mkdir(workdir, { recursive: true });
     const cell = new VmCell({ vmId, owner, backend: this.backend, spec, workdir });
-    const img = await runCmd("qemu-img", ["create", "-f", "qcow2", this.qcow2(cell), `${spec.diskGb}G`], 60000);
+    // Per-VM guest-agent secret lands in the workdir before anything boots.
+    const guestSecret = await provisionGuestSecret(workdir);
+    // Per-VM NoCloud seed: identity + ssh + guest secret for the in-guest
+    // agent. Built with cloud-localds when available; otherwise the VM boots
+    // seedless and the audit record says so (never silently assumed).
+    const seedIso = join(workdir, "seed.iso");
+    let seeded = false;
+    try {
+      const userData = opts.seedUserData ?? defaultSeedUserData({
+        hostname: opts.hostname ?? `eve-${vmId}`,
+        sshKey: opts.sshKey,
+        guestSecret,
+      });
+      await fs.writeFile(join(workdir, "user-data"), userData, "utf8");
+      await fs.writeFile(
+        join(workdir, "meta-data"),
+        `instance-id: ${vmId}\nlocal-hostname: ${opts.hostname ?? `eve-${vmId}`}\n`,
+        "utf8",
+      );
+      const seed = await runCmd("cloud-localds", [seedIso, join(workdir, "user-data"), join(workdir, "meta-data")], 60000);
+      seeded = seed.code === 0;
+      if (!seeded) await fs.rm(seedIso, { force: true });
+    } catch {
+      seeded = false;
+    }
+    cell.note("seed", seeded ? `nocloud ${seedIso}` : "seedless: cloud-localds unavailable");
+    let imgArgs: string[];
+    if (opts.baseImage) {
+      // Overlay mode: private CoW layer over a read-only golden base. The
+      // base itself is never opened for writing by this path.
+      const base = resolveBaseImage(this.imagesDir, opts.baseImage);
+      const pin = await backingDigest(base).catch((err) => {
+        throw new EveError("BASE_MISSING", `Base image unreadable: ${opts.baseImage}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      await fs.writeFile(join(workdir, "base-pin.json"), JSON.stringify({ base, ...pin }, null, 2), "utf8");
+      imgArgs = ["create", "-f", "qcow2", "-F", "qcow2", "-b", base, this.qcow2(cell)];
+      cell.note("create", `overlay over ${opts.baseImage} digest=${pin.digest.slice(0, 16)} cpu=${spec.cpu} mem=${spec.memoryMb}Mb`);
+    } else {
+      imgArgs = ["create", "-f", "qcow2", this.qcow2(cell), `${spec.diskGb}G`];
+      cell.note("create", `qcow2 ${spec.diskGb}G cpu=${spec.cpu} mem=${spec.memoryMb}Mb`);
+    }
+    const img = await runCmd("qemu-img", imgArgs, 60000);
     if (img.code !== 0) {
       await fs.rm(workdir, { recursive: true, force: true });
       throw new EveError("QEMU_IMAGE_FAILED", `qemu-img failed: ${img.stderr || img.stdout}`);
     }
-    cell.note("create", `qcow2 ${spec.diskGb}G cpu=${spec.cpu} mem=${spec.memoryMb}Mb`);
     cell.go("CREATED", "image-ready");
     this.cells.set(vmId, cell);
     return cell.snapshotRecord();
+  }
+
+  /** Re-fingerprint the pinned base; any drift refuses boot (fail closed). */
+  private async verifyBaseImmutable(cell: VmCell): Promise<void> {
+    let pin: BasePin;
+    try {
+      pin = JSON.parse(await fs.readFile(join(cell.record.workdir, "base-pin.json"), "utf8")) as BasePin;
+    } catch {
+      return; // no overlay: nothing pinned
+    }
+    const cur = await backingDigest(pin.base).catch(() => null);
+    if (!cur || cur.digest !== pin.digest || cur.size !== pin.size) {
+      throw new EveError("BASE_MUTATED", `Base image ${pin.base} changed since overlay creation; refusing boot`);
+    }
   }
 
   async boot(vmId: string): Promise<void> {
     const cell = cellOrThrow(this.cells, vmId);
     return this.withCellLock(cell, async () => {
       // Allocated before any transition: NO_DISPLAY leaves state untouched.
-      const display = this.allocateDisplay(cell.record.vmId);
+      // Async: the allocator TCP-probes each candidate triple so an orphaned
+      // QEMU (or any foreign listener) is skipped, never collided with.
+      const display = await this.allocateDisplay(cell.record.vmId);
       // V3: a crashed previous boot leaves qmp.sock behind and the next bind
       // fails; remove it best-effort before spawning.
       await fs.rm(this.qmpPath(cell), { force: true }).catch(() => undefined);
@@ -509,22 +830,64 @@ export class QemuDriver implements VmDriver {
         cell.go("CREATED", "boot-retry: recreated");
       }
       cell.go("BOOTING", "boot-requested");
+      // Base immutability is enforced before the first byte of guest code can
+      // run: a drifted golden image fails closed instead of booting.
+      try {
+        await this.verifyBaseImmutable(cell);
+      } catch (err) {
+        this.releaseDisplay(cell.record.vmId);
+        failCell(cell, err instanceof Error ? err.message : String(err));
+        throw err;
+      }
       const spec = cell.record.spec;
       const qmpSock = this.qmpPath(cell);
+      const qgaSock = join(cell.record.workdir, "qga.sock");
+      await fs.rm(qgaSock, { force: true }).catch(() => undefined);
       const args: string[] = [
+        // Repeated -accel flags = preference order (QEMU ≥7; the legacy
+        // "kvm,tcg" comma form is rejected by QEMU 10+).
+        "-accel", "kvm",
+        "-accel", "tcg",
         "-m", String(spec.memoryMb),
         "-smp", String(spec.cpu),
         "-drive", `file=${this.qcow2(cell)},format=qcow2,if=virtio`,
         "-qmp", `unix:${qmpSock},server=on,wait=off`,
+        // qemu-guest-agent channel (virtio-serial). The guest must run
+        // qemu-guest-agent (baked via cloud-init packages); without it the
+        // socket stays quiet and guest-exec fails closed with QGA_ABSENT.
+        "-chardev", `socket,path=${qgaSock},server=on,wait=off,id=qga0`,
+        "-device", "virtio-serial-pci",
+        "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         "-display", "none",
         "-vnc", `127.0.0.1:${display}`,
         "-k", "en-us",
         "-rtc", "base=utc",
+        // Seccomp sandbox: QEMU refuses obsolete syscalls, privilege
+        // elevation, process spawning and resource-control tampering.
+        "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
       ];
+      // Per-VM seed ISO, attached strictly read-only.
+      let seedAttached = false;
+      try {
+        await fs.access(join(cell.record.workdir, "seed.iso"));
+        args.push("-drive", `file=${join(cell.record.workdir, "seed.iso")},format=raw,if=virtio,readonly=on`);
+        seedAttached = true;
+      } catch { /* seedless boot */ }
       if (spec.network === "none") {
         args.push("-net", "none");
       } else {
-        args.push("-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0");
+        // User-mode networking with per-VM host-forwards for the in-guest
+        // EVE agent and diagnostic SSH. All forwards bind 127.0.0.1 only
+        // and are derived from the display claim (never fixed ports), so
+        // concurrent guests cannot collide. SSH uses the per-VM seed key
+        // and is a recovery channel, never the primary control mechanism
+        // (QMP + HMAC guest agent are).
+        const ports = this.portsFor(display);
+        cell.note("forwards", `agent=127.0.0.1:${ports.agent} ssh=127.0.0.1:${ports.ssh} (seed key only)`);
+        args.push(
+          "-netdev", `user,id=net0,hostfwd=tcp:127.0.0.1:${ports.agent}-:18080,hostfwd=tcp:127.0.0.1:${ports.ssh}-:22`,
+          "-device", "virtio-net-pci,netdev=net0",
+        );
       }
       let proc: ChildProcess;
       try {
@@ -544,6 +907,8 @@ export class QemuDriver implements VmDriver {
       proc.on("exit", () => {
         cell.qmp?.close();
         cell.qmp = null;
+        cell.qga?.close();
+        cell.qga = null;
       });
       // wait for the QMP socket to appear, then handshake
       const qmp = new QmpConnection();
@@ -567,7 +932,7 @@ export class QemuDriver implements VmDriver {
       }
       cell.qmp = qmp;
       cell.startedAtMs = Date.now();
-      cell.note("boot", `pid=${proc.pid ?? -1} vnc=127.0.0.1:${display} qmp=${qmpSock}`);
+      cell.note("boot", `pid=${proc.pid ?? -1} vnc=127.0.0.1:${display} qmp=${qmpSock} seed=${seedAttached ? "attached-ro" : "absent"}`);
       cell.go("READY", "qmp-handshake-ok");
       cell.go("RUNNING", "boot-complete");
     });
@@ -596,6 +961,8 @@ export class QemuDriver implements VmDriver {
       }
       cell.qmp?.close();
       cell.qmp = null;
+      cell.qga?.close();
+      cell.qga = null;
       cell.startedAtMs = null;
       this.releaseDisplay(cell.record.vmId);
       try {
@@ -691,35 +1058,119 @@ export class QemuDriver implements VmDriver {
   async clone(vmId: string, newOwner: string): Promise<VmRecord> {
     const src = cellOrThrow(this.cells, vmId);
     if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
+    return this.withCellLock(src, async () => (await this.cloneInnerNoLock(src, newOwner)).rec);
+  }
+
+  /** Clone without taking the source lock; the caller must already hold it
+   *  (clone() takes it; fork() holds it for the whole operation). */
+  private async cloneInnerNoLock(src: VmCell, newOwner: string): Promise<{ rec: VmRecord; marker: string | null }> {
+    const vmId = src.record.vmId;
     const dstId = uid("vm");
     const workdir = join(this.imagesDir, dstId);
     await fs.mkdir(workdir, { recursive: true });
     const dst = new VmCell({ vmId: dstId, owner: newOwner, backend: this.backend, spec: src.record.spec, workdir });
-    const cp = await runCmd("qemu-img", ["convert", "-O", "qcow2", this.qcow2(src), this.qcow2(dst)], 120000);
-    if (cp.code !== 0) {
+    let marker: string | null = null;
+    try {
+      if (src.sm.state === "RUNNING" || src.sm.state === "PAUSED") {
+        marker = await this.liveCopy(src, dst);
+      } else {
+        const cp = await runCmd("qemu-img", ["convert", "-O", "qcow2", this.qcow2(src), this.qcow2(dst)], 120000);
+        if (cp.code !== 0) {
+          throw new EveError("QEMU_CLONE_FAILED", `qemu-img convert failed: ${cp.stderr || cp.stdout}`);
+        }
+      }
+    } catch (err) {
       await fs.rm(workdir, { recursive: true, force: true });
-      throw new EveError("QEMU_CLONE_FAILED", `qemu-img convert failed: ${cp.stderr || cp.stdout}`);
+      throw err;
     }
     dst.note("clone", `from ${vmId}`);
     dst.go("CREATED", "clone-ready");
     this.cells.set(dstId, dst);
-    return dst.snapshotRecord();
+    return { rec: dst.snapshotRecord(), marker };
+  }
+
+  private async cloneInner(vmId: string, newOwner: string): Promise<{ rec: VmRecord; marker: string | null }> {
+    const src = cellOrThrow(this.cells, vmId);
+    if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
+    return this.withCellLock(src, async () => this.cloneInnerNoLock(src, newOwner));
+  }
+
+  /**
+   * Consistent copy of a LIVE source image. qemu-img convert cannot open an
+   * image QEMU holds, so: halt CPUs (stop) → savevm a fork marker (flushes
+   * all guest state into the image) → plain filesystem copy of the overlay
+   * (no QEMU locks involved; backing is shared read-only and never copied)
+   * → resume. The marker lets a forked child loadvm into the exact source
+   * moment. Failures resume the source whenever possible; a source that
+   * cannot resume lands in FAILED (never silently wedged).
+   */
+  private async liveCopy(src: VmCell, dst: VmCell): Promise<string> {
+    const wasPaused = src.sm.state === "PAUSED";
+    const q = await this.qmpOf(src);
+    if (!wasPaused) {
+      src.go("PAUSING", "clone-quiesce");
+      try {
+        await q.command("stop");
+      } catch (err) {
+        failCell(src, `clone-quiesce failed: ${errMsg(err)}`);
+        throw err;
+      }
+      src.go("PAUSED", "clone-quiesced");
+    }
+    const tag = validateSnapshotLabel(`fork-base-${dst.record.vmId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24)}`);
+    try {
+      await q.command("human-monitor-command", { "command-line": `savevm ${tag}` }, 120000);
+      src.note("fork-marker", tag);
+    } catch (err) {
+      await this.resumeCell(src, q).catch(() => undefined);
+      throw new EveError("QEMU_CLONE_FAILED", `fork marker savevm failed: ${errMsg(err)}`);
+    }
+    const cp = await runCmd("cp", [this.qcow2(src), this.qcow2(dst)], 120000);
+    if (cp.code !== 0) {
+      await this.resumeCell(src, q).catch(() => undefined);
+      throw new EveError("QEMU_CLONE_FAILED", `overlay copy failed: ${cp.stderr || cp.stdout}`);
+    }
+    if (!wasPaused) {
+      await this.resumeCell(src, q);
+    }
+    return tag;
+  }
+
+  private async resumeCell(src: VmCell, q: QmpConnection): Promise<void> {
+    try {
+      await q.command("cont");
+      if (src.sm.state === "PAUSED") src.go("RUNNING", "clone-resumed");
+    } catch (err) {
+      failCell(src, `clone-resume failed: ${errMsg(err)}`);
+      throw err;
+    }
   }
 
   async fork(vmId: string, newOwner: string): Promise<VmRecord> {
     const src = cellOrThrow(this.cells, vmId);
-    // The source cell is locked for the whole fork; clone/boot below only
-    // ever lock the *destination* cell, so no lock nesting can occur.
+    // The source cell is locked for the whole fork; cloneInner/boot below
+    // only ever lock the *destination* cell, so no lock nesting can occur.
+    // cloneInner quiesces the live source itself (stop → marker → copy →
+    // resume), so no outer stop/cont is needed or allowed here.
     return this.withCellLock(src, async () => {
       if (src.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot fork from ${src.sm.state}`);
       if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
-      // QEMU fork = clone the disk image, then boot the copy independently.
-      const rec = await this.clone(vmId, newOwner);
+      const { rec, marker } = await this.cloneInnerNoLock(src, newOwner);
       src.note("fork", `forked to ${rec.vmId}`);
       const dst = cellOrThrow(this.cells, rec.vmId);
       // fork goes through the normal boot path but keeps FORKING visible in audit
       dst.note("fork", `forked from ${vmId}`);
       await this.boot(dst.record.vmId);
+      if (marker) {
+        // Start the child at the exact source moment captured by the
+        // marker. The marker was taken with CPUs halted, so the child must
+        // be resumed after loadvm — otherwise it sits frozen while the
+        // state machine claims RUNNING.
+        const dq = await this.qmpOf(cellOrThrow(this.cells, rec.vmId));
+        await dq.command("human-monitor-command", { "command-line": `loadvm ${marker}` }, 120000);
+        await dq.command("cont");
+        cellOrThrow(this.cells, rec.vmId).note("fork-resume", `loaded marker ${marker}`);
+      }
       return cellOrThrow(this.cells, rec.vmId).snapshotRecord();
     });
   }
@@ -749,6 +1200,8 @@ export class QemuDriver implements VmDriver {
       }
       cell.qmp?.close();
       cell.qmp = null;
+      cell.qga?.close();
+      cell.qga = null;
       cell.startedAtMs = null;
       this.releaseDisplay(cell.record.vmId);
       await fs.rm(cell.record.workdir, { recursive: true, force: true });
@@ -786,9 +1239,108 @@ export class QemuDriver implements VmDriver {
     });
   }
 
+  // ── qemu-guest-agent execution (direct virtio-serial channel) ─────────────
+  // guest-exec runs a command INSIDE the guest (requires qemu-guest-agent
+  // running there, installed via the seed/cloud-init path). The channel is a
+  // direct connection to qga.sock with a guest-sync liveness proof — NOT QMP
+  // passthrough, which is absent on some QEMU builds (Debian QEMU 10
+  // registers no guest-* QMP commands). Without a live agent every call
+  // fails closed with QGA_ABSENT — never silently local.
+
+  private async qgaOf(cell: VmCell): Promise<QmpConnection> {
+    if (cell.qga) return cell.qga;
+    const conn = new QmpConnection();
+    try {
+      await conn.connectQga(join(cell.record.workdir, "qga.sock"), 10000);
+    } catch (err) {
+      conn.close();
+      throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    cell.qga = conn;
+    return conn;
+  }
+
+  async guestExec(vmId: string, argv: readonly string[]): Promise<{ pid: number }> {
+    const cell = cellOrThrow(this.cells, vmId);
+    if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
+      throw new EveError("INVALID_TRANSITION", `Cannot guest-exec from ${cell.sm.state}`);
+    }
+    const parsed = z.array(z.string().min(1).max(512)).min(1).max(16).parse([...argv]);
+    let q: QmpConnection;
+    try {
+      q = await this.qgaOf(cell);
+    } catch (err) {
+      cell.qga = null;
+      throw err;
+    }
+    let res: Record<string, unknown>;
+    try {
+      res = await q.command("guest-exec", {
+        path: parsed[0] as string,
+        arg: parsed.slice(1),
+        "capture-output": true,
+      });
+    } catch (err) {
+      cell.qga?.close();
+      cell.qga = null;
+      throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { pid: parseGuestExecPid(res) };
+  }
+
+  async guestExecStatus(vmId: string, pid: number): Promise<{ exited: boolean; exitcode?: number; out?: string; err?: string }> {
+    const cell = cellOrThrow(this.cells, vmId);
+    let q: QmpConnection;
+    try {
+      q = await this.qgaOf(cell);
+    } catch (err) {
+      cell.qga = null;
+      throw err;
+    }
+    let res: Record<string, unknown>;
+    try {
+      res = await q.command("guest-exec-status", { pid });
+    } catch (err) {
+      cell.qga?.close();
+      cell.qga = null;
+      throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const ret = (res["return"] ?? {}) as Record<string, unknown>;
+    const out64 = typeof ret["out-data"] === "string" ? Buffer.from(ret["out-data"], "base64").toString("utf8") : undefined;
+    const err64 = typeof ret["err-data"] === "string" ? Buffer.from(ret["err-data"], "base64").toString("utf8") : undefined;
+    return {
+      exited: Boolean(ret["exited"]),
+      exitcode: typeof ret["exitcode"] === "number" ? ret["exitcode"] : undefined,
+      out: out64,
+      err: err64,
+    };
+  }
+
+  /** Run argv to completion inside the guest (polls guest-exec-status). */
+  async guestExecSync(vmId: string, argv: readonly string[], timeoutMs = 60000): Promise<{ exitcode: number; out: string; err: string }> {
+    const { pid } = await this.guestExec(vmId, argv);
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const st = await this.guestExecStatus(vmId, pid);
+      if (st.exited) {
+        return { exitcode: st.exitcode ?? -1, out: st.out ?? "", err: st.err ?? "" };
+      }
+      if (Date.now() > deadline) throw new EveError("QGA_TIMEOUT", `guest-exec timed out: ${argv[0] ?? ""}`);
+      await sleep(500);
+    }
+  }
+
   auditLog(vmId: string): VmAuditEntry[] {
     return [...cellOrThrow(this.cells, vmId).audit];
   }
+}
+
+/** QMP envelopes wrap payloads in `{"return": ...}`. This parser isolates
+ *  that shape so a bare-payload regression fails loudly in unit tests. */
+export function parseGuestExecPid(res: Record<string, unknown>): number {
+  const pid = (res["return"] as { pid?: unknown } | undefined)?.pid;
+  if (typeof pid !== "number") throw new EveError("QGA_ABSENT", "guest-exec returned no pid (agent missing?)");
+  return pid;
 }
 
 // ── DockerDesktopDriver (real docker CLI: run/start/stop/commit/cp/exec/logs) ─
@@ -867,10 +1419,14 @@ export class DockerDesktopDriver implements VmDriver {
     return r;
   }
 
-  async create(specInput: unknown, owner: string): Promise<VmRecord> {
+  async create(specInput: unknown, owner: string, opts: CreateOpts = {}): Promise<VmRecord> {
     const spec = VmSpec.parse(specInput);
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
     validateDockerImage(this.imageFor(spec));
+    if (opts.baseImage) {
+      // Container backend boots from registry images, not qcow2 bases.
+      throw new EveError("UNSUPPORTED", "Docker backend does not use qcow2 base images");
+    }
     const vmId = uid("vm");
     const workdir = join(this.base, vmId);
     await fs.mkdir(workdir, { recursive: true });
@@ -1075,14 +1631,32 @@ export class DockerDesktopDriver implements VmDriver {
       throw new EveError("INVALID_TRANSITION", `Cannot screendump from ${cell.sm.state}`);
     }
     const name = this.cname(cell);
-    const shot = await runCmd("docker", ["exec", name, "sh", "-c",
-      "command -v scrot >/dev/null && scrot -o /tmp/eve-shot.png || (command -v import >/dev/null && DISPLAY=:0 import -window root /tmp/eve-shot.png)"], 30000);
-    if (shot.code !== 0) throw new EveError("SCREENSHOT_FAILED", `Guest screenshot tool failed: ${shot.stderr || shot.stdout}`);
-    const local = join(cell.record.workdir, `screen-${Date.now()}.png`);
-    await this.docker(["cp", `${name}:/tmp/eve-shot.png`, local]);
-    const data = await fs.readFile(local);
-    await fs.rm(local, { force: true });
-    return data;
+    // X display number varies by image (:0, :1, ...): discover it from
+    // /tmp/.X11-unix rather than assuming. Both tools need a live X server,
+    // which lags container start by seconds — retry to absorb guest boot
+    // skew instead of failing a healthy-but-warming guest.
+    const capture = "D=$(ls /tmp/.X11-unix/ 2>/dev/null | head -1 | sed 's/^X/:/'); D=${D:-:0}; " +
+      "(command -v scrot >/dev/null && DISPLAY=$D scrot -o /tmp/eve-shot.png) || " +
+      "(command -v import >/dev/null && DISPLAY=$D import -window root /tmp/eve-shot.png)";
+    let lastErr = "";
+    for (let attempt = 0; attempt < 15; attempt++) {
+      if (attempt > 0) await sleep(2000);
+      const shot = await runCmd("docker", ["exec", name, "sh", "-c", capture], 30000);
+      if (shot.code === 0) {
+        const local = join(cell.record.workdir, `screen-${Date.now()}.png`);
+        await this.docker(["cp", `${name}:/tmp/eve-shot.png`, local]);
+        const data = await fs.readFile(local);
+        await fs.rm(local, { force: true });
+        return data;
+      }
+      lastErr = shot.stderr || shot.stdout;
+    }
+    throw new EveError(
+      "SCREENSHOT_FAILED",
+      "Guest X server never became capturable (or image provides neither scrot nor ImageMagick import; " +
+        "bake one into the guest image — see docs/vm-images.md). " +
+        `Detail: ${lastErr}`,
+    );
   }
 
   async exec(vmId: string, argv: readonly string[]): Promise<CmdResult> {
@@ -1143,7 +1717,7 @@ export class DevFramebufferDriver implements VmDriver {
     cellOrThrow(this.cells, vmId).go(to, "test-hook");
   }
 
-  async create(specInput: unknown, owner: string): Promise<VmRecord> {
+  async create(specInput: unknown, owner: string, _opts: CreateOpts = {}): Promise<VmRecord> {
     const spec = VmSpec.parse(specInput);
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
     const vmId = uid("vm");
@@ -1487,7 +2061,7 @@ export class VmManager {
     }
   }
 
-  async create(owner: string, specInput: unknown, leaseTtlMs = 3600000): Promise<VmRecord> {
+  async create(owner: string, specInput: unknown, leaseTtlMs = 3600000, driverOpts: CreateOpts = {}): Promise<VmRecord> {
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
     const ttl = z.number().int().min(60000).max(86400000).parse(leaseTtlMs);
     // V8: parse the spec and enforce quotas BEFORE driver.create, so a denied
@@ -1496,7 +2070,7 @@ export class VmManager {
     // (concurrent callers serialize on the event loop between these awaits).
     const spec = VmSpec.parse(specInput);
     this.checkQuotas(owner, spec);
-    const rec = await this.primary.create(spec, owner);
+    const rec = await this.primary.create(spec, owner, driverOpts);
     this.registry.set(rec.vmId, { owner, backend: this.primary.backend, spec: rec.spec });
     this.leases.set(rec.vmId, { owner, expiresAtMs: Date.now() + ttl, ttlMs: ttl });
     this.trackPersisted(rec.vmId, rec, owner, false);
@@ -1665,6 +2239,28 @@ export class VmManager {
   async screendump(vmId: string, owner: string): Promise<Buffer> {
     const { driver } = this.mustOwn(vmId, owner);
     return driver.screendump(vmId);
+  }
+
+  /** qemu-guest-agent exec (QEMU backend only; others throw UNSUPPORTED). */
+  async guestExec(vmId: string, owner: string, argv: readonly string[]): Promise<{ pid: number }> {
+    const { driver } = this.mustOwn(vmId, owner);
+    const q = driver as unknown as { guestExec?: (id: string, a: readonly string[]) => Promise<{ pid: number }> };
+    if (typeof q.guestExec !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} has no guest-exec channel`);
+    return q.guestExec(vmId, argv);
+  }
+
+  async guestExecSync(
+    vmId: string,
+    owner: string,
+    argv: readonly string[],
+    timeoutMs = 60000,
+  ): Promise<{ exitcode: number; out: string; err: string }> {
+    const { driver } = this.mustOwn(vmId, owner);
+    const q = driver as unknown as {
+      guestExecSync?: (id: string, a: readonly string[], t?: number) => Promise<{ exitcode: number; out: string; err: string }>;
+    };
+    if (typeof q.guestExecSync !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} has no guest-exec channel`);
+    return q.guestExecSync(vmId, argv, timeoutMs);
   }
 
   async status(vmId: string, owner: string): Promise<VmStatus> {

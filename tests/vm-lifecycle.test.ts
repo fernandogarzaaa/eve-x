@@ -12,6 +12,8 @@ import {
   QemuDriver,
   QmpConnection,
   VmManager,
+  parseGuestExecPid,
+  portsForDisplay,
   validateDockerImage,
   validateSnapshotLabel,
 } from "../packages/vm/src/index.js";
@@ -177,18 +179,44 @@ describe("vm lifecycle (hardened)", () => {
   });
 
   it("VNC display allocation is unique, bounded, and reusable", async () => {
-    const q = new QemuDriver({ vncBase: 50 });
+    // Hermetic bases: production defaults (18080/22000) may be held by
+    // out-of-band processes on a dev box; the probe must skip those.
+    const q = new QemuDriver({ vncBase: 50, agentBase: 38080, sshBase: 42000 });
     const seen = new Set<number>();
     for (let i = 0; i < 40; i++) {
-      const d = q.allocateDisplay(`vm-${i}`);
+      const d = await q.allocateDisplay(`vm-${i}`);
       assert.ok(d >= 50 && d < 90, `display ${d} out of range`);
       assert.ok(!seen.has(d), `display ${d} allocated twice`);
       seen.add(d);
     }
     await assertThrowsCode(() => q.allocateDisplay("vm-overflow"), "NO_DISPLAY");
     q.releaseDisplay("vm-0");
-    const reused = q.allocateDisplay("vm-new");
+    const reused = await q.allocateDisplay("vm-new");
     assert.ok(seen.has(reused), "freed display should be reusable");
+  });
+
+  it("display allocator skips ports held by out-of-band processes", async () => {
+    const { createServer } = await import("node:net");
+    // Squat the VNC port of display 50 so the allocator must skip it.
+    const squat = createServer(() => undefined);
+    await new Promise<void>((resolve) => squat.listen(5950, "127.0.0.1", resolve));
+    try {
+      const q = new QemuDriver({ vncBase: 50, agentBase: 38180, sshBase: 42180 });
+      const d = await q.allocateDisplay("vm-skip");
+      assert.notEqual(d, 50, "display with busy VNC port must be skipped, never stolen");
+      assert.ok(d >= 51 && d < 90);
+    } finally {
+      await new Promise<void>((resolve) => squat.close(() => resolve()));
+    }
+  });
+
+  it("display port triples are derived and disjoint per display", async () => {
+    const a = portsForDisplay(10, 10);
+    const b = portsForDisplay(10, 11);
+    assert.deepEqual(a, { vnc: 5910, agent: 18080, ssh: 22000 });
+    assert.deepEqual(b, { vnc: 5911, agent: 18081, ssh: 22001 });
+    const all = [a.vnc, a.agent, a.ssh, b.vnc, b.agent, b.ssh];
+    assert.equal(new Set(all).size, all.length, "port triples must not overlap");
   });
 
   it("snapshot labels and docker image names are validated", async () => {
@@ -244,6 +272,61 @@ describe("vm lifecycle (hardened)", () => {
       const [a, b] = await Promise.all([qmp.command("query-status"), qmp.command("query-version")]);
       assert.deepEqual((a["return"] as { echo: string }).echo, "query-status");
       assert.deepEqual((b["return"] as { echo: string }).echo, "query-version");
+    } finally {
+      qmp.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("guest-exec parsers honor the real QMP {return:{...}} envelope", async () => {
+    // Real QEMU shape: payload nested under "return".
+    assert.equal(parseGuestExecPid({ return: { pid: 7 }, id: 3 }), 7);
+    // Bare-payload shape (the old bug) must fail closed, not yield undefined.
+    await assertThrowsCode(() => parseGuestExecPid({ pid: 7 }), "QGA_ABSENT");
+    await assertThrowsCode(() => parseGuestExecPid({ return: {} }), "QGA_ABSENT");
+  });
+
+  it("QGA channel: greeting without capabilities + guest-sync + guest-exec round-trip", async () => {
+    const dir = process.platform === "win32" ? "" : mkdtempSync(join(tmpdir(), "evex-qga-"));
+    const sockPath = process.platform === "win32"
+      ? `\\\\?\\pipe\\evex-qga-${process.pid}-${Date.now()}`
+      : join(dir, "qga.sock");
+    const server = createServer((conn: Socket) => {
+      // qemu-guest-agent style: NO greeting (the agent stays silent until
+      // spoken to) and no capabilities handshake. The client must initiate
+      // with guest-sync — a greeting-waiting client would hang here.
+      let acc = "";
+      conn.on("data", (d: Buffer) => {
+        acc += d.toString("utf8");
+        let nl = acc.indexOf("\n");
+        while (nl >= 0) {
+          const line = acc.slice(0, nl);
+          acc = acc.slice(nl + 1);
+          if (line.trim().length > 0) {
+            const msg = JSON.parse(line) as { execute: string; id: number; arguments?: Record<string, unknown> };
+            let ret: unknown = {};
+            if (msg.execute === "guest-sync") ret = (msg.arguments as { id: number }).id;
+            else if (msg.execute === "guest-exec") ret = { pid: 7 };
+            else if (msg.execute === "guest-exec-status") {
+              ret = { exited: true, exitcode: 0, "out-data": Buffer.from("eve-qual-01\n", "utf8").toString("base64") };
+            }
+            conn.write(`${JSON.stringify({ return: ret, id: msg.id })}\n`);
+          }
+          nl = acc.indexOf("\n");
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(sockPath, resolve));
+    const qmp = new QmpConnection();
+    try {
+      // capabilities must NOT be required on the QGA channel.
+      await qmp.connectQga(sockPath, 5000);
+      const ex = await qmp.command("guest-exec", { path: "/bin/hostname", arg: [], "capture-output": true });
+      assert.equal(parseGuestExecPid(ex), 7);
+      const st = await qmp.command("guest-exec-status", { pid: 7 });
+      const out64 = ((st["return"] ?? {}) as Record<string, unknown>)["out-data"];
+      assert.equal(typeof out64 === "string" ? Buffer.from(out64, "base64").toString("utf8") : "", "eve-qual-01\n");
     } finally {
       qmp.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));

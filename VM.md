@@ -36,10 +36,47 @@ are audit-logged with reason strings.
 
 ## Snapshots and forks
 
-- `snapshot` captures a named qcow2 overlay checkpoint; `restore` returns to
-  it (used for clean-room task starts and incident forensics).
-- `fork` clones a running guest via overlay for parallel branch exploration
-  during replay (`tests/replay.test.ts`).
+- `snapshot` captures a named checkpoint (`savevm`); `restore` returns to it
+  (`loadvm`). Restore was proven with real filesystem rewind: a file deleted
+  after the snapshot reappears after `loadvm`
+  (`artifacts/qualification/wsl-kvm-qual.json`, `restore-proof` phase).
+- `fork` duplicates a RUNNING guest for parallel branch exploration. Because
+  QEMU locks a live image, fork quiesces the source (`stop`), records a
+  `savevm` marker, copies the overlay at filesystem level (the golden base is
+  shared read-only and never copied), resumes the source, boots the child,
+  then `loadvm`s the marker and resumes its CPUs — so the child starts at the
+  exact source moment. Branch isolation proven live (independent files per
+  branch, `fork-isolation` phase).
+
+## Base images, overlays, and seeds
+
+- Golden base images are read-only (`chmod 444`); every VM boots a private
+  CoW overlay (`qemu-img create -b`). Boot re-fingerprints the base
+  (size + head/tail sha256) and refuses with `BASE_MUTATED` on drift.
+- Each VM gets a per-VM NoCloud `seed.iso` (attached `readonly=on`)
+  carrying hostname, optional SSH key, and the per-VM guest-agent HMAC
+  secret (`guest-secret`, mode 0600, in the VM workdir; provisioned by
+  `provisionGuestSecret`, never logged).
+- QEMU boots with `-accel kvm -accel tcg` (repeated flags: QEMU 10 rejects the
+  legacy `kvm,tcg` comma form), `-sandbox
+  on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`,
+  VNC bound to 127.0.0.1 only, and per-VM user-mode forwards derived from the
+  display claim (agent `18080+i`, SSH `22000+i`, VNC `5900+d`).
+- Display allocation TCP-probes each candidate triple and skips ports held by
+  out-of-band processes (e.g. orphaned QEMU) instead of colliding with them.
+
+## Guest channels
+
+- **QMP** (unix socket): lifecycle (`stop`/`cont`/`system_powerdown`/
+  `system_reset`), `screendump`, `savevm`/`loadvm`. Real QMP against QEMU
+  10.2.1 qualified live.
+- **qemu-guest-agent** (direct virtio-serial channel, `guest-sync` liveness
+  proof, then `guest-exec`): filesystem proof, in-guest commands. The direct
+  channel is used because QMP guest-exec passthrough is absent on some QEMU
+  builds (Debian QEMU 10 registers no `guest-*` QMP commands) and because QGA
+  sends no greeting (the client must speak first with `guest-sync`).
+- **EVE guest agent** (HTTP + HMAC, port-forwarded per VM): screenshots,
+  input injection, clipboard, fs operations. Secret travels only in the seed.
 
 ## Sizing and defaults
 
@@ -49,8 +86,10 @@ schemas before any hypervisor call.
 
 ## Operations
 
-- `GET /v1/vms/{vmId}` — state inspection.
-- `POST /v1/vms/{vmId}/control` — `{op, snapshotId?, reason?}`; 409 on
-  illegal transitions.
-- `DELETE /v1/vms/{vmId}` — destroy and reap overlays.
+- `GET /v1/vms` / `POST /v1/vms` — list / provision (capability `vm:create`).
+- `GET /v1/vms/{id}` / `GET /v1/vms/{id}/status` — inspection.
+- `POST /v1/vms/{id}/snapshot|restore|fork` — snapshot, restore, branch
+  (capability `vm:control`; fork needs `vm:create`). 409 on illegal
+  transitions; failed restores land in FAILED, never RUNNING.
+- `DELETE /v1/vms/{id}` — destroy and reap overlays (capability `vm:destroy`).
 - Console surfaces per-VM CPU/memory/disk plus snapshot chains.

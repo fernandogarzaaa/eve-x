@@ -39,7 +39,7 @@ function prng(seed: number): () => number {
   };
 }
 
-interface Lease { worker: string; at: string; ttlMs: number }
+interface Lease { worker: string; at: string; ttlMs: number; epoch?: number }
 export interface SessionDoc {
   id: string; goal: string; status: string; vmId?: string;
   seed?: number; maxSteps?: number; updatedAt?: string;
@@ -137,18 +137,21 @@ function isLive(l: Lease | null): boolean {
   return Date.now() - at < ttl;
 }
 
-function freshLeasePayload(): string {
-  return JSON.stringify({ worker: WORKER_ID, at: nowIso(), ttlMs: LEASE_TTL_MS });
+function freshLeasePayload(epoch = 0): string {
+  return JSON.stringify({ worker: WORKER_ID, at: nowIso(), ttlMs: LEASE_TTL_MS, epoch });
 }
 
 // W1: atomic acquire via O_EXCL create. No check-then-act: the create itself
 // is the claim. On EEXIST, a live foreign lease is left untouched; a stale /
 // released / corrupt / vanished entry is unlinked and claimed with ONE retry.
+// Takeover bumps the epoch: the previous holder observes the epoch change on
+// its next ownership check and aborts (clock-independent fencing — safe even
+// when worker clocks disagree about TTL expiry).
 export function tryAcquire(sessionId: string): boolean {
   ensureDirs();
   const p = leasePath(sessionId);
   try {
-    writeFileSync(p, freshLeasePayload(), { encoding: "utf8", flag: "wx" });
+    writeFileSync(p, freshLeasePayload(0), { encoding: "utf8", flag: "wx" });
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return false;
@@ -156,20 +159,29 @@ export function tryAcquire(sessionId: string): boolean {
   const cur = readJson(p) as Lease | null;
   if (cur && cur.worker === WORKER_ID) {
     try {
-      writeFileSync(p, freshLeasePayload(), "utf8");
+      const epoch = Number.isFinite(Number(cur.epoch)) ? Number(cur.epoch) : 0;
+      writeFileSync(p, freshLeasePayload(epoch), "utf8");
     } catch { /* ignore refresh failure; we already hold it */ }
     return true;
   }
   if (cur && cur.worker !== WORKER_ID && isLive(cur)) return false;
+  const nextEpoch = Number.isFinite(Number(cur?.epoch)) ? Number(cur?.epoch) + 1 : 1;
   try {
     unlinkSync(p);
   } catch { /* ignore: proceed to the single retry either way */ }
   try {
-    writeFileSync(p, freshLeasePayload(), { encoding: "utf8", flag: "wx" });
+    writeFileSync(p, freshLeasePayload(nextEpoch), { encoding: "utf8", flag: "wx" });
     return true;
   } catch {
     return false; // second EEXIST (or other error) → give up
   }
+}
+
+// Current epoch held by this worker, or null when not the holder.
+export function heldEpoch(sessionId: string): number | null {
+  const cur = readJson(leasePath(sessionId)) as Lease | null;
+  if (!cur || cur.worker !== WORKER_ID) return null;
+  return Number.isFinite(Number(cur.epoch)) ? Number(cur.epoch) : 0;
 }
 
 // W1: read-first heartbeat — only refreshes our own lease, never another
@@ -180,7 +192,8 @@ export function heartbeat(sessionId: string): void {
   try {
     const cur = readJson(p) as Lease | null;
     if (cur && cur.worker === WORKER_ID) {
-      writeFileSync(p, freshLeasePayload(), "utf8");
+      const epoch = Number.isFinite(Number(cur.epoch)) ? Number(cur.epoch) : 0;
+      writeFileSync(p, freshLeasePayload(epoch), "utf8");
       return;
     }
     if (cur && cur.worker && cur.worker !== WORKER_ID) return; // foreign: never clobber
@@ -353,7 +366,16 @@ export function runSessionToCompletion(sess: SessionDoc): { steps: number; outco
   );
   const startSeq = nextTraceSeq(sess.id);
   let phase: Phase = "OBSERVE";
-  let seq = startSeq; // next seq to assign
+  let appended = 0; // steps appended by this run (seq itself is allocated per step)
+  // Epoch fencing: another worker may take over a lease it considers stale
+  // (especially under clock skew). Any epoch change aborts this run even if
+  // our own clock still considers the lease live.
+  const myEpoch = heldEpoch(sess.id);
+  const epochOk = (): boolean => {
+    if (myEpoch === null) return leaseUsable(sess.id);
+    const cur = heldEpoch(sess.id);
+    return cur !== null && cur === myEpoch && leaseUsable(sess.id);
+  };
   const goal = String(sess.goal ?? "complete the task");
   const taskId = String(raw["taskId"] ?? sess.id);
 
@@ -364,8 +386,8 @@ export function runSessionToCompletion(sess: SessionDoc): { steps: number; outco
     const docPath = join(dataDir(), "sessions", `${sess.id}.json`);
     const cur = (readJson(docPath) ?? {}) as Record<string, unknown>;
     const status = finalOutcome === "ROLLOUT_COMPLETE" ? "DONE" : finalOutcome;
-    writeFileSync(docPath, JSON.stringify({ ...cur, id: sess.id, status, updatedAt: nowIso(), steps: seq }, null, 2), "utf8");
-    return { steps: seq - startSeq, outcome: finalOutcome };
+    writeFileSync(docPath, JSON.stringify({ ...cur, id: sess.id, status, updatedAt: nowIso(), steps: startSeq + appended }, null, 2), "utf8");
+    return { steps: appended, outcome: finalOutcome };
   };
 
   const baseStep = (mySeq: number): Record<string, unknown> => ({
@@ -382,13 +404,16 @@ export function runSessionToCompletion(sess: SessionDoc): { steps: number; outco
   while (phase !== ("DONE" as Phase)) {
     if (phase === "OBSERVE") {
       // W2: checked at the top of every loop iteration, before any ACT step.
+      // Epoch fencing rides along: a takeover (or a clock-skew split-brain
+      // rival) bumps the epoch, and this run aborts even when its own clock
+      // still calls the lease live.
+      if (!epochOk()) return { steps: appended, outcome: "LEASE_LOST" };
       const ctl = readControl(sess.id);
       if (ctl.humanControl) return finish("HUMAN_CONTROL");
       if (ctl.paused) return finish("PAUSED");
       if (ctl.complete) {
-        if (!leaseUsable(sess.id)) return { steps: seq - startSeq, outcome: "LEASE_LOST" };
-        const mySeq = seq;
-        seq += 1;
+        if (!epochOk()) return { steps: appended, outcome: "LEASE_LOST" };
+        const mySeq = nextTraceSeq(sess.id);
         const step = {
           ...baseStep(mySeq),
           vm_state_before: "RUNNING",
@@ -404,12 +429,14 @@ export function runSessionToCompletion(sess: SessionDoc): { steps: number; outco
           human_intervention: false,
         };
         appendFileSync(tracePath(sess.id), JSON.stringify(step) + "\n", "utf8");
+        appended += 1;
         phase = "DONE";
         return finish("ROLLOUT_COMPLETE");
       }
-      if (seq - startSeq >= maxSteps) return finish("BUDGET_EXHAUSTED");
-      const percept = observe(seed, seq);
-      const cands = plan(goal, percept, seed, seq);
+      if (appended >= maxSteps) return finish("BUDGET_EXHAUSTED");
+      const frameSeq = nextTraceSeq(sess.id);
+      const percept = observe(seed, frameSeq);
+      const cands = plan(goal, percept, seed, frameSeq);
       phase = "PLAN";
       void percept; void cands;
       (sess as { _percept?: unknown; _cands?: unknown })._percept = percept;
@@ -417,13 +444,14 @@ export function runSessionToCompletion(sess: SessionDoc): { steps: number; outco
     } else if (phase === "PLAN") {
       phase = "ACT";
     } else if (phase === "ACT") {
-      // W7: re-assert lease ownership before the append batch; abort if lost.
-      if (!leaseUsable(sess.id)) return { steps: seq - startSeq, outcome: "LEASE_LOST" };
+      // W7 + epoch fencing: re-assert ownership before every append; abort
+      // if lost. Seq is allocated fresh from the file tail per step, so a
+      // rival writer can never collide with our numbering.
+      if (!epochOk()) return { steps: appended, outcome: "LEASE_LOST" };
       const bag = sess as unknown as { _percept?: Record<string, unknown>; _cands?: Array<Record<string, unknown>> };
       const cands = bag._cands ?? [];
       const selected = pickBest(cands.length > 0 ? cands : [{ type: "wait", confidence: 0.5 }]);
-      const mySeq = seq;
-      seq += 1;
+      const mySeq = nextTraceSeq(sess.id);
       const step = {
         ...baseStep(mySeq),
         vm_state_before: "RUNNING",
@@ -437,6 +465,7 @@ export function runSessionToCompletion(sess: SessionDoc): { steps: number; outco
         human_intervention: false,
       };
       appendFileSync(tracePath(sess.id), JSON.stringify(step) + "\n", "utf8");
+      appended += 1;
       phase = "VERIFY";
     } else if (phase === "VERIFY") {
       phase = "OBSERVE";

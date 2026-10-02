@@ -1,0 +1,10 @@
+# Qualification desktop image: base + baked screenshot tooling.
+# Production pattern: guest capabilities are baked at image-build time because
+# containers run --cap-drop ALL (runtime apt cannot drop privileges).
+FROM dorowu/ubuntu-desktop-lxde-vnc:latest
+# The base image bundles a third-party Chrome repo whose key is expired;
+# remove third-party lists so the bake is hermetic to Ubuntu archives.
+RUN rm -f /etc/apt/sources.list.d/google-chrome.list \
+ && apt-get update -qq \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends scrot imagemagick \
+ && rm -rf /var/lib/apt/lists/*

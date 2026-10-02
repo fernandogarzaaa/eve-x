@@ -49,6 +49,24 @@ older than the configured window, and confirm `pgdata` volume growth.
 (`eve-x session stop <id>`), then `eve-x vm rm <id>` and reprovision from
 the clean snapshot. Never delete overlays by hand.
 
+**Orphaned QEMU after a control-plane crash.**
+`VmManager.recover()` (runs at worker/API start) SIGKILLs recorded live PIDs
+best-effort and reports `{recovered, orphansKilled, stale}`. The KVM
+qualification harness additionally reaps with `pkill -9 -f
+qemu-system-x86_64` pre-flight and refuses to start if orphans survive (a
+stale QMP/display/port claim otherwise surfaces as a misleading handshake
+failure). Port claims additionally TCP-probe before use, so an orphan is
+skipped, never collided with.
+
+**Clock discipline (leases depend on it).**
+Worker leases (20 s TTL) and HMAC timestamps (±60 s window) assume
+synchronized clocks. `linux-bootstrap.sh` enables chrony; alert if
+`chronyc tracking` shows offset > 5 s. Lease *takeover* is additionally
+protected by epoch fencing (a new holder bumps the epoch; the old holder
+aborts on mismatch regardless of clocks), and trace seqs are allocated from
+the file tail per step, so a skew split-brain can duplicate at most one
+in-flight batch before fencing trips — and replay flags any gap/dupe.
+
 ## Backups
 
 - Postgres: nightly `pg_dump` to the object bucket, 30-day retention.

@@ -17,10 +17,18 @@ internet at large, reviewer endpoint devices (covered by operator policy).
 ## Threats and mitigations
 
 1. **Guest escape (agent breaks out of the VM).**
-   Guests run under QEMU with snapshots; the worker owns the VNC/agent
-   socket and the guest has no route to Postgres, Redis, or object
-   credentials. Mitigation strength: containment + snapshot restore +
-   `FAILED` state quarantine (`tests/state-machine.test.ts`).
+   Guests run under QEMU/KVM with `-sandbox
+   on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`,
+   per-VM CoW overlays over a pinned read-only base (boot refuses on
+   `BASE_MUTATED`), VNC bound to 127.0.0.1, and per-VM port triples. Live
+   escape probes from inside a real guest (`artifacts/qualification/
+   escape-probes.json`): cloud metadata blocked, no QMP socket visible in
+   guest, no host secrets present, host loopback unreachable from guest.
+   User-mode NAT gateway (10.0.2.2) is reachable by design and documented;
+   `network: none` removes it entirely. Mitigation strength: containment +
+   snapshot restore + `FAILED` state quarantine. Full escape research
+   (device fuzzing, virtio attack surface) remains specialized future work —
+   not claimed.
 
 2. **Prompt injection from screen content.**
    Web pages and documents rendered in the guest are untrusted data. The
@@ -56,9 +64,17 @@ internet at large, reviewer endpoint devices (covered by operator policy).
    unready, so the control plane sheds load instead of crashing.
 
 8. **Token theft / replay.**
-   Bearer tokens travel only over loopback or TLS-terminated ingress;
-   mutating `act` calls carry idempotency keys so replays collapse to a
-   single execution.
+   Bearer tokens travel only over loopback or TLS-terminated ingress
+   (nginx sidecar pattern qualified live: TLS 1.3 + WSS through the proxy,
+   `infra/deployment/tls/`); mutating `act` calls carry idempotency keys so
+   replays collapse to a single execution. HMAC guest channels enforce a
+   ±60 s timestamp window (boundary-tested); worker leases add epoch fencing
+   so clock skew cannot cause silent double ownership.
+
+9. **Stale screen action (act on a changed VM).**
+   Actions bind `expectedFrameId`; the runtime and the API both reject
+   mismatches with 409 + current frame (live-verified), so a model can never
+   act on a screen it has not just seen.
 
 ## Residual risks
 

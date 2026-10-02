@@ -527,7 +527,7 @@ function stableJson(v: unknown): string {
 
 type ReplayVerdict = "deterministic-replay-ok" | "replay-divergent";
 
-function verifyReplay(
+export function verifyReplay(
   steps: Array<Record<string, unknown>>,
 ): { replayed: number; verdict: ReplayVerdict; issues: string[] } {
   const issues: string[] = [];
@@ -558,6 +558,11 @@ function verifyReplay(
       if (cur !== prev + 1) issues.push(`seq gap: ${prev} -> ${cur} (missing ${cur - prev - 1})`);
     }
   }
+  // Physical order: an append-only log must read 0,1,2,... in file order.
+  // Set continuity alone would bless a reordered (tampered) log.
+  steps.forEach((st, idx) => {
+    if (st["seq"] !== idx) issues.push(`out-of-order seq at position ${idx} (seq ${String(st["seq"])})`);
+  });
   // Digest chain: only when every step carries the digest+prev convention.
   const hasChain = steps.length > 0 && steps.every((st) => typeof st["digest"] === "string" && "prev" in st);
   if (hasChain) {
@@ -1197,12 +1202,23 @@ export async function startApi(port?: number): Promise<Server> {
   srv.headersTimeout = 60_000;
   srv.requestTimeout = 120_000;
   srv.keepAliveTimeout = 30_000;
-  const wss = new WebSocketServer({ server: srv, path: "/v1/stream" });
-  // Path-parameter WS: accept /v1/stream/<sessionId> via upgrade handling on top of wss.
+  // Single upgrade router (noServer): an earlier design attached both a
+  // path-filtered WebSocketServer AND a manual upgrade listener, which raced
+  // and destroyed /v1/stream/:sessionId upgrades with a 400.
+  const wss = new WebSocketServer({ noServer: true });
   srv.on("upgrade", (req, socket, head) => {
     const url = String(req.url ?? "");
+    if (url === "/v1/stream" || url.startsWith("/v1/stream?")) {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        ws.send(JSON.stringify({ kind: "hello", at: nowIso(), hint: "connect to /v1/stream/:sessionId" }));
+      });
+      return;
+    }
     const m = url.match(/^\/v1\/stream\/([\w-]+)(\?.*)?$/);
-    if (!m) return; // let wss default handle /v1/stream
+    if (!m) {
+      try { socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       const sessionId = m[1] as string;
       let set = streams.get(sessionId);
