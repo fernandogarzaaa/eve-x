@@ -40,8 +40,19 @@ export type AuditResult = z.infer<typeof AuditResultSchema>;
 
 interface Check {
   name: string;
-  run: (artifact: EvaluatorArtifact) => string | null; // null = pass, string = failure reason
+  run: (artifact: EvaluatorArtifact, resolver?: EvidenceResolver) => string | null; // null = pass, string = failure reason
 }
+
+/**
+ * Resolves claimed evidence step ids against a session. Returns null when
+ * the session cannot be read at all (the check abstains with an explicit
+ * note — absence of evidence is not evidence of forgery). Unknown ids
+ * within a readable session FAIL the check.
+ */
+export type EvidenceResolver = (
+  sessionId: string | undefined,
+  stepIds: string[],
+) => { known: string[]; unknown: string[] } | null;
 
 const SELF_GRADING_PATTERNS: RegExp[] = [
   /self[\s_-]?approv/i,
@@ -113,6 +124,20 @@ const CHECKS: Check[] = [
       return null;
     },
   },
+  {
+    name: "evidence-resolves",
+    run: (a, resolver) => {
+      if (!resolver) return null; // abstain: recorded by the caller, not a pass of substance
+      if (!a.gradedSessionId) return "claims cite evidence but no graded session is named";
+      const ids = [...new Set(a.claims.flatMap((c) => c.evidenceStepIds))];
+      const resolved = resolver(a.gradedSessionId, ids);
+      if (resolved === null) return null; // session unreadable: abstain, do not convict
+      if (resolved.unknown.length > 0) {
+        return `evidence step ids unknown in session ${a.gradedSessionId}: ${resolved.unknown.slice(0, 5).join(", ")}`;
+      }
+      return null;
+    },
+  },
 ];
 
 export class GenesisClient {
@@ -137,7 +162,7 @@ export class GenesisClient {
     return { ...artifact };
   }
 
-  audit(artifactIdInput: unknown): AuditResult {
+  audit(artifactIdInput: unknown, resolver?: EvidenceResolver): AuditResult {
     const artifactId = z.string().min(1).parse(artifactIdInput);
     const artifact = this.artifacts.get(artifactId);
     if (!artifact) throw new EveError("UNKNOWN_ARTIFACT", `No genesis artifact ${artifactId}`);
@@ -145,9 +170,13 @@ export class GenesisClient {
     const passedChecks: string[] = [];
     const reasons: string[] = [];
     for (const check of CHECKS) {
-      const failure = check.run(artifact);
-      if (failure === null) passedChecks.push(check.name);
-      else {
+      const failure = check.run(artifact, resolver);
+      if (failure === null) {
+        passedChecks.push(check.name);
+        if (check.name === "evidence-resolves" && !resolver) {
+          reasons.push("evidence-resolves: abstained (no resolver supplied)");
+        }
+      } else {
         failedChecks.push(check.name);
         reasons.push(`${check.name}: ${failure}`);
       }

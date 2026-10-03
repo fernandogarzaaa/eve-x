@@ -195,6 +195,17 @@ describe("vm lifecycle (hardened)", () => {
     assert.ok(seen.has(reused), "freed display should be reusable");
   });
 
+  it("concurrent display allocation never double-claims (TOCTOU)", async () => {
+    // Regression: the check-then-claim used to await between "is free" and
+    // "claim", so two simultaneous boots took the same display and the
+    // second QEMU died on a bound VNC port. The reservation is synchronous
+    // now; N same-tick claims must yield N distinct displays.
+    const q = new QemuDriver({ vncBase: 70, agentBase: 38280, sshBase: 42280 });
+    const ds = await Promise.all(Array.from({ length: 8 }, (_, i) => q.allocateDisplay(`vm-race-${i}`)));
+    assert.equal(new Set(ds).size, 8, `concurrent claims collided: ${ds}`);
+    for (const d of ds) assert.ok(d >= 70 && d < 110, `display ${d} out of range`);
+  });
+
   it("display allocator skips ports held by out-of-band processes", async () => {
     const { createServer } = await import("node:net");
     // Squat the VNC port of display 50 so the allocator must skip it.
@@ -332,6 +343,28 @@ describe("vm lifecycle (hardened)", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (dir) rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("destroy of a stale post-restart entry reaps workdir instead of stranding", async () => {
+    const { mgr } = freshManager();
+    const rec = await mgr.create(OWNER, tinySpec());
+    // Simulate a process restart: fresh manager over the same DATA_DIR with
+    // the persisted registry but no live driver cells.
+    const mgr2 = new VmManager(new DevFramebufferDriver());
+    const report = await mgr2.recover({ killOrphans: false });
+    assert.ok(report.stale.includes(rec.vmId));
+    await mgr2.destroy(rec.vmId, OWNER);
+    assert.deepEqual(mgr2.staleIds().includes(rec.vmId), false);
+  });
+
+  it("reattach adopts only a QMP-proven live VM, never a dead socket", async () => {
+    const q = new QemuDriver();
+    // Dead socket path: must fail closed with VM_NOT_RUNNING, not attach.
+    await assertThrowsCode(
+      () => q.reattach("vm-ghost", OWNER, tinySpec(), join(tmpdir(), "evex-nope")),
+      "VM_NOT_RUNNING",
+    );
+    assert.equal(q.cellCountForTest(), 0);
   });
 
   it("registry persistence round-trips and recover() reports shape", async () => {

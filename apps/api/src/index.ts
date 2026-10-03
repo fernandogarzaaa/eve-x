@@ -1,5 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { createServer, type Server } from "node:http";
+import { createConnection } from "node:net";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, basename } from "node:path";
@@ -7,8 +8,12 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 
 // Static imports of guaranteed-present siblings.
-import { uid, nowIso, prng, sha1hex, StateMachine, VM_TRANSITIONS } from "../../../packages/core/src/index.js";
+import { uid, nowIso, prng, sha1hex, EveError, StateMachine, VM_TRANSITIONS } from "../../../packages/core/src/index.js";
 import { ActionIR, ActionType, ComputerPercept, VmSpec, TaskSpec } from "../../../packages/protocol/src/index.js";
+import {
+  VmManager, selectDriver, QemuDriver, DockerDesktopDriver, DevFramebufferDriver,
+} from "../../../packages/vm/src/index.js";
+import { ComputerRuntime, QmpFrameSource, VncRfbInput } from "../../../packages/computer/src/index.js";
 
 // ── Optional sibling imports (dynamic, never break tsc when absent) ──
 type SecurityMod = typeof import("../../../packages/security/src/index.js");
@@ -34,6 +39,137 @@ async function loadOptionals(): Promise<void> {
     stor = null;
   }
 }
+
+/** TCP reachability probe (driver-independent service presence check). */
+function tcpReachable(host: string, port: number, timeoutMs = 2500): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    const finish = (ok: boolean): void => {
+      if (done) return;
+      done = true;
+      resolve(ok);
+    };
+    const timer = setTimeout(() => {
+      try { sock.destroy(); } catch { /* ignore */ }
+      finish(false);
+    }, timeoutMs);
+    let sock: { destroy: () => void; on: (ev: string, fn: (e?: Error) => void) => void };
+    try {
+      sock = createConnection({ host, port });
+    } catch {
+      clearTimeout(timer);
+      finish(false);
+      return;
+    }
+    sock.on("connect", () => {
+      clearTimeout(timer);
+      try { sock.destroy(); } catch { /* ignore */ }
+      finish(true);
+    });
+    sock.on("error", () => {
+      clearTimeout(timer);
+      finish(false);
+    });
+  });
+}
+
+function parseHostPort(url: string, dflt: number): { host: string; port: number } | null {
+  try {
+    const u = new URL(url.includes("://") ? url : `tcp://${url}`);
+    const port = u.port ? Number(u.port) : dflt;
+    if (!u.hostname || !Number.isInteger(port)) return null;
+    return { host: u.hostname, port };
+  } catch {
+    return null;
+  }
+}
+
+export interface ServiceProbe { reachable: boolean; detail: string; }
+
+/** Gather reachability for the production gate. Prefers driver-level checks
+ *  (pg/redis clients when installed) and falls back to TCP probes so a
+ *  missing optional driver is reported honestly instead of as down. */
+export async function probeServices(): Promise<Record<string, ServiceProbe>> {
+  const out: Record<string, ServiceProbe> = {};
+  const dbUrl = process.env["DATABASE_URL"] ?? "";
+  if (dbUrl) {
+    let via = "";
+    if (stor) {
+      try {
+        const pg = await stor.pgStatus();
+        if (pg.connected) {
+          out["postgres"] = { reachable: true, detail: pg.detail };
+          via = "driver";
+        }
+      } catch { /* fall through to TCP */ }
+    }
+    if (!via) {
+      const hp = parseHostPort(dbUrl, 5432);
+      const ok = hp ? await tcpReachable(hp.host, hp.port) : false;
+      out["postgres"] = {
+        reachable: ok,
+        detail: ok ? `tcp-reachable ${dbUrl.split("@")[1] ?? dbUrl} (pg driver not installed; file store primary)` : `unreachable ${dbUrl.split("@")[1] ?? dbUrl}`,
+      };
+    }
+  }
+  const redisUrl = process.env["REDIS_URL"] ?? "";
+  if (redisUrl) {
+    let via = "";
+    if (stor) {
+      try {
+        const rs = await stor.redisStatus();
+        if (rs.connected) {
+          out["redis"] = { reachable: true, detail: rs.detail };
+          via = "driver";
+        }
+      } catch { /* fall through */ }
+    }
+    if (!via) {
+      const hp = parseHostPort(redisUrl, 6379);
+      const ok = hp ? await tcpReachable(hp.host, hp.port) : false;
+      out["redis"] = {
+        reachable: ok,
+        detail: ok ? "tcp-reachable (redis driver not installed; coordination is file-lease based)" : `unreachable ${redisUrl}`,
+      };
+    }
+  }
+  const objUrl = process.env["OBJECT_ENDPOINT"] ?? "";
+  if (objUrl) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 4000);
+      const res = await fetch(objUrl, { method: "HEAD", signal: ctl.signal });
+      clearTimeout(t);
+      void res;
+      out["object"] = { reachable: true, detail: `http-reachable ${objUrl}` };
+    } catch (err) {
+      out["object"] = { reachable: false, detail: `unreachable ${objUrl}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+  return out;
+}
+
+/** Required-services gate for production mode. With EVEX_REQUIRE_SERVICES
+ *  set (e.g. "postgres,redis,object"), an unreachable required service
+ *  refuses startup instead of silently falling back to dev storage. */
+export async function enforceRequiredServices(): Promise<{ required: string[]; missing: string[] }> {
+  const required = (process.env["EVEX_REQUIRE_SERVICES"] ?? "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+    .map((s) => (s === "minio" || s === "s3" || s === "garage" ? "object" : s));
+  if (required.length === 0) return { required, missing: [] };
+  const statuses = await probeServices();
+  const missing = required.filter((s) => !statuses[s]?.reachable);
+  if (missing.length > 0) {
+    throw new Error(
+      `EVEX_REQUIRE_SERVICES unmet: ${missing.join(", ")} unreachable ` +
+      `(${missing.map((s) => statuses[s]?.detail ?? "no status").join("; ")}). ` +
+      `Refusing production startup (no silent fallback).`,
+    );
+  }
+  return { required, missing };
+}
+
+let prodGate: { required: string[]; missing: string[] } = { required: [], missing: [] };
 
 /** Test/bootstrap hook: load security+storage singletons in-process. */
 export async function ensureOptionals(): Promise<void> {
@@ -157,11 +293,16 @@ function rateLimit(req: Request, res: Response, next: NextFunction): void {
 }
 
 // ── in-memory state (durable mirror to storage pkg when present) ──
-interface VmRec { id: string; spec: Record<string, unknown>; state: string; createdAt: string; snapshots: string[]; owner: string }
+interface VmRec {
+  id: string; spec: Record<string, unknown>; state: string; createdAt: string; snapshots: string[];
+  owner: string; driverVmId?: string; backend?: string;
+}
 interface SessionRec {
   id: string; taskId: string; goal: string; vmId: string; status: string;
   seq: number; paused: boolean; humanControl: boolean; createdAt: string; updatedAt: string;
-  sm: StateMachine<string>; owner: string;
+  sm: StateMachine<string>; owner: string; lastFrame?: string; modeEnforced?: boolean;
+  lastPngSha?: string; stallCount?: number; modeRetryAt?: number;
+  lastRegions?: Array<{ regionId: string; bbox: [number, number, number, number]; label: string }>;
 }
 interface TaskRec { id: string; goal: string; status: string; sessionId: string | null; createdAt: string; result: unknown; owner: string }
 
@@ -214,13 +355,16 @@ function persistRemove(coll: "sessions" | "tasks" | "vms", id: string): void {
 function persistSession(s: SessionRec): void {
   persist("sessions", {
     id: s.id, goal: s.goal, vmId: s.vmId, status: s.status, taskId: s.taskId,
-    seq: s.seq, paused: s.paused, humanControl: s.humanControl,
-    owner: s.owner, createdAt: s.createdAt, updatedAt: s.updatedAt,
+    seq: s.seq, paused: s.paused, humanControl: s.humanControl, lastFrame: s.lastFrame,
+    modeEnforced: s.modeEnforced, modeRetryAt: s.modeRetryAt, owner: s.owner, createdAt: s.createdAt, updatedAt: s.updatedAt,
   });
 }
 
 function persistVm(v: VmRec): void {
-  persist("vms", { id: v.id, spec: v.spec, state: v.state, snapshots: v.snapshots, owner: v.owner, createdAt: v.createdAt });
+  persist("vms", {
+    id: v.id, spec: v.spec, state: v.state, snapshots: v.snapshots, owner: v.owner,
+    createdAt: v.createdAt, driverVmId: v.driverVmId, backend: v.backend,
+  });
 }
 
 function persistTask(t: TaskRec): void {
@@ -280,6 +424,252 @@ function denyIfNotOwner(rec: { owner?: string }, req: Request, res: Response): b
   return false;
 }
 
+// ── driver-backed VMs + computer runtimes ────────────────────────────────
+// Sessions/VMs are provisioned through VmManager (qemu/docker/dev per
+// VM_BACKEND). The dev-framebuffer backend keeps the historical synthetic
+// observe/act path, explicitly labeled synthetic:true — every other backend
+// drives the REAL ComputerRuntime (screendump frames, VNC input, guest exec).
+
+type VmManagerT = InstanceType<typeof VmManager>;
+let manager: VmManagerT | null = null;
+let managerBackend = "";
+
+async function vmManager(): Promise<{ mgr: VmManagerT; backend: string }> {
+  if (!manager) {
+    const imagesDir = process.env["EVEX_IMAGES"] ?? "./images";
+    const sel = await selectDriver({ imagesDir });
+    const num = (v: string | undefined, dflt: number): number => {
+      const n = v === undefined || v === "" ? NaN : Number(v);
+      return Number.isFinite(n) ? n : dflt;
+    };
+    manager = new VmManager(sel.driver, [], {
+      maxVmsPerTenant: num(process.env["EVEX_MAX_VMS_PER_TENANT"], 4),
+      maxTotalVms: num(process.env["EVEX_MAX_TOTAL_VMS"], 32),
+      maxCpuPerTenant: num(process.env["EVEX_MAX_CPU_PER_TENANT"], 16),
+      maxMemMbPerTenant: num(process.env["EVEX_MAX_MEM_MB_PER_TENANT"], 32768),
+    }) as VmManagerT;
+    managerBackend = sel.backend;
+    try {
+      await manager.recover({ killOrphans: false });
+    } catch { /* first boot: nothing to recover */ }
+    log("info", "vm manager online", { backend: sel.backend, note: sel.note });
+  }
+  return { mgr: manager, backend: managerBackend };
+}
+
+interface SessionRuntime {
+  runtime: ComputerRuntime;
+  input: VncRfbInput | null;
+  backend: string;
+}
+const runtimes = new Map<string, SessionRuntime>();
+
+/** Driver VM id + backend for an API vm record (undefined for legacy bare records). */
+function driverOf(v: VmRec): { driverVmId: string; backend: string } | null {
+  if (!v.driverVmId || !v.backend) return null;
+  return { driverVmId: v.driverVmId, backend: v.backend };
+}
+
+/** Owner string the manager uses for a request (must match creation owner). */
+function mgrOwner(req: Request): string {
+  return ownerOf(req);
+}
+
+/** Get-or-build the live computer runtime for a session (real backends only). */
+async function runtimeFor(req: Request, s: SessionRec): Promise<SessionRuntime> {
+  const v = s.vmId ? vms.get(s.vmId) : undefined;
+  const d = v ? driverOf(v) : null;
+  if (!d || d.backend === "dev-framebuffer") {
+    throw new EveError("DEV_BACKEND", "session VM is dev-framebuffer (synthetic path)");
+  }
+  const hit = runtimes.get(s.id);
+  if (hit) return hit;
+  const { mgr } = await vmManager();
+  const owner = mgrOwner(req);
+  // Force reattach for stale post-restart entries BEFORE resolving ports:
+  // status() re-establishes QMP-proven control (or fails loudly), so the
+  // VNC port below always belongs to this VM, never a recycled number.
+  await mgr.status(d.driverVmId, owner);
+  const frame = new QmpFrameSource(() => mgr.screendump(d.driverVmId, owner), 1000);
+  let input: VncRfbInput | null = null;
+  if (d.backend === "qemu") {
+    const port = mgr.vncPort(d.driverVmId, owner);
+    const vin = new VncRfbInput();
+    await vin.connect("127.0.0.1", port);
+    input = vin;
+  }
+  // Docker guests expose no host VNC port: pointer/key/type actions fail
+  // closed with UNSUPPORTED at act time; observe + terminal/tool work. The
+  // runtime still needs a VncInput object for construction, so an
+  // unconnected instance is supplied and never used for those backends.
+  const spec = (v?.spec ?? {}) as Record<string, unknown>;
+  const runtime = new ComputerRuntime(frame, input ?? new VncRfbInput(), null, {
+    width: Number(spec["width"] ?? 1920),
+    height: Number(spec["height"] ?? 1080),
+    channel: `api:${d.backend}`,
+  });
+  const rec: SessionRuntime = { runtime, input, backend: d.backend };
+  runtimes.set(s.id, rec);
+  return rec;
+}
+
+function closeRuntime(sessionId: string): void {
+  const r = runtimes.get(sessionId);
+  if (!r) return;
+  runtimes.delete(sessionId);
+  try {
+    r.input?.disconnect();
+  } catch { /* ignore */ }
+  // Frame timers are never started server-side (observe() polls on demand),
+  // so there is nothing else to release.
+}
+
+/** Provision (create+boot) a driver VM for an API vm record. Throws loudly on failure. */
+async function provisionDriverVm(owner: string, spec: Record<string, unknown>): Promise<{ driverVmId: string; backend: string }> {
+  const { mgr, backend } = await vmManager();
+  const baseImage = typeof process.env["EVEX_BASE_IMAGE"] === "string" && process.env["EVEX_BASE_IMAGE"] ? process.env["EVEX_BASE_IMAGE"] : undefined;
+  const rec = await mgr.create(owner, spec, 3600000, baseImage ? { baseImage } : {});
+  try {
+    await mgr.boot(rec.vmId, owner);
+  } catch (err) {
+    try { await mgr.destroy(rec.vmId, owner); } catch { /* best effort */ }
+    throw err;
+  }
+  return { driverVmId: rec.vmId, backend };
+}
+
+type FlatAction = {
+  type: string; text?: string; keys?: string[];
+  from?: { x: number; y: number }; ms?: number; confidence: number;
+};
+
+/**
+ * REAL actuation path: verify against the runtime's last frame, actuate
+ * through VNC/guest-exec, then re-observe the outcome. The trajectory only
+ * advances on success; every failure leaves seq, frames, and trace
+ * untouched. Throws EveError(STALE_PERCEPTION | UNSUPPORTED) for mapped
+ * statuses, anything else becomes actuation_failed.
+ */
+async function realAct(
+  req: Request,
+  s: SessionRec,
+  v: VmRec,
+  drv: { driverVmId: string; backend: string },
+  body: { frameId?: string; confidence: number },
+  action: FlatAction,
+): Promise<Record<string, unknown>> {
+  const { mgr } = await vmManager();
+  const owner = mgrOwner(req);
+  const { runtime, backend } = await runtimeFor(req, s);
+  const frameId = body.frameId ?? runtime.observedFrameId() ?? s.lastFrame;
+  const type = action.type;
+  if (type === "terminal" || type === "tool") {
+    // CLI/tool actions ride the guest-exec channel, never the framebuffer.
+    const argv = action.text ? ["sh", "-c", action.text] : ["true"];
+    try {
+      if (backend === "qemu") {
+        await mgr.guestExecSync(drv.driverVmId, owner, argv, 60000);
+      } else {
+        const dd = mgr as unknown as {
+          driverFor?: (id: string) => { driver: { exec?: (id: string, a: readonly string[]) => Promise<{ code: number }> } };
+        };
+        const entry = dd.driverFor?.(drv.driverVmId);
+        if (!entry || typeof entry.driver.exec !== "function") {
+          throw new EveError("UNSUPPORTED", `Backend ${backend} has no terminal channel`);
+        }
+        await entry.driver.exec(drv.driverVmId, argv);
+      }
+    } catch (err) {
+      if (err instanceof EveError && (err.code === "UNSUPPORTED" || err.code === "QGA_ABSENT")) throw err;
+      throw new EveError("ACTUATION_FAILED", `terminal action failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else if (type === "click" || type === "double_click" || type === "move" || type === "drag") {
+    if (!action.from) throw new EveError("ACTUATION_FAILED", `${type} requires x/y coordinates`);
+    if (backend !== "qemu") {
+      throw new EveError("UNSUPPORTED", `Pointer actions unsupported on ${backend} guests (no host VNC channel)`);
+    }
+    if (type === "click") await runtime.click(action.from.x, action.from.y, "left", frameId);
+    else if (type === "double_click") await runtime.doubleClick(action.from.x, action.from.y, frameId);
+    else if (type === "move") await runtime.movePointer(action.from.x, action.from.y);
+    else await runtime.drag(action.from, { x: action.from.x + 50, y: action.from.y + 50 }, frameId);
+  } else if (type === "type") {
+    if (backend !== "qemu") {
+      throw new EveError("UNSUPPORTED", `Keyboard actions unsupported on ${backend} guests (no host VNC channel)`);
+    }
+    await runtime.type(action.text ?? "", frameId);
+  } else if (type === "key") {
+    if (backend !== "qemu") {
+      throw new EveError("UNSUPPORTED", `Keyboard actions unsupported on ${backend} guests (no host VNC channel)`);
+    }
+    await runtime.key((action.keys ?? ["Return"])[0] as string, frameId);
+  } else if (type === "hotkey") {
+    if (backend !== "qemu") {
+      throw new EveError("UNSUPPORTED", `Keyboard actions unsupported on ${backend} guests (no host VNC channel)`);
+    }
+    await runtime.hotkey(action.keys ?? ["Control_L", "Alt_L", "t"], frameId);
+  } else if (type === "scroll") {
+    if (backend !== "qemu") {
+      throw new EveError("UNSUPPORTED", `Pointer actions unsupported on ${backend} guests (no host VNC channel)`);
+    }
+    await runtime.scroll(0, -3, frameId);
+  } else if (type === "wait" || type === "observe") {
+    await runtime.wait(action.ms ?? 500);
+  } else if (type === "ask_human") {
+    broadcast(s.id, { kind: "human-request", sessionId: s.id, reason: action.text ?? "agent requests help" });
+  } else if (type === "terminate") {
+    s.status = "STOPPED";
+    s.updatedAt = nowIso();
+    persistSession(s);
+    closeRuntime(s.id);
+    return { sessionId: s.id, seq: s.seq, action, terminated: true, synthetic: false };
+  } else if (type === "zoom" || type === "crop" || type === "open_application") {
+    await runtime.wait(300);
+  } else {
+    throw new EveError("UNSUPPORTED", `Action type ${type} has no real-backend implementation`);
+  }
+  // OBSERVE RESULT: re-perceive after every successful actuation.
+  const after = await runtime.observe();
+  s.seq += 1;
+  s.lastFrame = String(after.frameId);
+  s.updatedAt = nowIso();
+  persistSession(s);
+  // Point→region grounding: resolve the acted point against the regions from
+  // the last perception. A contained point yields a verified visual-region
+  // target + grounding record; otherwise the act is recorded unverified
+  // (honest about ungrounded pointing, never invented).
+  let target: Record<string, unknown> | undefined;
+  let grounding: Record<string, unknown> | undefined;
+  if (action.from && (type === "click" || type === "double_click" || type === "move" || type === "drag" || type === "scroll")) {
+    // Bboxes are [x0, y0, x1, y1] corners everywhere (protocol, perception,
+    // verifier IoU, contract examples).
+    const regs = s.lastRegions ?? [];
+    const hit = regs.find((r) =>
+      action.from !== undefined &&
+      action.from.x >= r.bbox[0] && action.from.y >= r.bbox[1] &&
+      action.from.x <= r.bbox[2] && action.from.y <= r.bbox[3],
+    );
+    if (hit) {
+      target = { kind: "visual-region", regionId: hit.regionId, bbox: hit.bbox, label: hit.label };
+      grounding = { regionId: hit.regionId, bbox: hit.bbox, verified: true };
+    } else {
+      grounding = { verified: false, reason: "act point matched no perceived region" };
+    }
+  }
+  const step = {
+    session_id: s.id, task_id: s.taskId, step_id: uid("step"), seq: s.seq,
+    timestamp: nowIso(), actor: "eve-agent", vm_state_before: "RUNNING", screen_before: frameId ?? "",
+    goal: s.goal, candidate_actions: [action],
+    selected_action: { ...action, confidence: body.confidence, ...(target ? { target } : {}) },
+    ...(grounding ? { grounding } : {}),
+    screen_after: String(after.frameId), outcome: "acted",
+    provenance: { source: "screenshot", channel: `api-act:${backend}`, at: nowIso() },
+    model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+  };
+  appendStep(s.id, step);
+  broadcast(s.id, { kind: "frame", sessionId: s.id, frameId: after.frameId, at: nowIso() });
+  return { sessionId: s.id, seq: s.seq, action, frameId: after.frameId, synthetic: false };
+}
+
 /** Best-effort restart recovery: load persisted sessions/tasks/vms into memory. */
 export function hydrateFromDisk(): { sessions: number; tasks: number; vms: number } {
   const out = { sessions: 0, tasks: 0, vms: 0 };
@@ -297,6 +687,9 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
         paused: d["paused"] === true, humanControl: d["humanControl"] === true,
         createdAt: String(d["createdAt"] ?? nowIso()), updatedAt: String(d["updatedAt"] ?? nowIso()),
         sm, owner: typeof d["owner"] === "string" ? String(d["owner"]) : "",
+        lastFrame: typeof d["lastFrame"] === "string" ? String(d["lastFrame"]) : undefined,
+        modeEnforced: d["modeEnforced"] === true,
+        modeRetryAt: typeof d["modeRetryAt"] === "number" ? d["modeRetryAt"] : undefined,
       });
       if (!traces.has(id)) traces.set(id, []);
       out.sessions += 1;
@@ -321,6 +714,8 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
         createdAt: String(d["createdAt"] ?? nowIso()),
         snapshots: Array.isArray(d["snapshots"]) ? (d["snapshots"] as string[]) : [],
         owner: typeof d["owner"] === "string" ? String(d["owner"]) : "",
+        driverVmId: typeof d["driverVmId"] === "string" ? String(d["driverVmId"]) : undefined,
+        backend: typeof d["backend"] === "string" ? String(d["backend"]) : undefined,
       });
       out.vms += 1;
     }
@@ -357,9 +752,12 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
 
 /** Test/restart hook: drop in-memory maps (persistence on disk is untouched). */
 export function __clearMemory(): void {
+  for (const sid of runtimes.keys()) closeRuntime(sid);
   vms.clear(); sessions.clear(); tasks.clear(); traces.clear();
   benchmarks.clear(); idemResponses.clear(); judgmentKeys.clear(); rateBuckets.clear();
   reviews.clear();
+  manager = null;
+  managerBackend = "";
 }
 
 // ── server-side blind review (§34): the API strips model-revealing fields ──
@@ -438,8 +836,9 @@ function syntheticFrame(sessionId: string, seq: number): Record<string, unknown>
     height: 1080,
     pngBase64: "",
     overlays: [
-      { regionId: "r-taskbar", bbox: [0, 1040, 1920, 40], label: "taskbar", confidence: 0.99 },
-      { regionId: "r-cursor", bbox: [640 + ((seq * 37) % 400), 400, 12, 18], label: "cursor", confidence: 1 },
+      // Corners [x0, y0, x1, y1], matching ActionIR throughout the system.
+      { regionId: "r-taskbar", bbox: [0, 1040, 1919, 1079], label: "taskbar", confidence: 0.99 },
+      { regionId: "r-cursor", bbox: [640 + ((seq * 37) % 400), 400, 640 + ((seq * 37) % 400) + 12, 418], label: "cursor", confidence: 1 },
     ],
     cursor: { x: 640 + ((seq * 37) % 400), y: 400 },
     status: s?.status ?? "unknown",
@@ -625,7 +1024,14 @@ export function buildApp(): express.Express {
   // public
   app.get("/health", (_req: Request, res: Response) => res.json({ ok: true, service: "evex-api", at: nowIso() }));
   app.get("/ready", (_req: Request, res: Response) => {
-    res.json({ ready: true, sessions: sessions.size, vms: vms.size, at: nowIso() });
+    res.json({
+      ready: true, sessions: sessions.size, vms: vms.size, at: nowIso(),
+      persistence: {
+        mode: prodGate.required.length === 0 ? "file-primary (no required services)" : "production",
+        required: prodGate.required,
+        missing: prodGate.missing,
+      },
+    });
   });
   app.get("/metrics", (_req: Request, res: Response) => {
     res.type("text/plain").send(
@@ -642,37 +1048,52 @@ export function buildApp(): express.Express {
     const me = ownerOf(req);
     res.json({ sessions: [...sessions.values()].filter((s) => !s.owner || s.owner === me).map((s) => ({ ...s, sm: undefined })) });
   });
-  v1.post("/sessions", requireCap("task:execute"), (req: Request, res: Response) => {
+  v1.post("/sessions", requireCap("task:execute"), async (req: Request, res: Response) => {
     const body = validate(SessionCreate, req.body, res);
     if (!body) return;
     const owner = ownerOf(req);
     let vmId = body.vmId ?? "";
-    if (!vmId || !vms.has(vmId)) {
+    let rec = vmId ? vms.get(vmId) : undefined;
+    if (!rec) {
       vmId = uid("vm");
-      const vmRec: VmRec = { id: vmId, spec: (body.vm ?? {}) as Record<string, unknown>, state: "READY", createdAt: nowIso(), snapshots: [], owner };
-      vms.set(vmId, vmRec);
-      persistVm(vmRec);
+      // Every session VM is provisioned through the driver layer
+      // (qemu/docker/dev per VM_BACKEND) — never a bare record. The dev
+      // backend is record-only, so unit/dev flows stay side-effect free.
+      const spec = { ...(body.vm ?? {}), image: (body.vm as { image?: string } | undefined)?.image ?? "ubuntu-desktop-v1" };
+      let provisioned: { driverVmId: string; backend: string };
+      try {
+        provisioned = await provisionDriverVm(owner, spec as Record<string, unknown>);
+      } catch (err) {
+        res.status(500).json({ error: "vm_provision_failed", message: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+      rec = {
+        id: vmId, spec: spec as Record<string, unknown>, state: "READY", createdAt: nowIso(),
+        snapshots: [], owner, driverVmId: provisioned.driverVmId, backend: provisioned.backend,
+      } satisfies VmRec;
+      vms.set(vmId, rec);
+      persistVm(rec);
     }
     const id = uid("sess");
     const sm = new StateMachine<string>("READY", SESSION_SM);
-    const rec: SessionRec = {
+    const srec: SessionRec = {
       id, taskId: body.taskId ?? uid("task"), goal: body.goal, vmId,
       status: "RUNNING", seq: 0, paused: false, humanControl: false,
       createdAt: nowIso(), updatedAt: nowIso(), sm, owner,
     };
     try { sm.transition("RUNNING", "session start"); } catch { /* already */ }
-    sessions.set(id, rec);
+    sessions.set(id, srec);
     traces.set(id, []);
-    persistSession(rec);
+    persistSession(srec);
     appendStep(id, {
-      session_id: id, task_id: rec.taskId, step_id: uid("step"), seq: 0,
+      session_id: id, task_id: srec.taskId, step_id: uid("step"), seq: 0,
       timestamp: nowIso(), actor: "system", vm_state_before: "READY", screen_before: "",
-      goal: rec.goal, candidate_actions: [],
+      goal: srec.goal, candidate_actions: [],
       provenance: { source: "system", channel: "api", at: nowIso() },
       model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
     });
     log("info", "session created", { sessionId: id, requestId: (req as ReqCtx).id ?? "-" });
-    res.status(201).json({ id, taskId: rec.taskId, vmId, status: rec.status });
+    res.status(201).json({ id, taskId: srec.taskId, vmId, status: srec.status, backend: rec?.backend ?? "unknown" });
   });
   v1.get("/sessions/:id", requireCap("computer:observe"), (req: Request, res: Response) => {
     const s = sessions.get(req.params["id"] as string);
@@ -695,6 +1116,7 @@ export function buildApp(): express.Express {
     s.status = "STOPPED";
     s.updatedAt = nowIso();
     persistSession(s);
+    closeRuntime(s.id);
     broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status });
     res.json({ id: s.id, status: s.status });
   });
@@ -725,17 +1147,28 @@ export function buildApp(): express.Express {
     res.json({ id: s.id, seq: s.seq });
   });
 
-  // ── vms ──
-  v1.post("/vms", requireCap("vm:create"), (req: Request, res: Response) => {
+  // ── vms (delegated to VmManager; API records mirror driver state) ──
+  v1.post("/vms", requireCap("vm:create"), async (req: Request, res: Response) => {
     const body = validate(VmCreate, req.body ?? {}, res);
     if (!body) return;
     const parsed = VmSpec.safeParse(body);
     void parsed;
+    const owner = ownerOf(req);
+    let provisioned: { driverVmId: string; backend: string };
+    try {
+      provisioned = await provisionDriverVm(owner, body as Record<string, unknown>);
+    } catch (err) {
+      res.status(500).json({ error: "vm_provision_failed", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
     const id = uid("vm");
-    const rec: VmRec = { id, spec: body as Record<string, unknown>, state: "READY", createdAt: nowIso(), snapshots: [], owner: ownerOf(req) };
+    const rec: VmRec = {
+      id, spec: body as Record<string, unknown>, state: "READY", createdAt: nowIso(),
+      snapshots: [], owner, driverVmId: provisioned.driverVmId, backend: provisioned.backend,
+    };
     vms.set(id, rec);
     persistVm(rec);
-    res.status(201).json({ id, state: "READY" });
+    res.status(201).json({ id, state: "READY", backend: provisioned.backend, driverVmId: provisioned.driverVmId });
   });
   v1.get("/vms", requireCap("computer:observe"), (req: Request, res: Response) => {
     const me = ownerOf(req);
@@ -747,28 +1180,89 @@ export function buildApp(): express.Express {
     if (denyIfNotOwner(v, req, res)) return;
     res.json(v);
   });
-  v1.get("/vms/:id/status", requireCap("computer:observe"), (req: Request, res: Response) => {
+  v1.get("/vms/:id/status", requireCap("computer:observe"), async (req: Request, res: Response) => {
     const v = vms.get(req.params["id"] as string);
     if (!v) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(v, req, res)) return;
-    res.json({ id: v.id, state: v.state });
+    const drv = driverOf(v);
+    if (drv && drv.backend !== "dev-framebuffer") {
+      try {
+        const { mgr } = await vmManager();
+        const st = await mgr.status(drv.driverVmId, mgrOwner(req));
+        v.state = String(st.state);
+        persistVm(v);
+        res.json({ id: v.id, state: v.state, backend: drv.backend });
+        return;
+      } catch (err) {
+        res.status(502).json({ error: "driver_failed", message: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+    res.json({ id: v.id, state: v.state, backend: drv?.backend ?? "dev-framebuffer" });
   });
-  v1.delete("/vms/:id", requireCap("vm:destroy"), (req: Request, res: Response) => {
+  v1.get("/vms/:id/audit", requireCap("trace:read"), async (req: Request, res: Response) => {
+    // Driver audit trail: every lifecycle transition with reason + timestamp.
+    // Invaluable when the cell state disagrees with expectations.
+    const v = vms.get(req.params["id"] as string);
+    if (!v) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(v, req, res)) return;
+    const drv = driverOf(v);
+    if (!drv || drv.backend === "dev-framebuffer") {
+      res.json({ id: v.id, backend: drv?.backend ?? "dev-framebuffer", audit: [] });
+      return;
+    }
+    try {
+      const { mgr } = await vmManager();
+      const entries = await mgr.auditLog(drv.driverVmId, mgrOwner(req));
+      res.json({ id: v.id, backend: drv.backend, audit: entries });
+    } catch (err) {
+      res.status(502).json({ error: "driver_failed", message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  v1.delete("/vms/:id", requireCap("vm:destroy"), async (req: Request, res: Response) => {
     const id = req.params["id"] as string;
     const v = vms.get(id);
     if (!v) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(v, req, res)) return;
+    const drv = driverOf(v);
+    if (drv && drv.backend !== "dev-framebuffer") {
+      try {
+        const { mgr } = await vmManager();
+        await mgr.destroy(drv.driverVmId, mgrOwner(req));
+      } catch (err) {
+        res.status(502).json({ error: "driver_failed", message: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+    for (const [sid, s] of sessions) {
+      if (s.vmId === id) closeRuntime(sid);
+    }
     vms.delete(id);
     persistRemove("vms", id);
     res.json({ id, state: "DESTROYED" });
   });
-  v1.post("/vms/:id/snapshot", requireCap("vm:control"), (req: Request, res: Response) => {
+  v1.post("/vms/:id/snapshot", requireCap("vm:control"), async (req: Request, res: Response) => {
     const v = vms.get(req.params["id"] as string);
     if (!v) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(v, req, res)) return;
     const label = String(req.body?.["label"] ?? `snap-${Date.now()}`);
     if (!SNAP_LABEL_RE.test(label)) {
       res.status(400).json({ error: "bad_request", message: "invalid snapshot label (alphanumeric, _, -; max 64)" });
+      return;
+    }
+    const drv = driverOf(v);
+    if (drv && drv.backend !== "dev-framebuffer") {
+      try {
+        const { mgr } = await vmManager();
+        const snapId = await mgr.snapshot(drv.driverVmId, mgrOwner(req), label);
+        const tag = snapId.includes("@") ? String(snapId.split("@")[1]) : label;
+        if (!v.snapshots.includes(tag)) v.snapshots.push(tag);
+        v.state = "RUNNING";
+        persistVm(v);
+        res.json({ id: v.id, state: v.state, snapshots: v.snapshots });
+      } catch (err) {
+        res.status(502).json({ error: "driver_failed", message: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
     const sm = new StateMachine<string>(v.state, VM_TRANSITIONS as unknown as Record<string, string[]>);
@@ -782,7 +1276,7 @@ export function buildApp(): express.Express {
     persistVm(v);
     res.json({ id: v.id, state: v.state, snapshots: v.snapshots });
   });
-  v1.post("/vms/:id/restore", requireCap("vm:control"), (req: Request, res: Response) => {
+  v1.post("/vms/:id/restore", requireCap("vm:control"), async (req: Request, res: Response) => {
     const v = vms.get(req.params["id"] as string);
     if (!v) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(v, req, res)) return;
@@ -796,37 +1290,183 @@ export function buildApp(): express.Express {
       res.status(404).json({ error: "snapshot_not_found", snapshot: label });
       return;
     }
+    const drv = driverOf(v);
+    if (drv && drv.backend !== "dev-framebuffer") {
+      try {
+        const { mgr } = await vmManager();
+        await mgr.restore(drv.driverVmId, mgrOwner(req), label);
+        v.state = "RUNNING";
+        persistVm(v);
+        res.json({ id: v.id, state: v.state, restored: label });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (err instanceof EveError && err.code === "SNAPSHOT_NOT_FOUND") {
+          res.status(404).json({ error: "snapshot_not_found", snapshot: label });
+          return;
+        }
+        if (err instanceof EveError && err.code === "INVALID_TRANSITION") {
+          res.status(409).json({ error: "illegal_transition", message: msg });
+          return;
+        }
+        v.state = "FAILED";
+        persistVm(v);
+        res.status(502).json({ error: "driver_failed", message: msg });
+      }
+      return;
+    }
     v.state = "RUNNING";
     persistVm(v);
     res.json({ id: v.id, state: v.state, restored: label });
   });
-  v1.post("/vms/:id/fork", requireCap("vm:create"), (req: Request, res: Response) => {
+  const vmLifecycle = (op: "pause" | "resume" | "reboot") => async (req: Request, res: Response) => {
     const v = vms.get(req.params["id"] as string);
     if (!v) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(v, req, res)) return;
+    const drv = driverOf(v);
+    if (!drv || drv.backend === "dev-framebuffer") {
+      res.status(501).json({ error: "unsupported_action", message: `${op} requires a driver-backed VM` });
+      return;
+    }
+    try {
+      const { mgr } = await vmManager();
+      await mgr[op](drv.driverVmId, mgrOwner(req));
+      const st = await mgr.status(drv.driverVmId, mgrOwner(req));
+      v.state = String(st.state);
+      persistVm(v);
+      res.json({ id: v.id, state: v.state });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof EveError && err.code === "INVALID_TRANSITION") {
+        res.status(409).json({ error: "illegal_transition", message: msg });
+        return;
+      }
+      res.status(502).json({ error: "driver_failed", message: msg });
+    }
+  };
+  v1.post("/vms/:id/pause", requireCap("vm:control"), vmLifecycle("pause"));
+  v1.post("/vms/:id/resume", requireCap("vm:control"), vmLifecycle("resume"));
+  v1.post("/vms/:id/reboot", requireCap("vm:control"), vmLifecycle("reboot"));
+  v1.post("/vms/:id/fork", requireCap("vm:create"), async (req: Request, res: Response) => {
+    const v = vms.get(req.params["id"] as string);
+    if (!v) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(v, req, res)) return;
+    const owner = ownerOf(req);
+    const drv = driverOf(v);
+    if (drv && drv.backend !== "dev-framebuffer") {
+      try {
+        const { mgr } = await vmManager();
+        const child = await mgr.fork(drv.driverVmId, owner, owner);
+        const id = uid("vm");
+        const rec: VmRec = {
+          id, spec: v.spec, state: "READY", createdAt: nowIso(),
+          snapshots: [], owner, driverVmId: child.vmId, backend: drv.backend,
+        };
+        vms.set(id, rec);
+        persistVm(rec);
+        res.status(201).json({ id, from: v.id, state: "READY", driverVmId: child.vmId });
+      } catch (err) {
+        res.status(502).json({ error: "driver_failed", message: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
     const id = uid("vm");
-    const rec: VmRec = { id, spec: v.spec, state: "READY", createdAt: nowIso(), snapshots: [], owner: ownerOf(req) };
+    const rec: VmRec = { id, spec: v.spec, state: "READY", createdAt: nowIso(), snapshots: [], owner };
     vms.set(id, rec);
     persistVm(rec);
     res.status(201).json({ id, from: v.id, state: "READY" });
   });
-
-  // ── computer observe / act ──
-  v1.get("/computer/:sessionId/observe", requireCap("computer:observe"), (req: Request, res: Response) => {
+  v1.get("/computer/:sessionId/observe", requireCap("computer:observe"), async (req: Request, res: Response) => {
     const s = sessions.get(req.params["sessionId"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
+    const v = s.vmId ? vms.get(s.vmId) : undefined;
+    const drv = v ? driverOf(v) : null;
+    if (drv && drv.backend !== "dev-framebuffer") {
+      // REAL path: hypervisor screendump → perception → candidate regions.
+      try {
+        const { runtime } = await runtimeFor(req, s);
+        let percept = await runtime.observe();
+        // Lazy resolution enforcement: the guest negotiates its own initial
+        // mode (GDM/Xorg) and may drift later (idle resets); whenever the
+        // frame dims mismatch the session spec, set the mode once via xrandr
+        // through the guest-exec channel and re-observe. Failures back off
+        // (cooldown) so a headless/warming guest costs one slow observe per
+        // two minutes, not every poll.
+        const wantW = Number((v?.spec as Record<string, unknown> | undefined)?.["width"] ?? 0) || 0;
+        const wantH = Number((v?.spec as Record<string, unknown> | undefined)?.["height"] ?? 0) || 0;
+        if (wantW > 0 && wantH > 0 && (percept.width !== wantW || percept.height !== wantH) && Date.now() >= (s.modeRetryAt ?? 0)) {
+          try {
+            const { mgr } = await vmManager();
+            const cookieCmd = "for C in /run/user/*/gdm/Xauthority /var/lib/gdm3/.Xauthority; do " +
+              `if [ -f "$C" ]; then XAUTHORITY=$C DISPLAY=:0 xrandr --output default --mode ${wantW}x${wantH} && break; fi; done`;
+            await mgr.guestExecSync(drv.driverVmId, mgrOwner(req), ["/bin/sh", "-c", cookieCmd], 15000);
+            percept = await runtime.observe();
+            if (percept.width === wantW && percept.height === wantH) {
+              s.modeEnforced = true;
+            } else {
+              s.modeRetryAt = Date.now() + 120000;
+            }
+          } catch {
+            s.modeRetryAt = Date.now() + 120000;
+          }
+        }
+        s.lastFrame = String(percept.frameId);
+        s.updatedAt = nowIso();
+        persistSession(s);
+        // Cache perceived regions for point→region grounding at act time.
+        try {
+          const regs = (percept.regions ?? []) as Array<{ regionId?: unknown; bbox?: unknown; label?: unknown }>;
+          s.lastRegions = regs
+            .filter((r) => typeof r.regionId === "string" && Array.isArray(r.bbox) && r.bbox.length === 4)
+            .map((r) => ({
+              regionId: String(r.regionId),
+              bbox: (r.bbox as number[]).slice(0, 4) as [number, number, number, number],
+              label: typeof r.label === "string" ? String(r.label) : "",
+            }));
+        } catch { /* grounding cache is best-effort */ }
+        // Stall annotation: consecutive byte-identical frames mean the guest
+        // is producing no visual change (wedged boot, frozen compositor, or
+        // a genuinely idle screen). Advisory only — the console surfaces it;
+        // no state change is inferred from pixels alone.
+        let stalled = false;
+        try {
+          const sha = sha1hex(String(percept.pngBase64 ?? ""));
+          if (s.lastPngSha !== undefined && s.lastPngSha === sha) {
+            s.stallCount = (s.stallCount ?? 0) + 1;
+          } else {
+            s.lastPngSha = sha;
+            s.stallCount = 0;
+          }
+          if ((s.stallCount ?? 0) >= 3) {
+            stalled = true;
+            log("warn", "guest visually stalled", { sessionId: s.id, vmId: s.vmId, consecutive: s.stallCount });
+          }
+        } catch { /* annotation is best-effort */ }
+        broadcast(s.id, { kind: "frame", sessionId: s.id, frameId: percept.frameId, at: nowIso(), stalled });
+        res.json({ ...percept, backend: drv.backend, synthetic: false, stalled });
+      } catch (err) {
+        const code = err instanceof EveError ? err.code : "observe_failed";
+        res.status(code === "DEV_BACKEND" ? 500 : 502).json({
+          error: code === "DEV_BACKEND" ? "internal" : "observe_failed",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
     const percept = {
       frameId: `f-${s.seq}`, width: 1920, height: 1080, pngBase64: "",
-      regions: [{ regionId: "r-taskbar", bbox: [0, 1040, 1920, 40], label: "taskbar", confidence: 0.99 }],
+      // Corners [x0, y0, x1, y1] like every other producer in the system.
+      regions: [{ regionId: "r-taskbar", bbox: [0, 1040, 1919, 1079], label: "taskbar", confidence: 0.99 }],
       cursor: { x: 640, y: 400 }, windows: ["desktop"], dialogs: [], loading: false,
       provenance: { source: "screenshot", channel: "api", at: nowIso() },
+      backend: drv?.backend ?? "dev-framebuffer", synthetic: true,
     };
-    const parsed = ComputerPercept.safeParse(percept);
+    s.lastFrame = `f-${s.seq}`;
+    const parsed = ComputerPercept.safeParse({ ...percept });
     void parsed;
     res.json(percept);
   });
-  v1.post("/computer/:sessionId/act", requireCap("computer:act"), (req: Request, res: Response) => {
+  v1.post("/computer/:sessionId/act", requireCap("computer:act"), async (req: Request, res: Response) => {
     const sessionId = req.params["sessionId"] as string;
     const s = sessions.get(sessionId);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
@@ -847,8 +1487,12 @@ export function buildApp(): express.Express {
         return;
       }
     }
-    // A4: stale perception guard.
-    const current = `f-${s.seq}`;
+    // A4: stale perception guard. Real sessions compare against the last
+    // observed frame id; synthetic sessions against f-seq.
+    const v = s.vmId ? vms.get(s.vmId) : undefined;
+    const drv = v ? driverOf(v) : null;
+    const realPath = Boolean(drv && drv.backend !== "dev-framebuffer");
+    const current = realPath ? (s.lastFrame ?? `f-${s.seq}`) : `f-${s.seq}`;
     if (body.frameId !== undefined && body.frameId !== current) {
       res.status(409).json({ error: "stale_perception", current });
       return;
@@ -863,8 +1507,25 @@ export function buildApp(): express.Express {
       res.status(400).json({ error: "bad_request", issues: parsed.error.issues });
       return;
     }
+    if (realPath && drv) {
+      // REAL path: verify → actuate through the computer runtime →
+      // re-observe the outcome. Failures never advance the trajectory.
+      try {
+        const resp = await realAct(req, s, v as VmRec, drv, body, action);
+        if (body.idempotencyKey) idemResponses.set(`${sessionId}:${body.idempotencyKey}`, resp);
+        res.json(resp);
+      } catch (err) {
+        if (err instanceof EveError && (err.code === "STALE_PERCEPTION" || err.code === "UNSUPPORTED")) {
+          res.status(err.code === "STALE_PERCEPTION" ? 409 : 501).json({ error: err.code === "STALE_PERCEPTION" ? "stale_perception" : "unsupported_action", message: err.message });
+          return;
+        }
+        res.status(502).json({ error: "actuation_failed", message: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
     s.seq += 1;
     s.updatedAt = nowIso();
+    s.lastFrame = `f-${s.seq}`;
     persistSession(s);
     const step = {
       session_id: s.id, task_id: s.taskId, step_id: uid("step"), seq: s.seq,
@@ -876,7 +1537,7 @@ export function buildApp(): express.Express {
     };
     appendStep(s.id, step);
     broadcast(s.id, syntheticFrame(s.id, s.seq));
-    const resp = { sessionId: s.id, seq: s.seq, action };
+    const resp = { sessionId: s.id, seq: s.seq, action, synthetic: true };
     if (body.idempotencyKey) idemResponses.set(`${sessionId}:${body.idempotencyKey}`, resp);
     res.json(resp);
   });
@@ -1197,6 +1858,14 @@ export function buildApp(): express.Express {
 
 export async function startApi(port?: number): Promise<Server> {
   await loadOptionals();
+  // Production gate first: with EVEX_REQUIRE_SERVICES set, missing services
+  // refuse startup loudly instead of silently degrading to dev storage.
+  prodGate = await enforceRequiredServices();
+  if (prodGate.required.length > 0) {
+    log("info", "production persistence gate passed", { required: prodGate.required });
+  } else {
+    log("info", "persistence: file-primary (EVEX_REQUIRE_SERVICES unset)");
+  }
   const app = buildApp();
   const srv = createServer(app);
   srv.headersTimeout = 60_000;

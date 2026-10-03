@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.build.json && node scripts/copy-static.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "node scripts/lint.mjs",
+    "pretest": "tsc -p tsconfig.json",
     "test": "node --test dist/tests/*.test.js",
     "test:all": "node --test dist/tests/*.test.js",
     "doctor": "node dist/apps/cli/src/index.js doctor",

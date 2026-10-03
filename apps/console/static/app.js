@@ -59,7 +59,9 @@ function drawOverlays(overlays, W = 1920, H = 1080) {
   ov.innerHTML = "";
   const stage = $("stage").getBoundingClientRect();
   (overlays || []).forEach((o) => {
-    const [x, y, w, h] = o.bbox || [0, 0, 100, 40];
+    // Canonical bbox is corners [x0, y0, x1, y1] (protocol-wide).
+    const b = o.bbox || [0, 0, 100, 40];
+    const x = b[0], y = b[1], w = Math.max(1, b[2] - b[0]), h = Math.max(1, b[3] - b[1]);
     const d = document.createElement("div");
     d.className = "bbox";
     d.style.left = `${(x / W) * stage.width}px`;

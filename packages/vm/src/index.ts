@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { appendFileSync as fsAppendFileSync, readFileSync as fsReadFileSync, existsSync as fsExistsSync } from "node:fs";
 import { join, basename, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
@@ -95,6 +96,32 @@ export function validateDockerImage(image: string): string {
     throw new EveError("BAD_IMAGE", `Illegal docker image name: ${image}`);
   }
   return image;
+}
+
+/** Best-effort durable audit line (sync; tiny writes only). */
+function appendAuditLine(workdir: string, entry: { at: string; op: string; detail: string }): void {
+  fsAppendFileSync(join(workdir, "audit.jsonl"), JSON.stringify(entry) + "\n");
+}
+
+/** Read back persisted audit lines (reattach path). */
+export function readAuditFile(workdir: string): VmAuditEntry[] {
+  try {
+    if (!fsExistsSync(join(workdir, "audit.jsonl"))) return [];
+    const out: VmAuditEntry[] = [];
+    for (const line of fsReadFileSync(join(workdir, "audit.jsonl"), "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const o = JSON.parse(t) as { at?: unknown; op?: unknown; detail?: unknown };
+        if (typeof o.at === "string" && typeof o.op === "string") {
+          out.push({ at: o.at, op: o.op, detail: String(o.detail ?? "") });
+        }
+      } catch { /* skip corrupt lines, keep the rest */ }
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 // ── Base-image overlays + guest-secret provisioning ─────────────────────────
@@ -462,6 +489,9 @@ interface CellInit {
   backend: string;
   spec: VmSpecT;
   workdir: string;
+  /** Initial audited state (default CREATING). Reattach passes RUNNING for a
+   *  QEMU that never stopped — recording observed state, not a transition. */
+  initialState?: VmStateT;
 }
 
 export class VmCell {
@@ -469,12 +499,12 @@ export class VmCell {
   readonly sm: StateMachine<VmStateT>;
   proc: ChildProcess | null = null;
   qmp: QmpConnection | null = null;
-  qga: QmpConnection | null = null;
   startedAtMs: number | null = null;
   readonly audit: VmAuditEntry[] = [];
 
   constructor(init: CellInit) {
-    this.sm = new StateMachine<VmStateT>("CREATING", TRANSITIONS);
+    const initial = init.initialState ?? "CREATING";
+    this.sm = new StateMachine<VmStateT>(initial, TRANSITIONS);
     this.record = VmRecordSchema.parse({
       vmId: init.vmId,
       owner: init.owner,
@@ -485,6 +515,9 @@ export class VmCell {
       workdir: init.workdir,
       detail: "",
     });
+    if (init.initialState !== undefined) {
+      this.note("reattach-init", `cell initialized at observed state ${initial}`);
+    }
   }
 
   go(to: VmStateT, reason: string): void {
@@ -494,7 +527,34 @@ export class VmCell {
   }
 
   note(op: string, detail: string): void {
-    this.audit.push({ at: nowIso(), op, detail });
+    const entry = { at: nowIso(), op, detail };
+    this.audit.push(entry);
+    // Durable mirror: the audit trail must survive control-plane restarts
+    // (post-restart forensics depends on it). Best-effort sync append; the
+    // in-memory list stays authoritative within the process.
+    try {
+      const dir = this.record.workdir;
+      if (dir) appendAuditLine(dir, entry);
+    } catch { /* workdir may not exist yet (early create); memory keeps it */ }
+  }
+
+  /** Load persisted audit lines (reattach path). File history is prepended
+   *  so the merged trail stays chronological; constructor notes already in
+   *  memory are deduplicated, not duplicated. */
+  loadAudit(entries: VmAuditEntry[]): void {
+    const seen = new Set(this.audit.map((e) => `${e.at}|${e.op}|${e.detail}`));
+    const prefix: VmAuditEntry[] = [];
+    for (const e of entries) {
+      if (e && typeof e.at === "string" && typeof e.op === "string") {
+        const norm = { at: e.at, op: e.op, detail: String(e.detail ?? "") };
+        const key = `${norm.at}|${norm.op}|${norm.detail}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          prefix.push(norm);
+        }
+      }
+    }
+    this.audit.unshift(...prefix);
   }
 
   snapshotRecord(): VmRecord {
@@ -684,12 +744,15 @@ export class QemuDriver implements VmDriver {
     if (existing !== undefined) return existing;
     for (let d = this.vncBase; d < this.vncBase + 40; d++) {
       if (this.displays.has(d)) continue;
-      const ports = this.portsFor(d);
-      if (await tcpPortBusy("127.0.0.1", ports.vnc)) continue;
-      if (await tcpPortBusy("127.0.0.1", ports.agent)) continue;
-      if (await tcpPortBusy("127.0.0.1", ports.ssh)) continue;
+      // Reserve synchronously BEFORE any await: concurrent boots must never
+      // observe the same display as free (TOCTOU double-claim → two QEMUs on
+      // one VNC port → second boot dies). Probe failures release the claim.
       this.displays.add(d);
       this.displayOf.set(vmId, d);
+      const ports = this.portsFor(d);
+      if (await tcpPortBusy("127.0.0.1", ports.vnc)) { this.releaseDisplay(vmId); continue; }
+      if (await tcpPortBusy("127.0.0.1", ports.agent)) { this.releaseDisplay(vmId); continue; }
+      if (await tcpPortBusy("127.0.0.1", ports.ssh)) { this.releaseDisplay(vmId); continue; }
       return d;
     }
     throw new EveError("NO_DISPLAY", `No free VNC display in [${this.vncBase}, ${this.vncBase + 40})`);
@@ -710,12 +773,36 @@ export class QemuDriver implements VmDriver {
     return this.portsFor(d).ssh;
   }
 
+  /** Host TCP port of this VM's QEMU VNC server (127.0.0.1 only). */
+  vncPortFor(vmId: string): number {
+    const d = this.displayOf.get(vmId);
+    if (d === undefined) throw new EveError("NO_DISPLAY", `No display claimed for ${vmId}`);
+    return this.portsFor(d).vnc;
+  }
+
   releaseDisplay(vmId: string): void {
     const d = this.displayOf.get(vmId);
     if (d !== undefined) {
       this.displayOf.delete(vmId);
       this.displays.delete(d);
     }
+  }
+
+  /** Display currently claimed by a cell, if any (persistence/recovery). */
+  claimedDisplay(vmId: string): number | null {
+    return this.displayOf.get(vmId) ?? null;
+  }
+
+  /**
+   * Restore a display claim after process restart (recovery path only).
+   * Bypasses the TCP probe deliberately: the still-running QEMU owns these
+   * ports, so probing would refuse our own allocation. Callers must verify
+   * the recorded pid is alive first.
+   */
+  restoreDisplayClaim(vmId: string, display: number): void {
+    if (!Number.isInteger(display)) throw new EveError("BAD_ARG", "display must be an integer");
+    this.displays.add(display);
+    this.displayOf.set(vmId, display);
   }
 
   cellCountForTest(): number {
@@ -731,6 +818,49 @@ export class QemuDriver implements VmDriver {
     const cell = cellOrThrow(this.cells, vmId);
     if (!cell.qmp) throw new EveError("QMP_CLOSED", `No live QMP channel for ${vmId}`);
     return cell.qmp;
+  }
+
+  /**
+   * Reattach a live QEMU that outlived the control-plane process (restart
+   * recovery). The OS process cannot be adopted as a ChildProcess, so the
+   * cell carries no proc handle: graceful shutdown uses QMP powerdown, and
+   * destroy falls back to the recorded pid. Liveness is PROVEN first via
+   * QMP query-status — a dead socket fails closed instead of hallucinating
+   * a running VM. The caller must restore the display claim (ports still
+   * belong to the live QEMU).
+   */
+  async reattach(vmId: string, owner: string, specInput: unknown, workdir: string, pid?: number): Promise<VmRecord> {
+    if (this.cells.has(vmId)) throw new EveError("ALREADY_ATTACHED", `vm ${vmId} is already attached in this process`);
+    const spec = VmSpec.parse(specInput);
+    if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
+    const qmpSock = join(workdir, "qmp.sock");
+    const probe = new QmpConnection();
+    try {
+      await probe.connect(qmpSock, 8000);
+      const st = await probe.command("query-status");
+      const qstate = (st["return"] as { status?: unknown } | undefined)?.status;
+      if (qstate !== "running" && qstate !== "paused" && qstate !== "inmigrate") {
+        probe.close();
+        throw new EveError("VM_NOT_RUNNING", `QEMU for ${vmId} reports status ${String(qstate)}`);
+      }
+    } catch (err) {
+      try { probe.close(); } catch { /* ignore */ }
+      // Any failure to prove liveness (refused socket, timeout, bad status)
+      // is the same verdict: no live QEMU to adopt. Fail closed.
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new EveError("VM_NOT_RUNNING", `No live QEMU for ${vmId}: ${detail}`);
+    }
+    probe.close();
+    // Reachable states map onto the audited machine without transitions:
+    // the VM never stopped, so we record observed state, not a transition.
+    const cell = new VmCell({ vmId, owner, backend: this.backend, spec, workdir, initialState: "RUNNING" });
+    // Restore pre-restart history first so the audit trail is continuous;
+    // the reattach note below lands last, in order.
+    cell.loadAudit(readAuditFile(workdir));
+    if (pid !== undefined) cell.record.pid = pid;
+    cell.note("reattach", `adopted live QEMU${pid !== undefined ? ` pid=${pid}` : ""}`);
+    this.cells.set(vmId, cell);
+    return cell.snapshotRecord();
   }
 
   private qcow2(cell: VmCell): string {
@@ -858,6 +988,13 @@ export class QemuDriver implements VmDriver {
         "-chardev", `socket,path=${qgaSock},server=on,wait=off,id=qga0`,
         "-device", "virtio-serial-pci",
         "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+        // Serial console to a per-VM log: guest boot/diagnostic visibility
+        // without VNC (invaluable when the framebuffer is a frozen BIOS).
+        "-serial", `file:${join(cell.record.workdir, "console.log")}`,
+        // Explicit std-VGA resolution from the VmSpec so the guest mode is
+        // deterministic (otherwise QEMU/guest defaults apply and the mode
+        // must be discovered from screendumps instead).
+        "-device", `VGA,xres=${Number(spec.width) || 1280},yres=${Number(spec.height) || 800}`,
         "-display", "none",
         "-vnc", `127.0.0.1:${display}`,
         "-k", "en-us",
@@ -907,8 +1044,6 @@ export class QemuDriver implements VmDriver {
       proc.on("exit", () => {
         cell.qmp?.close();
         cell.qmp = null;
-        cell.qga?.close();
-        cell.qga = null;
       });
       // wait for the QMP socket to appear, then handshake
       const qmp = new QmpConnection();
@@ -961,8 +1096,6 @@ export class QemuDriver implements VmDriver {
       }
       cell.qmp?.close();
       cell.qmp = null;
-      cell.qga?.close();
-      cell.qga = null;
       cell.startedAtMs = null;
       this.releaseDisplay(cell.record.vmId);
       try {
@@ -1016,9 +1149,10 @@ export class QemuDriver implements VmDriver {
       if (cell.sm.state !== "RUNNING") throw new EveError("INVALID_TRANSITION", `Cannot snapshot from ${cell.sm.state}`);
       const q = await this.qmpOf(cell);
       // Snapshot ops never change state: failure is noted and rethrown with
-      // the cell untouched.
+      // the cell untouched. savevm scales with guest RAM + host I/O pressure
+      // (minutes for desktop guests); timeout generously, fail loudly.
       try {
-        await q.command("human-monitor-command", { "command-line": `savevm ${tag}` }, 120000);
+        await q.command("human-monitor-command", { "command-line": `savevm ${tag}` }, 600000);
       } catch (err) {
         cell.note("snapshot-failed", `savevm ${tag}: ${errMsg(err)}`);
         throw err;
@@ -1118,8 +1252,12 @@ export class QemuDriver implements VmDriver {
       src.go("PAUSED", "clone-quiesced");
     }
     const tag = validateSnapshotLabel(`fork-base-${dst.record.vmId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24)}`);
+    // savevm duration scales with guest RAM dirtied pages and host I/O
+    // pressure (minutes for multi-GB desktop guests); the timeout is
+    // generous and the tag is unique per fork so a timed-out partial never
+    // collides with a retry.
     try {
-      await q.command("human-monitor-command", { "command-line": `savevm ${tag}` }, 120000);
+      await q.command("human-monitor-command", { "command-line": `savevm ${tag}` }, 600000);
       src.note("fork-marker", tag);
     } catch (err) {
       await this.resumeCell(src, q).catch(() => undefined);
@@ -1137,13 +1275,24 @@ export class QemuDriver implements VmDriver {
   }
 
   private async resumeCell(src: VmCell, q: QmpConnection): Promise<void> {
-    try {
-      await q.command("cont");
-      if (src.sm.state === "PAUSED") src.go("RUNNING", "clone-resumed");
-    } catch (err) {
-      failCell(src, `clone-resume failed: ${errMsg(err)}`);
-      throw err;
+    // Resume is retried: after minutes of savevm + multi-GB copy under host
+    // I/O pressure, a single 10 s QMP round-trip can spuriously time out on
+    // an otherwise healthy QEMU. cont on a running guest is a harmless
+    // no-op, so retries are safe; persistent failure lands FAILED honestly.
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await q.command("cont", undefined, 30000);
+        if (src.sm.state === "PAUSED") src.go("RUNNING", "clone-resumed");
+        return;
+      } catch (err) {
+        lastErr = err;
+        src.note("resume-retry", `cont attempt ${attempt} failed: ${errMsg(err)}`);
+        await sleep(2000);
+      }
     }
+    failCell(src, `clone-resume failed: ${errMsg(lastErr)}`);
+    throw lastErr instanceof Error ? lastErr : new EveError("QEMU_RESUME_FAILED", String(lastErr));
   }
 
   async fork(vmId: string, newOwner: string): Promise<VmRecord> {
@@ -1200,8 +1349,6 @@ export class QemuDriver implements VmDriver {
       }
       cell.qmp?.close();
       cell.qmp = null;
-      cell.qga?.close();
-      cell.qga = null;
       cell.startedAtMs = null;
       this.releaseDisplay(cell.record.vmId);
       await fs.rm(cell.record.workdir, { recursive: true, force: true });
@@ -1247,8 +1394,13 @@ export class QemuDriver implements VmDriver {
   // registers no guest-* QMP commands). Without a live agent every call
   // fails closed with QGA_ABSENT — never silently local.
 
-  private async qgaOf(cell: VmCell): Promise<QmpConnection> {
-    if (cell.qga) return cell.qga;
+  /**
+   * Run fn against a fresh QGA channel, always closing afterwards. The
+   * virtio-serial host socket serves one client: connections are NEVER
+   * cached, because every leaked half-open client wedges the slot for all
+   * later callers (observed live as a permanently silent channel).
+   */
+  private async withQga<T>(cell: VmCell, fn: (q: QmpConnection) => Promise<T>): Promise<T> {
     const conn = new QmpConnection();
     try {
       await conn.connectQga(join(cell.record.workdir, "qga.sock"), 10000);
@@ -1256,8 +1408,20 @@ export class QemuDriver implements VmDriver {
       conn.close();
       throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
-    cell.qga = conn;
-    return conn;
+    try {
+      return await fn(conn);
+    } finally {
+      conn.close();
+    }
+  }
+
+  private qgaGuestExec(q: QmpConnection, argv: readonly string[]): Promise<Record<string, unknown>> {
+    const parsed = z.array(z.string().min(1).max(512)).min(1).max(16).parse([...argv]);
+    return q.command("guest-exec", {
+      path: parsed[0] as string,
+      arg: parsed.slice(1),
+      "capture-output": true,
+    });
   }
 
   async guestExec(vmId: string, argv: readonly string[]): Promise<{ pid: number }> {
@@ -1265,24 +1429,11 @@ export class QemuDriver implements VmDriver {
     if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
       throw new EveError("INVALID_TRANSITION", `Cannot guest-exec from ${cell.sm.state}`);
     }
-    const parsed = z.array(z.string().min(1).max(512)).min(1).max(16).parse([...argv]);
-    let q: QmpConnection;
-    try {
-      q = await this.qgaOf(cell);
-    } catch (err) {
-      cell.qga = null;
-      throw err;
-    }
     let res: Record<string, unknown>;
     try {
-      res = await q.command("guest-exec", {
-        path: parsed[0] as string,
-        arg: parsed.slice(1),
-        "capture-output": true,
-      });
+      res = await this.withQga(cell, (q) => this.qgaGuestExec(q, argv));
     } catch (err) {
-      cell.qga?.close();
-      cell.qga = null;
+      if (err instanceof EveError && err.code === "QGA_ABSENT") throw err;
       throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
     return { pid: parseGuestExecPid(res) };
@@ -1290,44 +1441,46 @@ export class QemuDriver implements VmDriver {
 
   async guestExecStatus(vmId: string, pid: number): Promise<{ exited: boolean; exitcode?: number; out?: string; err?: string }> {
     const cell = cellOrThrow(this.cells, vmId);
-    let q: QmpConnection;
-    try {
-      q = await this.qgaOf(cell);
-    } catch (err) {
-      cell.qga = null;
-      throw err;
-    }
     let res: Record<string, unknown>;
     try {
-      res = await q.command("guest-exec-status", { pid });
+      res = await this.withQga(cell, (q) => q.command("guest-exec-status", { pid }));
     } catch (err) {
-      cell.qga?.close();
-      cell.qga = null;
+      if (err instanceof EveError && err.code === "QGA_ABSENT") throw err;
       throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const ret = (res["return"] ?? {}) as Record<string, unknown>;
-    const out64 = typeof ret["out-data"] === "string" ? Buffer.from(ret["out-data"], "base64").toString("utf8") : undefined;
-    const err64 = typeof ret["err-data"] === "string" ? Buffer.from(ret["err-data"], "base64").toString("utf8") : undefined;
-    return {
-      exited: Boolean(ret["exited"]),
-      exitcode: typeof ret["exitcode"] === "number" ? ret["exitcode"] : undefined,
-      out: out64,
-      err: err64,
-    };
+    return parseGuestExecStatus(res);
   }
 
-  /** Run argv to completion inside the guest (polls guest-exec-status). */
+  /** Run argv to completion inside the guest (one channel for exec+polls). */
   async guestExecSync(vmId: string, argv: readonly string[], timeoutMs = 60000): Promise<{ exitcode: number; out: string; err: string }> {
-    const { pid } = await this.guestExec(vmId, argv);
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const st = await this.guestExecStatus(vmId, pid);
-      if (st.exited) {
-        return { exitcode: st.exitcode ?? -1, out: st.out ?? "", err: st.err ?? "" };
-      }
-      if (Date.now() > deadline) throw new EveError("QGA_TIMEOUT", `guest-exec timed out: ${argv[0] ?? ""}`);
-      await sleep(500);
+    const cell = cellOrThrow(this.cells, vmId);
+    if (cell.sm.state !== "RUNNING" && cell.sm.state !== "PAUSED") {
+      throw new EveError("INVALID_TRANSITION", `Cannot guest-exec from ${cell.sm.state}`);
     }
+    return this.withQga(cell, async (q) => {
+      let res: Record<string, unknown>;
+      try {
+        res = await this.qgaGuestExec(q, argv);
+      } catch (err) {
+        throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const pid = parseGuestExecPid(res);
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        let st: Record<string, unknown>;
+        try {
+          st = await q.command("guest-exec-status", { pid });
+        } catch (err) {
+          throw new EveError("QGA_ABSENT", `Guest agent unavailable: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const parsed = parseGuestExecStatus(st);
+        if (parsed.exited) {
+          return { exitcode: parsed.exitcode ?? -1, out: parsed.out ?? "", err: parsed.err ?? "" };
+        }
+        if (Date.now() > deadline) throw new EveError("QGA_TIMEOUT", `guest-exec timed out`);
+        await sleep(500);
+      }
+    });
   }
 
   auditLog(vmId: string): VmAuditEntry[] {
@@ -1341,6 +1494,19 @@ export function parseGuestExecPid(res: Record<string, unknown>): number {
   const pid = (res["return"] as { pid?: unknown } | undefined)?.pid;
   if (typeof pid !== "number") throw new EveError("QGA_ABSENT", "guest-exec returned no pid (agent missing?)");
   return pid;
+}
+
+/** Parse a guest-exec-status payload (base64 output decoded). */
+export function parseGuestExecStatus(res: Record<string, unknown>): { exited: boolean; exitcode?: number; out?: string; err?: string } {
+  const ret = (res["return"] ?? {}) as Record<string, unknown>;
+  const out64 = typeof ret["out-data"] === "string" ? Buffer.from(ret["out-data"], "base64").toString("utf8") : undefined;
+  const err64 = typeof ret["err-data"] === "string" ? Buffer.from(ret["err-data"], "base64").toString("utf8") : undefined;
+  return {
+    exited: Boolean(ret["exited"]),
+    exitcode: typeof ret["exitcode"] === "number" ? ret["exitcode"] : undefined,
+    out: out64,
+    err: err64,
+  };
 }
 
 // ── DockerDesktopDriver (real docker CLI: run/start/stop/commit/cp/exec/logs) ─
@@ -1955,6 +2121,8 @@ const PersistedEntrySchema = z.object({
   pid: z.number().optional(),
   containerName: z.string().optional(),
   booted: z.boolean().default(false),
+  display: z.number().int().optional(),
+  ports: z.object({ vnc: z.number().int(), agent: z.number().int(), ssh: z.number().int() }).optional(),
   lease: PersistedLeaseSchema.optional(),
 });
 const PersistedFileSchema = z.object({
@@ -2023,8 +2191,9 @@ export class VmManager {
     } catch { /* in-memory registry remains the source of truth */ }
   }
 
-  private trackPersisted(vmId: string, rec: VmRecord, owner: string, booted: boolean): void {
+  private trackPersisted(vmId: string, rec: VmRecord, owner: string, booted: boolean, display?: number): void {
     const lease = this.leases.get(vmId);
+    const prev = this.persisted.get(vmId);
     this.persisted.set(vmId, {
       owner,
       backend: rec.backend,
@@ -2033,6 +2202,8 @@ export class VmManager {
       pid: rec.pid,
       containerName: rec.containerName,
       booted,
+      display: display ?? prev?.display,
+      ports: prev?.ports,
       lease: lease ? { owner: lease.owner, expiresAtMs: lease.expiresAtMs, ttlMs: lease.ttlMs } : undefined,
     });
   }
@@ -2051,7 +2222,9 @@ export class VmManager {
       mem += e.spec.memoryMb;
     }
     if (count + 1 > this.quotas.maxVmsPerTenant) {
-      throw new EveError("QUOTA_COUNT", `Tenant VM quota reached (${this.quotas.maxVmsPerTenant})`);
+      const staleMine = [...this.stale].filter((id) => this.registry.get(id)?.owner === owner).length;
+      const hint = staleMine > 0 ? ` (${staleMine} stale; destroy stale VMs or raise EVEX_MAX_VMS_PER_TENANT)` : "";
+      throw new EveError("QUOTA_COUNT", `Tenant VM quota reached (${this.quotas.maxVmsPerTenant})${hint}`);
     }
     if (cpu + spec.cpu > this.quotas.maxCpuPerTenant) {
       throw new EveError("QUOTA_CPU", `Tenant CPU quota exceeded (${this.quotas.maxCpuPerTenant})`);
@@ -2120,6 +2293,32 @@ export class VmManager {
     return this.driverFor(vmId).entry.owner;
   }
 
+  /** Backend name (qemu/docker/dev-framebuffer) for routing decisions. */
+  backendOf(vmId: string): string {
+    return this.driverFor(vmId).entry.backend;
+  }
+
+  /** Host VNC port for QEMU guests (throws UNSUPPORTED otherwise).
+   *  NOTE: deliberately no persisted-ports fallback. After a restart the
+   *  recorded ports may have been reused by an unrelated process; returning
+   *  stale numbers could steer input into the wrong guest. Callers must go
+   *  through withLiveDriver (QMP-proven reattach + claim restore) first. */
+  vncPort(vmId: string, owner: string): number {
+    const { driver } = this.mustOwn(vmId, owner);
+    const q = driver as unknown as { vncPortFor?: (id: string) => number };
+    if (typeof q.vncPortFor !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} exposes no VNC port`);
+    return q.vncPortFor(vmId);
+  }
+
+  /** Host forwarded port of the in-guest EVE agent (QEMU backend). Same
+   *  no-fallback rule as vncPort: stale numbers must never steer traffic. */
+  guestAgentPort(vmId: string, owner: string): number {
+    const { driver } = this.mustOwn(vmId, owner);
+    const q = driver as unknown as { guestAgentPort?: (id: string) => number };
+    if (typeof q.guestAgentPort !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} exposes no agent port`);
+    return q.guestAgentPort(vmId);
+  }
+
   isStale(vmId: string): boolean {
     return this.stale.has(vmId);
   }
@@ -2153,6 +2352,10 @@ export class VmManager {
       this.persisted.set(vmId, { ...e });
       this.stale.add(vmId);
       stale.push(vmId);
+      // Display claims are NOT restored here: pid numbers can be recycled by
+      // the OS, so a claim is only restored after the on-demand reattach
+      // proves QMP liveness (see withLiveDriver). Dead entries simply boot
+      // fresh with probed ports later.
       if (killOrphans && e.backend === "qemu" && typeof e.pid === "number") {
         try {
           process.kill(e.pid, 0);
@@ -2177,58 +2380,134 @@ export class VmManager {
         const st = await driver.status(vmId);
         if (st.pid !== undefined) persisted.pid = st.pid;
       } catch { /* pid is best-effort metadata */ }
+      try {
+        const q = driver as unknown as {
+          claimedDisplay?: (id: string) => number | null;
+          guestAgentPort?: (id: string) => number;
+          guestSshPort?: (id: string) => number;
+          vncPortFor?: (id: string) => number;
+        };
+        const d = q.claimedDisplay?.(vmId);
+        if (typeof d === "number") {
+          persisted.display = d;
+          try {
+            persisted.ports = {
+              vnc: Number(q.vncPortFor?.(vmId)),
+              agent: Number(q.guestAgentPort?.(vmId)),
+              ssh: Number(q.guestSshPort?.(vmId)),
+            };
+            if (![persisted.ports.vnc, persisted.ports.agent, persisted.ports.ssh].every(Number.isInteger)) {
+              persisted.ports = undefined;
+            }
+          } catch { /* ports best-effort */ }
+        }
+      } catch { /* display is best-effort metadata */ }
       await this.persist();
     }
   }
 
+  /**
+   * Run a driver op, transparently reattaching stale post-restart entries.
+   * After a control-plane restart the driver forgot its live cells while the
+   * QEMU processes kept running; the persisted record (workdir + display)
+   * plus a QMP liveness probe re-establishes control without disturbing the
+   * guest. Probe failure fails closed (no hallucinated VMs).
+   */
+  private async withLiveDriver<T>(
+    vmId: string,
+    owner: string,
+    op: (driver: VmDriver, entry: RegistryEntry) => Promise<T>,
+  ): Promise<T> {
+    const found = this.mustOwn(vmId, owner);
+    try {
+      return await op(found.driver, found.entry);
+    } catch (err) {
+      if (!(err instanceof EveError) || err.code !== "VM_NOT_FOUND") throw err;
+      if (!this.stale.has(vmId)) throw err;
+      const p = this.persisted.get(vmId);
+      const qemu = found.driver as unknown as {
+        reattach?: (id: string, o: string, spec: unknown, workdir: string, pid?: number) => Promise<unknown>;
+        restoreDisplayClaim?: (id: string, d: number) => void;
+      };
+      if (!p?.workdir || typeof qemu.reattach !== "function") throw err;
+      await qemu.reattach(vmId, owner, found.entry.spec, p.workdir, p.pid);
+      if (typeof p.display === "number" && typeof qemu.restoreDisplayClaim === "function") {
+        try {
+          qemu.restoreDisplayClaim(vmId, p.display);
+        } catch { /* ports re-probed on next boot; observe fails loudly meanwhile */ }
+      }
+      this.stale.delete(vmId);
+      await this.persist();
+      return op(found.driver, found.entry);
+    }
+  }
+
   async shutdown(vmId: string, owner: string): Promise<void> {
-    const { driver } = this.mustOwn(vmId, owner);
-    await driver.shutdown(vmId);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.shutdown(vmId));
   }
 
   async pause(vmId: string, owner: string): Promise<void> {
-    const { driver } = this.mustOwn(vmId, owner);
-    await driver.pause(vmId);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.pause(vmId));
   }
 
   async resume(vmId: string, owner: string): Promise<void> {
-    const { driver } = this.mustOwn(vmId, owner);
-    await driver.resume(vmId);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.resume(vmId));
   }
 
   async reboot(vmId: string, owner: string): Promise<void> {
-    const { driver } = this.mustOwn(vmId, owner);
-    await driver.reboot(vmId);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.reboot(vmId));
   }
 
   async snapshot(vmId: string, owner: string, name: string): Promise<string> {
-    const { driver } = this.mustOwn(vmId, owner);
-    return driver.snapshot(vmId, name);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.snapshot(vmId, name));
   }
 
   async restore(vmId: string, owner: string, name: string): Promise<string> {
-    const { driver } = this.mustOwn(vmId, owner);
-    return driver.restore(vmId, name);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.restore(vmId, name));
   }
 
   async fork(vmId: string, owner: string, newOwner: string): Promise<VmRecord> {
-    const { driver, entry } = this.mustOwn(vmId, owner);
     if (!newOwner) throw new EveError("BAD_OWNER", "Owner is required");
     // V9: newOwner === owner is allowed (same-tenant branch for
     // human-branching and counterfactual runs); mustOwn still guards source.
-    const rec = await driver.fork(vmId, newOwner);
-    const now = Date.now();
-    const ttl = 3600000;
-    this.registry.set(rec.vmId, { owner: newOwner, backend: entry.backend, spec: rec.spec });
-    this.leases.set(rec.vmId, { owner: newOwner, expiresAtMs: now + ttl, ttlMs: ttl });
-    this.trackPersisted(rec.vmId, rec, newOwner, true);
-    await this.persist();
-    return rec;
+    return this.withLiveDriver(vmId, owner, async (driver, entry) => {
+      const rec = await driver.fork(vmId, newOwner);
+      const now = Date.now();
+      const ttl = 3600000;
+      this.registry.set(rec.vmId, { owner: newOwner, backend: entry.backend, spec: rec.spec });
+      this.leases.set(rec.vmId, { owner: newOwner, expiresAtMs: now + ttl, ttlMs: ttl });
+      this.trackPersisted(rec.vmId, rec, newOwner, true);
+      await this.persist();
+      return rec;
+    });
   }
 
   async destroy(vmId: string, owner: string): Promise<void> {
-    const { driver } = this.mustOwn(vmId, owner);
-    await driver.destroy(vmId);
+    const { driver, entry } = this.mustOwn(vmId, owner);
+    try {
+      await driver.destroy(vmId);
+    } catch (err) {
+      if (!(err instanceof EveError) || err.code !== "VM_NOT_FOUND") throw err;
+      // Post-restart stale entry: the driver never saw this VM in this
+      // process (live handles cannot cross restarts), but the persisted
+      // record has a workdir (+ recorded pid). Reap best-effort so destroy
+      // stays idempotent instead of stranding the entry forever.
+      const rec = this.persisted.get(vmId);
+      const workdir = rec?.workdir;
+      if (typeof entry.owner === "string" && workdir) {
+        if (typeof rec?.pid === "number") {
+          try {
+            process.kill(rec.pid, 0);
+            try { process.kill(rec.pid, "SIGKILL"); } catch { /* exiting */ }
+          } catch { /* pid not alive */ }
+        }
+        try {
+          await fs.rm(workdir, { recursive: true, force: true });
+        } catch { /* best effort */ }
+      } else {
+        throw err;
+      }
+    }
     this.registry.delete(vmId);
     this.leases.delete(vmId);
     this.persisted.delete(vmId);
@@ -2237,16 +2516,16 @@ export class VmManager {
   }
 
   async screendump(vmId: string, owner: string): Promise<Buffer> {
-    const { driver } = this.mustOwn(vmId, owner);
-    return driver.screendump(vmId);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.screendump(vmId));
   }
 
   /** qemu-guest-agent exec (QEMU backend only; others throw UNSUPPORTED). */
   async guestExec(vmId: string, owner: string, argv: readonly string[]): Promise<{ pid: number }> {
-    const { driver } = this.mustOwn(vmId, owner);
-    const q = driver as unknown as { guestExec?: (id: string, a: readonly string[]) => Promise<{ pid: number }> };
-    if (typeof q.guestExec !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} has no guest-exec channel`);
-    return q.guestExec(vmId, argv);
+    return this.withLiveDriver(vmId, owner, (driver) => {
+      const q = driver as unknown as { guestExec?: (id: string, a: readonly string[]) => Promise<{ pid: number }> };
+      if (typeof q.guestExec !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} has no guest-exec channel`);
+      return q.guestExec(vmId, argv);
+    });
   }
 
   async guestExecSync(
@@ -2255,16 +2534,25 @@ export class VmManager {
     argv: readonly string[],
     timeoutMs = 60000,
   ): Promise<{ exitcode: number; out: string; err: string }> {
-    const { driver } = this.mustOwn(vmId, owner);
-    const q = driver as unknown as {
-      guestExecSync?: (id: string, a: readonly string[], t?: number) => Promise<{ exitcode: number; out: string; err: string }>;
-    };
-    if (typeof q.guestExecSync !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} has no guest-exec channel`);
-    return q.guestExecSync(vmId, argv, timeoutMs);
+    return this.withLiveDriver(vmId, owner, (driver) => {
+      const q = driver as unknown as {
+        guestExecSync?: (id: string, a: readonly string[], t?: number) => Promise<{ exitcode: number; out: string; err: string }>;
+      };
+      if (typeof q.guestExecSync !== "function") throw new EveError("UNSUPPORTED", `Backend ${driver.backend} has no guest-exec channel`);
+      return q.guestExecSync(vmId, argv, timeoutMs);
+    });
   }
 
   async status(vmId: string, owner: string): Promise<VmStatus> {
-    const { driver } = this.mustOwn(vmId, owner);
-    return driver.status(vmId);
+    return this.withLiveDriver(vmId, owner, (driver) => driver.status(vmId));
+  }
+
+  /** Driver audit trail for a VM (lifecycle transitions + reasons). */
+  async auditLog(vmId: string, owner: string): Promise<Array<{ at: string; op: string; detail: string }>> {
+    return this.withLiveDriver(vmId, owner, async (driver) => {
+      const q = driver as unknown as { auditLog?: (id: string) => Array<{ at: string; op: string; detail: string }> };
+      if (typeof q.auditLog !== "function") return [];
+      return q.auditLog(vmId);
+    });
   }
 }

@@ -9,4 +9,5 @@ models/
 *.png
 coverage/
 infra/deployment/tls/certs/
+infra/deployment/object-storage/.runtime-qual/
 gpu-ckpt.pt

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRegistry } from "../packages/model-registry/src/index.js";
@@ -60,11 +61,16 @@ describe("genesis separates integrity from performance", () => {
     const dir = mkdtempSync(join(tmpdir(), "evex-genesis-"));
     try {
       const reg = new ModelRegistry({ dir });
+      const wpath = join(dir, "weights", "w.bin");
+      writeFileSync(wpath, Buffer.alloc(1024, 7));
+      // Real digest so the weights gate passes and the held-out gate is what
+      // refuses (the original intent of this test).
+      const real = createHash("sha256").update(readFileSync(wpath)).digest("hex");
       const rec = reg.createRecord({
         version: "0.1.0",
         architecture: "cua-small",
-        weightsUri: "file:weights/w.bin",
-        weightsSha256: "0".repeat(64),
+        weightsUri: wpath,
+        weightsSha256: real,
         weightsBytes: 1024,
         quantization: "none",
         configHash: "c".repeat(64),
@@ -88,6 +94,36 @@ describe("genesis separates integrity from performance", () => {
         () => reg.promote(rec.modelId, "staging", { approvalToken: "human-ok-1", minSuccessRate: 0.8, minGroundingAccuracy: 0.85, minRecoveryRate: 0.6, requireHeldOut: true }, "eve-ground-v1"),
         /held-out/,
       );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("registry promotion refuses missing or tampered weights", () => {
+    const dir = mkdtempSync(join(tmpdir(), "evex-genesis-"));
+    try {
+      const reg = new ModelRegistry({ dir });
+      const mk = (weightsUri: string, sha: string, bytes: number): string => {
+        const rec = reg.createRecord({
+          version: "0.1.0", architecture: "cua-small", weightsUri,
+          weightsSha256: sha, weightsBytes: bytes, quantization: "none",
+          configHash: "c".repeat(64), datasetDigest: "d".repeat(64),
+          codeDigest: "e".repeat(64), trainedBy: "eval", config: {},
+        });
+        reg.recordBenchmark(rec.modelId, {
+          benchmark: "eve-ground-v1", split: "test",
+          successRate: 0.9, groundingAccuracy: 0.9, recoveryRate: 0.7,
+          samples: 10, digest: "f".repeat(64), at: new Date().toISOString(),
+        });
+        return rec.modelId;
+      };
+      const gate = { approvalToken: "human-ok-2", minSuccessRate: 0.5, minGroundingAccuracy: 0.5, minRecoveryRate: 0.5, requireHeldOut: false };
+      const missing = mk(join(dir, "weights", "nope.bin"), "0".repeat(64), 10);
+      assert.throws(() => reg.promote(missing, "staging", gate, "eve-ground-v1"), /weights missing/);
+      const wpath = join(dir, "weights", "w.bin");
+      writeFileSync(wpath, Buffer.alloc(64, 1));
+      const tampered = mk(wpath, "1".repeat(64), 64);
+      assert.throws(() => reg.promote(tampered, "staging", gate, "eve-ground-v1"), /mismatch/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -232,6 +232,25 @@ export class ModelRegistry {
     if (!parsedGate.approvalToken || parsedGate.approvalToken.trim().length < 8) {
       throw new Error("Refusing promotion: human approval token required");
     }
+    // Weights integrity: a corrupt or missing local checkpoint must never
+    // promote. file:// URIs and plain paths are verified (existence, size,
+    // sha256); remote URIs are out of scope for local verification and are
+    // recorded as unverified (a separate supply-chain check owns them).
+    const wuri = rec.weights.uri;
+    const localPath = wuri.startsWith("file://") ? wuri.slice("file://".length) : (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(wuri) ? null : wuri);
+    if (localPath !== null) {
+      const st = weightsStat(localPath);
+      if (!st.exists || st.bytes === 0) {
+        throw new Error(`Refusing promotion: weights missing or empty at ${localPath}`);
+      }
+      if (st.bytes !== rec.weights.bytes) {
+        throw new Error(`Refusing promotion: weights size ${st.bytes} != recorded ${rec.weights.bytes} (corrupt or replaced)`);
+      }
+      const actual = sha256File(localPath);
+      if (actual !== rec.weights.sha256) {
+        throw new Error("Refusing promotion: weights sha256 mismatch (corrupt or replaced)");
+      }
+    }
     const test = this.latestBenchmark(rec, benchmark, "test");
     if (!test) throw new Error(`Refusing promotion: no test-split score for benchmark ${benchmark}`);
     const failures: string[] = [];
@@ -355,4 +374,9 @@ export function weightsStat(weightsPath: string): { exists: boolean; bytes: numb
   if (!existsSync(weightsPath)) return { exists: false, bytes: 0 };
   const st = statSync(weightsPath);
   return { exists: st.isFile(), bytes: st.size };
+}
+
+/** sha256 of a local file (promotion gate integrity check). */
+export function sha256File(weightsPath: string): string {
+  return createHash("sha256").update(readFileSync(weightsPath)).digest("hex");
 }

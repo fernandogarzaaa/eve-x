@@ -3,9 +3,12 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, accessSync, constan
 import { join, resolve } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
+import { totalmem } from "node:os";
 
 // ── eve-x CLI: init/doctor/vm/session/benchmark/report/model/dataset/server ──
 // Deps: node builtins only (+ fetch global). Talks to the API over HTTP.
+
+import { evaluateProduction } from "../../../packages/security/src/index.js";
 
 const VERSION = "1.0.0";
 const ROOT = process.cwd();
@@ -40,6 +43,7 @@ Usage: eve-x <command> [args]
 
   init [--dir <path>]              scaffold data dirs + .env
   doctor                           check node/qemu/docker/images/storage/network/ports/permissions
+  doctor --production              hard production-safety gate (auth/services/quotas/TLS)
   vm create [--image N] [--cpu N]   create a VM
   vm status <id> | rm <id>          vm status / destroy
   session create --goal "..."       create session
@@ -183,6 +187,112 @@ async function doctor(): Promise<number> {
   return 0;
 }
 
+// ── doctor --production: hard production-safety gate (§21) ──
+
+function probeTcp(host: string, port: number, timeoutMs = 2500): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    const finish = (ok: boolean): void => {
+      if (done) return;
+      done = true;
+      resolve(ok);
+    };
+    const timer = setTimeout(() => {
+      try { s.destroy(); } catch { /* ignore */ }
+      finish(false);
+    }, timeoutMs);
+    let s: { destroy: () => void; on: (ev: string, fn: () => void) => void };
+    try {
+      s = createConnection({ host, port });
+    } catch {
+      clearTimeout(timer);
+      finish(false);
+      return;
+    }
+    s.on("connect", () => {
+      clearTimeout(timer);
+      try { s.destroy(); } catch { /* ignore */ }
+      finish(true);
+    });
+    s.on("error", () => {
+      clearTimeout(timer);
+      finish(false);
+    });
+  });
+}
+
+function hostPort(url: string, dflt: number): { host: string; port: number } | null {
+  try {
+    const u = new URL(url.includes("://") ? url : `tcp://${url}`);
+    const port = u.port ? Number(u.port) : dflt;
+    if (!u.hostname || !Number.isInteger(port)) return null;
+    return { host: u.hostname, port };
+  } catch {
+    return null;
+  }
+}
+
+async function doctorProduction(): Promise<number> {
+  const requireServices = (process.env["EVEX_REQUIRE_SERVICES"] ?? "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+    .map((s) => (s === "minio" || s === "s3" || s === "garage" ? "object" : s));
+  const serviceStatus: Record<string, { reachable: boolean; detail: string }> = {};
+  const dbUrl = process.env["DATABASE_URL"] ?? "";
+  if (dbUrl) {
+    const hp = hostPort(dbUrl, 5432);
+    const ok = hp ? await probeTcp(hp.host, hp.port) : false;
+    serviceStatus["postgres"] = { reachable: ok, detail: ok ? `tcp-reachable ${dbUrl.split("@")[1] ?? dbUrl}` : "unreachable" };
+  }
+  const redisUrl = process.env["REDIS_URL"] ?? "";
+  if (redisUrl) {
+    const hp = hostPort(redisUrl, 6379);
+    const ok = hp ? await probeTcp(hp.host, hp.port) : false;
+    serviceStatus["redis"] = { reachable: ok, detail: ok ? "tcp-reachable" : "unreachable" };
+  }
+  const objUrl = process.env["OBJECT_ENDPOINT"] ?? "";
+  if (objUrl) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 4000);
+      const res = await fetch(objUrl, { method: "HEAD", signal: ctl.signal });
+      clearTimeout(t);
+      void res;
+      serviceStatus["object"] = { reachable: true, detail: `http-reachable ${objUrl}` };
+    } catch (err) {
+      serviceStatus["object"] = { reachable: false, detail: `unreachable: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+  const maxSessions = process.env["EVEX_MAX_SESSIONS"] !== undefined ? Number(process.env["EVEX_MAX_SESSIONS"]) : undefined;
+  const { verdict, findings } = evaluateProduction({
+    authToken: process.env["EVEX_AUTH_TOKEN"] ?? "",
+    corsOrigins: process.env["EVEX_CORS_ORIGINS"] ?? "",
+    requireServices,
+    serviceStatus,
+    maxSessions,
+    vmBackend: process.env["VM_BACKEND"],
+    publicUrl: process.env["EVEX_PUBLIC_URL"],
+    objectEndpoint: objUrl,
+  });
+  for (const f of findings) {
+    out(`[${f.status.toUpperCase()}] ${f.name}: ${f.detail}`);
+  }
+  // Host capacity sanity: quotas that exceed physical RAM guarantee OOM
+  // wedges (observed live: two 4 GB desktop guests on a 9.6 GB host froze
+  // boot with no error surfaced). This is advisory; the scheduler owns quota.
+  const ramMb = Math.floor(totalmem() / 1048576);
+  const perTenantMb = process.env["EVEX_MAX_MEM_MB_PER_TENANT"] !== undefined ? Number(process.env["EVEX_MAX_MEM_MB_PER_TENANT"]) : 32768;
+  const totalVms = process.env["EVEX_MAX_TOTAL_VMS"] !== undefined ? Number(process.env["EVEX_MAX_TOTAL_VMS"]) : 32;
+  out(`[INFO] host RAM: ${ramMb} MB`);
+  if (Number.isFinite(perTenantMb) && Number.isFinite(totalVms) && totalVms * 2048 > ramMb) {
+    out(`[WARN] capacity: EVEX_MAX_TOTAL_VMS=${totalVms} at ~2 GB/guest oversubscribes ${ramMb} MB RAM — size quotas to the host or expect OOM wedges`);
+  }
+  if (ramMb < 16384) {
+    out(`[WARN] capacity: ${ramMb} MB RAM is below the 16 GB recommended workstation profile for graphical KVM guests`);
+  }
+  out(`production: ${verdict}`);
+  return verdict === "production-safe" ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const [, , cmd, sub, ...rest] = process.argv;
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -211,6 +321,7 @@ async function main(): Promise<number> {
         return 0;
       }
       case "doctor":
+        if (sub === "--production" || rest.includes("--production")) return await doctorProduction();
         return await doctor();
       case "vm": {
         if (sub === "create") {

@@ -368,3 +368,94 @@ export function listSessionTokens(): Array<{ user: string; role: Role; expiresAt
   }
   return out;
 }
+
+// ── Production-mode configuration validation (§21) ─────────────────────────
+// Pure function: callers gather service reachability (TCP probe, driver
+// status, HTTP check — whatever the environment supports) and pass it in.
+// Verdicts: production-safe | development-only. Any `fail` finding forces
+// development-only; callers in required-services mode must refuse to start.
+
+export type ProductionStatus = "pass" | "fail" | "warn";
+
+export interface ProductionFinding {
+  name: string;
+  status: ProductionStatus;
+  detail: string;
+}
+
+export interface ProductionInput {
+  authToken: string;
+  corsOrigins: string;
+  requireServices: string[];
+  serviceStatus: Record<string, { reachable: boolean; detail: string }>;
+  maxSessions?: number;
+  vmBackend?: string;
+  publicUrl?: string;
+  objectEndpoint?: string;
+}
+
+const WEAK_TOKENS = new Set(["", "change-me", "changeme", "test", "dev", "password", "evex", "secret"]);
+
+export function evaluateProduction(input: ProductionInput): { verdict: "production-safe" | "development-only"; findings: ProductionFinding[] } {
+  const findings: ProductionFinding[] = [];
+  const t = (input.authToken ?? "").trim();
+  if (!t || WEAK_TOKENS.has(t.toLowerCase())) {
+    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset or a well-known value (dev auth)" });
+  } else if (t.length < 32) {
+    findings.push({ name: "auth", status: "fail", detail: `EVEX_AUTH_TOKEN too short (${t.length} chars; require >= 32)` });
+  } else {
+    findings.push({ name: "auth", status: "pass", detail: `bearer token set (${t.length} chars)` });
+  }
+  const origins = (input.corsOrigins ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (origins.includes("*")) {
+    // The CORS middleware never reflects "*", so this is dead config rather
+    // than a hole — but in production it signals a misunderstood policy.
+    findings.push({ name: "cors", status: "warn", detail: "EVEX_CORS_ORIGINS contains '*' (inert: never reflected; remove it)" });
+  } else if (origins.length === 0) {
+    findings.push({ name: "cors", status: "warn", detail: "no CORS origins configured (browser console on another origin will fail)" });
+  } else {
+    findings.push({ name: "cors", status: "pass", detail: `allowlist: ${origins.join(",")}` });
+  }
+  if (input.requireServices.length === 0) {
+    findings.push({ name: "services", status: "warn", detail: "EVEX_REQUIRE_SERVICES unset: silent file fallback possible (development-only posture)" });
+  }
+  for (const svc of input.requireServices) {
+    const st = input.serviceStatus[svc];
+    if (!st) {
+      findings.push({ name: `service:${svc}`, status: "fail", detail: "required but status unknown" });
+    } else if (!st.reachable) {
+      findings.push({ name: `service:${svc}`, status: "fail", detail: `required but unreachable: ${st.detail}` });
+    } else {
+      findings.push({ name: `service:${svc}`, status: "pass", detail: st.detail });
+    }
+  }
+  if (input.maxSessions === undefined) {
+    findings.push({ name: "quotas", status: "warn", detail: "EVEX_MAX_SESSIONS unset (unbounded sessions)" });
+  } else if (!Number.isInteger(input.maxSessions) || input.maxSessions < 1 || input.maxSessions > 512) {
+    findings.push({ name: "quotas", status: "fail", detail: `EVEX_MAX_SESSIONS=${input.maxSessions} out of range 1..512` });
+  } else {
+    findings.push({ name: "quotas", status: "pass", detail: `max sessions ${input.maxSessions}` });
+  }
+  const backend = (input.vmBackend ?? "auto").toLowerCase();
+  if (backend.startsWith("dev")) {
+    findings.push({ name: "vm-backend", status: "warn", detail: `VM_BACKEND=${backend} is development-only (no isolation)` });
+  } else {
+    findings.push({ name: "vm-backend", status: "pass", detail: `VM_BACKEND=${backend}` });
+  }
+  const pub = (input.publicUrl ?? "").trim();
+  if (!pub) {
+    findings.push({ name: "tls", status: "warn", detail: "no public URL configured (terminate TLS at ingress for any shared host)" });
+  } else if (pub.startsWith("https://")) {
+    findings.push({ name: "tls", status: "pass", detail: `public endpoint ${pub}` });
+  } else if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/.test(pub)) {
+    findings.push({ name: "tls", status: "pass", detail: `loopback endpoint ${pub} (no TLS needed)` });
+  } else {
+    findings.push({ name: "tls", status: "fail", detail: `non-local HTTP endpoint ${pub} (HTTP-only production)` });
+  }
+  const obj = (input.objectEndpoint ?? "").trim();
+  if (obj && !obj.startsWith("https://") && !/^(http:\/\/)?(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/.test(obj)) {
+    findings.push({ name: "object-tls", status: "warn", detail: `object endpoint ${obj} is plaintext over network` });
+  }
+  const verdict = findings.some((f) => f.status === "fail") ? "development-only" : "production-safe";
+  return { verdict, findings };
+}

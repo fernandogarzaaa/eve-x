@@ -16,6 +16,14 @@ let base = "";
 let srv: Server | null = null;
 const MASTER = "test-master-token-xyz";
 const SECRET = "test-hmac-secret-abc";
+let prevBackend: string | undefined;
+const QUOTA_ENV: Record<string, string> = {
+  EVEX_MAX_VMS_PER_TENANT: "64",
+  EVEX_MAX_TOTAL_VMS: "512",
+  EVEX_MAX_CPU_PER_TENANT: "256",
+  EVEX_MAX_MEM_MB_PER_TENANT: "524288",
+};
+const prevQuota: Record<string, string | undefined> = {};
 
 function auth(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
@@ -66,6 +74,15 @@ before(async () => {
   process.env["EVEX_AUTH_TOKEN"] = MASTER;
   process.env["EVEX_TOKEN_SECRET"] = SECRET;
   process.env["EVEX_CORS_ORIGINS"] = "http://localhost:3000,http://localhost:3001";
+  // Pin the dev backend: these tests exercise API hardening (authz, replay,
+  // idempotency), not drivers. Without the pin, auto-select would grab a
+  // live Docker daemon where present and change timing/behavior.
+  prevBackend = process.env["VM_BACKEND"];
+  process.env["VM_BACKEND"] = "dev-framebuffer";
+  for (const [k, v] of Object.entries(QUOTA_ENV)) {
+    prevQuota[k] = process.env[k];
+    process.env[k] = v;
+  }
   delete process.env["EVEX_TENANT"];
   await ensureOptionals();
   __clearMemory();
@@ -80,6 +97,12 @@ before(async () => {
 
 after(async () => {
   await new Promise<void>((resolve) => srv?.close(() => resolve()));
+  if (prevBackend === undefined) delete process.env["VM_BACKEND"];
+  else process.env["VM_BACKEND"] = prevBackend;
+  for (const [k, v] of Object.entries(prevQuota)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
 });
 
 describe("api hardening", () => {

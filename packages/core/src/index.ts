@@ -30,12 +30,15 @@ export class StateMachine<S extends string> {
   }
 }
 export const VM_TRANSITIONS: Record<string, string[]> = {
-  CREATING: ["CREATED", "FAILED"], CREATED: ["BOOTING", "DESTROYING"],
-  BOOTING: ["READY", "FAILED"], READY: ["RUNNING", "STOPPING"],
+  // Fail-closed invariant: EVERY non-terminal state can reach FAILED, so a
+  // command-phase failure (e.g. clone-resume timeout while PAUSED) always
+  // lands honestly instead of stranding the cell in a transient state.
+  CREATING: ["CREATED", "FAILED"], CREATED: ["BOOTING", "DESTROYING", "FAILED"],
+  BOOTING: ["READY", "FAILED"], READY: ["RUNNING", "STOPPING", "FAILED"],
   RUNNING: ["PAUSING", "STOPPING", "RESTORING", "FORKING", "FAILED"],
-  PAUSING: ["PAUSED", "FAILED"], PAUSED: ["RUNNING", "RESTORING", "STOPPING"],
+  PAUSING: ["PAUSED", "FAILED"], PAUSED: ["RUNNING", "RESTORING", "STOPPING", "FAILED"],
   RESTORING: ["RUNNING", "FAILED"], FORKING: ["RUNNING", "FAILED"],
-  STOPPING: ["STOPPED", "FAILED"], STOPPED: ["BOOTING", "DESTROYING", "CREATING"],
+  STOPPING: ["STOPPED", "FAILED"], STOPPED: ["BOOTING", "DESTROYING", "CREATING", "FAILED"],
   FAILED: ["DESTROYING", "CREATING"], DESTROYING: ["DESTROYED"], DESTROYED: [],
 };
 export function sha1hex(s: string): string {

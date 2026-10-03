@@ -47,6 +47,15 @@ describe("vm state machine", () => {
     assert.ok(!m.can("RUNNING"));
   });
 
+  it("fail-closed: every non-terminal state can reach FAILED", () => {
+    for (const from of ["CREATING", "CREATED", "BOOTING", "READY", "RUNNING", "PAUSING", "PAUSED", "RESTORING", "FORKING", "STOPPING", "STOPPED"]) {
+      const m = vmMachine(from);
+      assert.ok(m.can("FAILED"), `${from} must reach FAILED (fail-closed invariant)`);
+      m.transition("FAILED", "command-phase failure");
+      assert.equal(m.state, "FAILED");
+    }
+  });
+
   it("DESTROYED is terminal", () => {
     const m = vmMachine("DESTROYING");
     m.transition("DESTROYED", "reaped");

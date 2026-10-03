@@ -100,6 +100,8 @@ describe("blind review flow (server-side)", () => {
   const MASTER = "test-blind-master-token";
   let base = "";
   let srv: Server | null = null;
+  let prevBackend: string | undefined;
+  const prevQuota: Record<string, string | undefined> = {};
 
   async function api(method: string, path: string, body?: unknown): Promise<{ status: number; json: any }> {
     const res = await fetch(`${base}${path}`, {
@@ -133,6 +135,19 @@ describe("blind review flow (server-side)", () => {
     process.env["DATA_DIR"] = mkdtempSync(join(tmpdir(), "evex-blind-"));
     process.env["EVEX_AUTH_TOKEN"] = MASTER;
     delete process.env["EVEX_TENANT"];
+    // Pin dev backend (see api-hardening.test.ts): API-behavior tests must
+    // not depend on whatever hypervisor happens to be reachable.
+    prevBackend = process.env["VM_BACKEND"];
+    process.env["VM_BACKEND"] = "dev-framebuffer";
+    for (const [k, v] of Object.entries({
+      EVEX_MAX_VMS_PER_TENANT: "64",
+      EVEX_MAX_TOTAL_VMS: "512",
+      EVEX_MAX_CPU_PER_TENANT: "256",
+      EVEX_MAX_MEM_MB_PER_TENANT: "524288",
+    })) {
+      prevQuota[k] = process.env[k];
+      process.env[k] = v;
+    }
     await ensureOptionals();
     __clearMemory();
     const app = buildApp();
@@ -144,6 +159,12 @@ describe("blind review flow (server-side)", () => {
 
   after(async () => {
     await new Promise<void>((resolve) => srv?.close(() => resolve()));
+    if (prevBackend === undefined) delete process.env["VM_BACKEND"];
+    else process.env["VM_BACKEND"] = prevBackend;
+    for (const [k, v] of Object.entries(prevQuota)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   });
 
   it("enqueue strips confidence keys, submit unlocks full, double-submit 409s", async () => {

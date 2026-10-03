@@ -17,9 +17,9 @@ export type FrameSourceOptions = z.infer<typeof FrameSourceOptions>;
 export class FrameSource {
   private readonly opts: FrameSourceOptions;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private latestPng: Buffer | null = null;
-  private lastError: string | null = null;
-  private readonly listeners = new Set<(png: Buffer) => void>();
+  protected latestPng: Buffer | null = null;
+  protected lastError: string | null = null;
+  protected readonly listeners = new Set<(png: Buffer) => void>();
 
   constructor(optsInput: unknown) {
     this.opts = FrameSourceOptions.parse(optsInput);
@@ -66,9 +66,44 @@ export class FrameSource {
     return this.lastError;
   }
 
+  /** Validate PNG magic + publish to latest/listeners (subclass hook). */
+  protected emitFrame(png: Buffer): Buffer {
+    if (png.length < 8 || png[0] !== 137 || png[1] !== 80) {
+      throw new EveError("BAD_FRAME", "Source did not return PNG bytes");
+    }
+    this.latestPng = png;
+    this.lastError = null;
+    for (const l of this.listeners) l(png);
+    return png;
+  }
+
   onFrame(listener: (png: Buffer) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
+  }
+}
+
+/**
+ * QMP-backed frame source: screenshots come from the hypervisor
+ * (`driver.screendump`), not from an in-guest HTTP agent. Used for KVM
+ * guests (and any backend without a guest agent). The baseUrl/secret pair
+ * required by FrameSource is a documented placeholder here — pollOnce never
+ * performs an HTTP fetch.
+ */
+export class QmpFrameSource extends FrameSource {
+  private readonly shot: () => Promise<Buffer>;
+
+  constructor(screendump: () => Promise<Buffer>, pollMs = 1000) {
+    super({
+      baseUrl: "http://127.0.0.1:9/qmp-frame-source",
+      secret: "qmp-frame-source-no-http-fetch-00000000",
+      pollMs,
+    });
+    this.shot = screendump;
+  }
+
+  override async pollOnce(): Promise<Buffer> {
+    return this.emitFrame(await this.shot());
   }
 }
 
@@ -342,10 +377,13 @@ export class ComputerRuntime {
     };
   }
 
-  /** Observe: pixels in, ComputerPercept out. Nothing else leaves this method. */
+  /** Observe: pixels in, ComputerPercept out. Nothing else leaves this method.
+   *  Always polls fresh: serving a cached frame with a new frameId would let
+   *  the agent act on a dead past (observed live: an early-boot text frame
+   *  served forever while the guest ran a desktop). latest() exists for
+   *  stream subscribers, never for perception. */
   async observe(): Promise<z.infer<typeof ComputerPercept>> {
-    let png = this.frame.latest();
-    if (!png) png = await this.frame.pollOnce();
+    const png = await this.frame.pollOnce();
     const frameId = uid("frame");
     this.lastFrameId = frameId;
     const a = analyzePng(png, this.opts.channel);
@@ -369,8 +407,7 @@ export class ComputerRuntime {
   }
 
   async screenshot(): Promise<string> {
-    let png = this.frame.latest();
-    if (!png) png = await this.frame.pollOnce();
+    const png = await this.frame.pollOnce();
     this.lastFrameId = uid("frame");
     return png.toString("base64");
   }
@@ -463,13 +500,29 @@ export class ComputerRuntime {
   async hotkey(namesInput: string[], expectedFrameId?: string): Promise<void> {
     this.checkFresh(expectedFrameId);
     const names = z.array(z.string().min(1).max(64)).min(1).max(4).parse(namesInput);
-    const syms = names.map((n) => {
-      const s = KEYSYMS[n];
-      if (s === undefined) throw new EveError("BAD_KEY", `Unknown key: ${n}`);
-      return s;
-    });
-    for (const s of syms) await this.input.key(s, true);
-    for (let i = syms.length - 1; i >= 0; i--) await this.input.key(syms[i] ?? 0, false);
+    // Named keys (Control_L, F1, ...) resolve via the keysym table; single
+    // characters resolve like type() so Ctrl+Alt+T style shortcuts work.
+    const downs: number[] = [];
+    const ups: number[] = [];
+    for (const n of names) {
+      const sym = KEYSYMS[n];
+      if (sym !== undefined) {
+        downs.push(sym);
+        ups.unshift(sym);
+        continue;
+      }
+      if ([...n].length === 1) {
+        const { keysym, shift } = keysymForChar(n);
+        if (shift) downs.push(KEYSYMS["Shift_L"] ?? 0xffe1);
+        downs.push(keysym);
+        ups.unshift(keysym);
+        if (shift) ups.unshift(KEYSYMS["Shift_L"] ?? 0xffe1);
+        continue;
+      }
+      throw new EveError("BAD_KEY", `Unknown key: ${n}`);
+    }
+    for (const s of downs) await this.input.key(s, true);
+    for (const s of ups) await this.input.key(s, false);
   }
 
   async scroll(dxInput: number, dyInput: number, expectedFrameId?: string): Promise<void> {

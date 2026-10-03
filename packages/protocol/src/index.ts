@@ -1,6 +1,9 @@
 import { z } from "zod";
 
 // ── Canonical EVE-X protocol (single schema authority, §53) ──
+// Coordinate convention (binding everywhere: perception, grounding,
+// ActionIR, verifier IoU, console overlays): BBox is inclusive pixel
+// corners [x0, y0, x1, y1]. Point-in-region tests and IoU assume this.
 export const Point = z.object({ x: z.number().int().min(0), y: z.number().int().min(0) });
 export type Point = z.infer<typeof Point>;
 export const BBox = z.tuple([z.number(), z.number(), z.number(), z.number()]);

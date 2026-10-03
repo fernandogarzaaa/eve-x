@@ -4,8 +4,8 @@
 // encoded; any unexpected REACHABLE is a finding. Evidence JSON to ARTDIR.
 import { execSync } from "node:child_process";
 
-const IMGDIR = "/var/lib/eve-images/qual";
-const ARTDIR = "/root/evex/artifacts/qualification";
+const IMGDIR = "/var/lib/eve-images";
+const ARTDIR = "/root/evex-prod/artifacts/qualification";
 const out = { at: new Date().toISOString(), probes: [] };
 const rec = (target, result, detail) => {
   out.probes.push({ target, result, detail: String(detail).slice(0, 200) });
@@ -13,10 +13,10 @@ const rec = (target, result, detail) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const { QemuDriver } = await import("/root/evex/dist/packages/vm/src/index.js");
+const { QemuDriver } = await import("/root/evex-prod/dist/packages/vm/src/index.js");
 const driver = new QemuDriver({ imagesDir: IMGDIR, vncBase: 30 });
 const spec = { image: "ubuntu-desktop-v1", cpu: 2, memoryMb: 2048, diskGb: 8, width: 1280, height: 800, network: "allowlisted" };
-const vm = await driver.create(spec, "qual-tenant", { baseImage: "eve-base-noble.qcow2", hostname: "eve-qual-escape" });
+const vm = await driver.create(spec, "qual-tenant", { baseImage: "eve-desktop-xorg.qcow2", hostname: "eve-qual-escape" });
 await driver.boot(vm.vmId);
 console.log("RUNNING " + vm.vmId);
 
