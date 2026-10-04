@@ -1,15 +1,16 @@
 # EVE-X console image (static UI + thin config server on :3000).
 # Build from the repo root: docker build -f infra/docker/Dockerfile.console .
-FROM node:20-slim AS base
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS base
 ENV NODE_ENV=production \
     CONSOLE_PORT=3000 \
     EVEX_API_URL=http://api:8080
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev --no-audit --no-fund \
+RUN npm ci --omit=dev --no-audit --no-fund \
   && npm cache clean --force
+# dist is the single source of truth (the console static bundle ships inside
+# dist via copy-static.mjs); never COPY source trees into the image.
 COPY dist ./dist
-COPY apps/console/static ./apps/console/static
 RUN useradd --system --create-home --home-dir /home/evex evex \
   && chown -R evex:evex /app
 EXPOSE 3000

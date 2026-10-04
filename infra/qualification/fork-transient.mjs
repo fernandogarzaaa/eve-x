@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Rapid snapshot->restore->fork to catch the transient post-restore fork failure.
 const API = "http://127.0.0.1:8080";
-const H = { "Content-Type": "application/json", Authorization: "Bearer qual-canonical-token-0123456789abcdef" };
+const H = { "Content-Type": "application/json", Authorization: "Bearer " + (process.env.EVEX_AUTH_TOKEN ?? "") };
 async function call(method, path, body) {
   const r = await fetch(API + path, { method, headers: H, body: body === undefined ? undefined : JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));

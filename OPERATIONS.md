@@ -4,6 +4,8 @@
 
 - Check `/health` on api + inference `/health`; confirm `/ready` is 200
   (unready means degraded heuristic mode — serving, but investigate).
+  `/health` also reports the release identity; a commit that does not match
+  the deployed release is an incident, not a curiosity.
 - Review worker backlog (Redis queue depth) and VM fleet states; any VM in
   `FAILED` longer than 15 min gets destroyed and reprovisioned.
 - Scan the governance audit log for 403/409 spikes — a burst of policy
@@ -67,11 +69,50 @@ aborts on mismatch regardless of clocks), and trace seqs are allocated from
 the file tail per step, so a skew split-brain can duplicate at most one
 in-flight batch before fencing trips — and replay flags any gap/dupe.
 
+**Storage failure (DATA_DIR).**
+The filesystem is the system of record: stop the plane, restore `DATA_DIR`
+from the latest `data-backup.tar`, restart, confirm session count via
+`/v1/sessions` and release identity via `/version` (rehearsed: 32→0→32).
+Never hand-edit JSON collections; use the API or replay tooling.
+
+**Garage / object failure.**
+Blobs stay local (`OBJECT_DIR`); Garage is the publish/backup target.
+Re-run `bring-up.sh` (idempotent on restored data dirs) and re-run
+`object-qual.py` with a throwaway key to re-verify CRUD + checksums.
+
+**Postgres / Redis failure.**
+Both are optional with file fallback: the plane keeps serving. Restore the
+container/volume, then confirm `/ready` persistence mode flips back to
+`production` when `EVEX_REQUIRE_SERVICES` is set.
+
+**Model / inference failure.**
+`/v1/models/status` reports reachability; the plane serves heuristic
+actions degraded meanwhile. Roll back via the registry (`retire` the bad
+checkpoint; the previous production record remains authoritative).
+
+**TLS failure.**
+Qual/prod certs live in `infra/deployment/tls/certs/` (gitignored).
+Re-issue, restart the nginx sidecar, re-run `tls-check.mjs`.
+
+**Credential rotation.**
+`EVEX_AUTH_TOKEN`: set the new value, rolling-restart api/worker/mcp/
+console, revoke the old. Garage keys: `key create` → re-allow bucket →
+`key delete --yes` the old (rehearsed during qual). VM guest secrets are
+per-VM generated at provision time — nothing to rotate.
+
+**Incident response.**
+Freeze: capture `/version` + `baseline.json`-style env facts first. Then
+session trace (`dataset trace`), audit log, and the object bundle. Reports
+must cite the release commit; never debug a dirty build in production.
+
 ## Backups
 
-- Postgres: nightly `pg_dump` to the object bucket, 30-day retention.
-- Object bucket: versioned; registry `records/*.json` also committed to the
-  release branch per promotion.
+- `DATA_DIR` (the system of record): tar snapshots (`data-backup.tar`
+  pattern), restore rehearsed (wipe → 0 sessions → restore → full recovery).
+- Object bucket (Garage): data+meta dir copies; destroy/restore rehearsed
+  byte-identical (`artifacts/release/garage-backup-restore.json`).
+- Postgres (optional mirror): nightly `pg_dump` to the object bucket,
+  30-day retention.
 - Guest snapshots needed for forensics are exported before VM destroy.
 
 ## Access

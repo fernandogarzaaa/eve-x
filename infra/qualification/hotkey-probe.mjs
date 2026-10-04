@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 const API = "http://127.0.0.1:8080";
-const H = { "Content-Type": "application/json", Authorization: "Bearer qual-canonical-token-0123456789abcdef" };
+const H = { "Content-Type": "application/json", Authorization: "Bearer " + (process.env.EVEX_AUTH_TOKEN ?? "") };
 const SID = "sess-4c2bb7b1";
 const o = await fetch(`${API}/v1/computer/${SID}/observe`, { headers: H });
 const oj = await o.json();

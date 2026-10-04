@@ -14,21 +14,35 @@ Services, ports, and volumes below mirror
 |---|---|---|---|
 | `postgres` | `postgres:16-alpine` | none published | `pgdata:/var/lib/postgresql/data`; healthy via `pg_isready -U evex` |
 | `redis` | `redis:7-alpine` (`--appendonly yes`) | none published | `redisdata:/data`; healthy via `redis-cli ping` |
-| `minio` | `minio/minio:RELEASE.2024-06-13T22-53-53Z` (`server /data --console-address :9001`) | none published | `miniadata:/data` |
-| `inference` | `infra/vm-images/Dockerfile.inference`, `python ml/inference/server.py --host 0.0.0.0 --port 8090 --cpu` | `${INFERENCE_PORT:-8090}:8090` | healthy via `GET /health` |
-| `api` | `infra/vm-images/Dockerfile.api`, `PORT=8080`, `DATA_DIR=/data` | `${API_PORT:-8080}:8080` | `evexdata:/data`; depends on postgres+redis healthy, minio started |
-| `worker` | `infra/vm-images/Dockerfile.api`, `node dist/apps/worker/index.js` | none published | `evexdata:/data`; depends on api+redis healthy |
-| `mcp` | `infra/vm-images/Dockerfile.api`, `node dist/apps/mcp/index.js` | `${MCP_PORT:-8081}:8081` | depends on api healthy; serves StreamableHTTP at `/mcp` |
-| `console` | `infra/vm-images/Dockerfile.console`, `EVEX_API_URL=http://api:8080` | `${CONSOLE_PORT:-3000}:3000` | depends on api healthy |
+| `garage` | `dxflrs/garage:v2.0.0` pinned by digest (see release manifest), `server -c /etc/garage.toml` | none published | `garagedata-meta`, `garagedata-data`; config rendered at deploy time from `infra/deployment/object-storage/garage.toml.template` (secrets never committed). The qualified S3-compatible backend per ADR-14; MinIO is a merely supported alternative, not the qualified backend |
+| `inference` | `infra/docker/Dockerfile.inference`, `python ml/inference/server.py --host 0.0.0.0 --port 8090 --cpu` | `${INFERENCE_PORT:-8090}:8090` | healthy via `GET /health` |
+| `api` | `infra/docker/Dockerfile.api`, `PORT=8080`, `DATA_DIR=/data` | `${API_PORT:-8080}:8080` | `evexdata:/data`; depends on postgres+redis healthy, garage started |
+| `worker` | `infra/docker/Dockerfile.worker`, `node dist/apps/worker/src/index.js` | none published | `evexdata:/data`; depends on api+redis healthy |
+| `mcp` | `infra/docker/Dockerfile.mcp`, `node dist/apps/mcp/src/index.js` | `${MCP_PORT:-8081}:8081` | depends on api healthy; serves StreamableHTTP at `/mcp` |
+| `console` | `infra/docker/Dockerfile.console`, `EVEX_API_URL=http://api:8080` | `${CONSOLE_PORT:-3000}:3000` | depends on api healthy |
 
-Volumes: `pgdata`, `redisdata`, `miniadata`, `evexdata` persist across
-restarts. `latest` is never deployed — image tags pin the release version.
+Volumes: `pgdata`, `redisdata`, `garagedata-meta`, `garagedata-data`,
+`evexdata` persist across restarts. `latest` is never deployed — image tags
+pin the release version and the release manifest pins base digests.
 
 Standalone equivalents of the service images (same launch contract, kept
 alongside compose): `infra/docker/Dockerfile.api`, `Dockerfile.worker`,
 `Dockerfile.mcp`, `Dockerfile.console`, `infra/docker/Dockerfile.inference`
 (python 3.11 + `ml/`). Non-API entry paths (`worker`, `mcp`) resolve under
 `dist/apps/<name>/src/index.js` in a fresh `npm run build` tree.
+
+## Persistence split (system of record, §15)
+
+| State | System of record | Role of the rest |
+|---|---|---|
+| Sessions, VMs, tasks, trace steps (JSONL), judgments, model registry, audit logs | **Filesystem** (`DATA_DIR`: JSON collections + `objects/traces/*.jsonl`) | Postgres is an optional structured mirror, not the record: with `DATABASE_URL` unset or the `pg` driver absent the control plane stays file-primary; `EVEX_REQUIRE_SERVICES` only gates reachability when an operator explicitly requires it |
+| Coordination / leases | **Filesystem leases** (Redis driver absent by default) | Redis is ephemeral coordination only, never durable; file-lease fallback is the default path |
+| Blobs (screenshots, reports, exports, weights) | **Filesystem** (`OBJECT_DIR`) content-addressed by sha256 | Garage (S3 API) is the qualified artifact publish/backup target, operated at the deployment layer; no application code speaks S3 or depends on Garage-specific behavior (§14) |
+| Guests | Cattle | Any VM can be destroyed and reprovisioned from the sealed base + snapshot without losing platform state |
+
+Do not imply Postgres is the system of record. Do not imply Redis is
+durable. Do not imply the filesystem fallback is equivalent to distributed
+persistence — it is the primary by design in 1.0.0.
 
 ## Guest images
 

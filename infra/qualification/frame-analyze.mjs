@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Fetch the canonical session frame + decode + crude content analysis.
 const API = "http://127.0.0.1:8080";
-const H = { Authorization: "Bearer qual-canonical-token-0123456789abcdef" };
+const H = { Authorization: "Bearer " + (process.env.EVEX_AUTH_TOKEN ?? "") };
 const { analyzePng } = await import("/root/evex-prod/dist/packages/perception/src/index.js");
 const r = await fetch(`${API}/v1/computer/sess-5bb0e520/observe`, { headers: H });
 const j = await r.json();

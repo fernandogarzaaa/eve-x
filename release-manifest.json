@@ -1,0 +1,84 @@
+{
+  "product": "eve-x",
+  "version": "1.0.0",
+  "commit": "15e6b977bfd4cfae1c74478309b55d1e3ad265ed",
+  "tree": "02fecf125c32259657fb1e46e6aeba4a7db44e13",
+  "dirty": true,
+  "generatedAt": "2026-10-04T00:19:58.449Z",
+  "toolchain": {
+    "node": "v26.7.0",
+    "npm": "11.19.0",
+    "python": "Python 3.11.9"
+  },
+  "lockfiles": {
+    "package-lock.json": "81ef2884be6e3109a974f861fc6f1b6db3c9acbdba41255d3c0823fb0f8ff9dd"
+  },
+  "containers": {
+    "baseImages": {
+      "node:20-slim": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
+      "python:3.11-slim": "sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b",
+      "dxflrs/garage:v2.0.0": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
+      "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+      "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+    }
+  },
+  "guest": {
+    "image": "eve-desktop-xorg.qcow2",
+    "imageSha256": "38afb22b948e61c11fa044204a2cf2372bbb1ba80fb94075dcac9d45ae5b4249",
+    "baseImage": "eve-desktop-noble.qcow2",
+    "baseSha256": "e19b77ba669ef5e813213a145a99efeeb3d4f58a0fc220dad2f9b4891679273b",
+    "sealedReadonly": true,
+    "reproducibility": "logical (sealed base digest + bake manifest); not claimed bit-for-bit"
+  },
+  "model": {
+    "registry": "filesystem-first (DATA_DIR/models), gated promotion, sha256 checkpoints",
+    "smokePath": "stdlib-only (no torch required)"
+  },
+  "mcp": {
+    "server": "eve-x 1.0.0",
+    "toolSurface": "mcp/1",
+    "tools": [
+      "eve_session_create",
+      "eve_session_status",
+      "eve_session_stop",
+      "eve_vm_create",
+      "eve_vm_status",
+      "eve_vm_snapshot",
+      "eve_vm_restore",
+      "eve_vm_fork",
+      "eve_computer_observe",
+      "eve_computer_act",
+      "eve_human_request",
+      "eve_human_takeover",
+      "eve_human_release",
+      "eve_task_start",
+      "eve_task_status",
+      "eve_task_validate",
+      "eve_trace_get",
+      "eve_replay",
+      "eve_report",
+      "eve_benchmark",
+      "eve_model_status"
+    ],
+    "toolCount": 21
+  },
+  "skills": {
+    "contract": "AGENT_SKILL.md",
+    "integrations": [
+      "claude-code",
+      "codex",
+      "generic",
+      "hermes",
+      "openclaw",
+      "opencode",
+      "pi"
+    ],
+    "installerTargets": [
+      "claude-code",
+      "codex",
+      "opencode",
+      "cursor",
+      "windsurf"
+    ]
+  }
+}

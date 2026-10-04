@@ -1,16 +1,18 @@
 # EVE-X control-plane API image.
 # Build from the repo root: docker build -f infra/docker/Dockerfile.api .
-FROM node:20-slim AS base
+# Base pinned by digest (release reproducibility §9); refresh deliberately.
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS base
 ENV NODE_ENV=production \
     PORT=8080 \
     DATA_DIR=/data \
     OBJECT_DIR=/data/objects
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev --no-audit --no-fund \
+RUN npm ci --omit=dev --no-audit --no-fund \
   && npm cache clean --force
+# dist is the single source of truth (built by `npm run build` from the
+# release commit); never COPY source trees into the image.
 COPY dist ./dist
-COPY apps/console/static ./apps/console/static
 RUN useradd --system --create-home --home-dir /home/evex evex \
   && mkdir -p /data /data/objects \
   && chown -R evex:evex /app /data

@@ -8,10 +8,13 @@
     "node": ">=20.0.0"
   },
   "scripts": {
+    "gen:identity": "node scripts/gen-release-identity.mjs",
+    "clean": "node scripts/clean.mjs",
+    "prebuild": "node scripts/gen-release-identity.mjs",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-static.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node scripts/gen-release-identity.mjs && tsc --noEmit",
     "lint": "node scripts/lint.mjs",
-    "pretest": "tsc -p tsconfig.json",
+    "pretest": "node scripts/gen-release-identity.mjs && tsc -p tsconfig.json",
     "test": "node --test dist/tests/*.test.js",
     "test:all": "node --test dist/tests/*.test.js",
     "doctor": "node dist/apps/cli/src/index.js doctor",
@@ -20,7 +23,9 @@
     "mcp": "node dist/apps/mcp/src/index.js",
     "cli": "node dist/apps/cli/src/index.js",
     "benchmark": "node dist/apps/cli/src/index.js benchmark run",
-    "security:audit": "node scripts/security-audit.mjs"
+    "security:audit": "node scripts/security-audit.mjs",
+    "package": "node scripts/package-release.mjs",
+    "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",

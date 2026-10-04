@@ -1,5 +1,25 @@
 import { randomUUID } from "node:crypto";
 // Core primitives: ids, time, state machines, errors (§52)
+export { RELEASE } from "./release.gen.js";
+import { RELEASE } from "./release.gen.js";
+/** Full runtime release identity: baked build facts + live runtime facts. */
+export function releaseIdentity(): Record<string, string | boolean> {
+  return {
+    ...RELEASE,
+    nodeVersion: process.version,
+    release: `${String(RELEASE.product)} ${String(RELEASE.version)}+${String(RELEASE.commit).slice(0, 12)}${RELEASE.dirty ? ".dirty" : ""}`,
+  };
+}
+/** Fail-closed release/commit gate: when EVEX_EXPECT_COMMIT is set, the
+ *  process refuses to serve unless the baked commit matches (§21). */
+export function assertReleaseCommit(expectedEnv = "EVEX_EXPECT_COMMIT"): void {
+  const expected = (process.env[expectedEnv] ?? "").trim();
+  if (!expected) return;
+  const built = String(RELEASE.commit);
+  if (built !== expected) {
+    throw new Error(`release mismatch: built from ${built} but ${expectedEnv}=${expected}`);
+  }
+}
 export const uid = (p = "id"): string => `${p}-${randomUUID().slice(0, 8)}`;
 export const nowIso = (): string => new Date().toISOString();
 export class EveError extends Error {

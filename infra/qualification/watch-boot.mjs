@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Watch a session boot: observe every 20s, print dims + stalled flag.
 const API = "http://127.0.0.1:8080";
-const H = { Authorization: "Bearer qual-canonical-token-0123456789abcdef" };
+const H = { Authorization: "Bearer " + (process.env.EVEX_AUTH_TOKEN ?? "") };
 const SID = process.argv[2];
 const N = Number(process.argv[3] ?? 25);
 for (let i = 0; i < N; i++) {

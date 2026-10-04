@@ -8,7 +8,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 
 // Static imports of guaranteed-present siblings.
-import { uid, nowIso, prng, sha1hex, EveError, StateMachine, VM_TRANSITIONS } from "../../../packages/core/src/index.js";
+import { uid, nowIso, prng, sha1hex, EveError, StateMachine, VM_TRANSITIONS, releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
 import { ActionIR, ActionType, ComputerPercept, VmSpec, TaskSpec } from "../../../packages/protocol/src/index.js";
 import {
   VmManager, selectDriver, QemuDriver, DockerDesktopDriver, DevFramebufferDriver,
@@ -1022,7 +1022,10 @@ export function buildApp(): express.Express {
   });
 
   // public
-  app.get("/health", (_req: Request, res: Response) => res.json({ ok: true, service: "evex-api", at: nowIso() }));
+  app.get("/health", (_req: Request, res: Response) => res.json({ ok: true, service: "evex-api", at: nowIso(), ...releaseIdentity() }));
+  // Release identity endpoint (§3): exact build revision for release
+  // qualification, mismatch detection, and incident attribution.
+  app.get("/version", (_req: Request, res: Response) => res.json(releaseIdentity()));
   app.get("/ready", (_req: Request, res: Response) => {
     res.json({
       ready: true, sessions: sessions.size, vms: vms.size, at: nowIso(),
@@ -1858,8 +1861,14 @@ export function buildApp(): express.Express {
 
 export async function startApi(port?: number): Promise<Server> {
   await loadOptionals();
-  // Production gate first: with EVEX_REQUIRE_SERVICES set, missing services
-  // refuse startup loudly instead of silently degrading to dev storage.
+  // Release/commit gate first: refuse to serve a build that does not match
+  // the expected release revision (§21). Then the production gate.
+  try {
+    assertReleaseCommit();
+  } catch (err) {
+    log("error", "release-commit mismatch refuses startup", { msg: err instanceof Error ? err.message : String(err) });
+    throw err;
+  }
   prodGate = await enforceRequiredServices();
   if (prodGate.required.length > 0) {
     log("info", "production persistence gate passed", { required: prodGate.required });

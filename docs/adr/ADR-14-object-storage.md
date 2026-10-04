@@ -44,8 +44,9 @@ the S3-compatible object store. Rationale:
   tamper-evident digests.
 - Restart persistence: container restart → identical bytes + digest.
 - Backup/restore: data+meta dirs copied out, instance destroyed, dirs
-  restored into a clean instance, idempotent bring-up skips applied layout,
-  objects byte-identical (sha `676f125a…` before and after).
+  restored into a clean instance, objects byte-identical
+  (`qual/shot.png` sha256 `fbbab289f7f94b25…` before and after;
+  release rehearsal evidence: `artifacts/release/garage-backup-restore.json`).
 - Rejected weak secrets: Garage refuses non-hex RPC secrets at startup
   (observed during qual; bring-up generates 64-hex).
 

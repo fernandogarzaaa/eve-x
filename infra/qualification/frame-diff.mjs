@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Capture two API frames 60s apart; compare bytes to tell frozen vs alive.
 const API = "http://127.0.0.1:8080";
-const H = { Authorization: "Bearer qual-canonical-token-0123456789abcdef" };
+const H = { Authorization: "Bearer " + (process.env.EVEX_AUTH_TOKEN ?? "") };
 const SID = "sess-d054467c";
 import { createHash } from "node:crypto";
 async function frame() {

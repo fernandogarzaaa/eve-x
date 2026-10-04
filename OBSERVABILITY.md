@@ -1,37 +1,26 @@
 # OBSERVABILITY
 
-## Metrics
+## Endpoints (verified against the release build)
 
-Prometheus scrapes (`infra/observability/prometheus.yml`, 10–15 s):
+- `evex-api` (:8080): `/health` (public, carries full release identity),
+  `/ready`, `/metrics`, `/version` (exact build revision). Every response
+  carries `x-request-id`; every log line carries `requestId`.
+- `evex-inference` (:8090): `/health`, `/metrics` (stdlib exposition:
+  requests, errors, queue depth, latency).
+- `evex-mcp` (:8091): `/health` (always public; no `/metrics` in 1.0.0).
+- `evex-console` (:3000): `/health`.
+- `evex-worker`: serves no HTTP by design (Dockerfile healthcheck polls the
+  control plane); progress is file-based under `DATA_DIR`.
 
-- `evex-api` (:8080 `/v1/metrics`) — requests, auth failures, policy
-  denials, transition errors, task starts/completions.
-- `evex-inference` (:8090 `/metrics`) — `evex_infer_requests_total`,
-  `evex_infer_errors_total`, `evex_infer_queue_depth`,
-  `evex_infer_latency_p50_ms` (stdlib exposition, no client library).
-- `evex-worker` (:8082 `/metrics`), `evex-mcp` (:8081 `/metrics`),
-  postgres/redis exporters, and Prometheus self-metrics.
+Prometheus scrapes (`infra/observability/prometheus.yml`) the HTTP
+endpoints above. Trace steps are the primary audit record: every state
+transition, denial, escalation, and judgment carries `at` timestamps,
+`session_id`/`step_id`, actor, model version, and reasons queryable per
+session.
 
-Alert rules (`alert.rules.yml` next to `prometheus.yml`) fire on: inference
-unready > 5 min, queue depth > 80% of bound, 5xx rate spike, VM `FAILED`
-growth, and promotion-gate refusal bursts.
+## Incident attribution
 
-## Logs
-
-Structured JSON lines (UTC timestamp, component, session/task/vm ids,
-outcome). Trace steps are the primary audit record, not log exhaust: every
-state transition, denial, escalation, and judgment carries `at` timestamps
-and reasons queryable per session.
-
-## Tracing sessions
-
-From a session id: `trace read` replays the step journal; per-step digests
-detect tampering; `trace export` produces the offline bundle reviewers and
-the dataset pipeline consume. Replay cursors (`tests/replay.test.ts`) seek
-and branch without mutating history.
-
-## Dashboards
-
-Console panels: fleet states, population-study progress (success/drop-off
-histograms), inference latency/queue, reviewer agreement, and release-gate
-status (integrity vs performance bars side by side).
+`/health` and `/version` report `product/version/commit/tree/buildTime/
+sourceDigest`, so operators can always answer which release produced an
+incident. No secrets are ever logged or served: error paths return typed
+codes + requestId, never stacks or bodies.

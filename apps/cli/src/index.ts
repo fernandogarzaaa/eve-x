@@ -9,6 +9,7 @@ import { totalmem } from "node:os";
 // Deps: node builtins only (+ fetch global). Talks to the API over HTTP.
 
 import { evaluateProduction } from "../../../packages/security/src/index.js";
+import { releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
 
 const VERSION = "1.0.0";
 const ROOT = process.cwd();
@@ -94,6 +95,8 @@ function portFree(port: number): Promise<boolean> {
 }
 
 async function doctor(): Promise<number> {
+  const id = releaseIdentity();
+  out(`eve-x ${id.release} · built ${id.buildTime} · digest ${String(id.sourceDigest).slice(0, 16)}${id.dirty ? " · DIRTY (dev build, not releasable)" : ""}`);
   const checks: Check[] = [];
   const major = Number(process.versions.node.split(".")[0] ?? 0);
   checks.push({
@@ -233,6 +236,22 @@ function hostPort(url: string, dflt: number): { host: string; port: number } | n
 }
 
 async function doctorProduction(): Promise<number> {
+  const id = releaseIdentity();
+  out(`eve-x ${id.release} · built ${id.buildTime} · digest ${String(id.sourceDigest).slice(0, 16)}${id.dirty ? " · DIRTY (dev build, not releasable)" : ""}`);
+  // Release/commit gate: a production doctor against the wrong build fails
+  // closed instead of blessing a mismatched deployment (§21).
+  try {
+    assertReleaseCommit();
+  } catch (err) {
+    out(`[FAIL] release-commit: ${err instanceof Error ? err.message : String(err)}`);
+    out("production: blocked");
+    return 1;
+  }
+  if (id.dirty) {
+    out("[FAIL] release-cleanliness: dirty build must never gate production");
+    out("production: blocked");
+    return 1;
+  }
   const requireServices = (process.env["EVEX_REQUIRE_SERVICES"] ?? "")
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
     .map((s) => (s === "minio" || s === "s3" || s === "garage" ? "object" : s));
@@ -301,6 +320,11 @@ async function main(): Promise<number> {
   }
   if (cmd === "--version" || cmd === "-V") {
     out(VERSION);
+    return 0;
+  }
+  if (cmd === "version") {
+    // Full release identity: never just "1.0.0" when commit is knowable (§3).
+    out(JSON.stringify(releaseIdentity(), null, 2));
     return 0;
   }
   try {

@@ -1,6 +1,6 @@
 # ADR-05: Postgres + Object Storage Split
 
-- Status: accepted
+- Status: accepted (concrete backend superseded by ADR-14: Garage v2, not MinIO)
 - Date: 2026-04-02
 
 ## Context

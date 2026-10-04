@@ -11,3 +11,4 @@ coverage/
 infra/deployment/tls/certs/
 infra/deployment/object-storage/.runtime-qual/
 gpu-ckpt.pt
+packages/core/src/release.gen.ts

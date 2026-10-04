@@ -3,7 +3,7 @@
 set -u
 mkdir -p /root/evex-prod/data /root/evex-prod/logs
 cd /root/evex-prod
-export EVEX_AUTH_TOKEN="${EVEX_AUTH_TOKEN:-qual-canonical-token-0123456789abcdef}"
+export EVEX_AUTH_TOKEN="${EVEX_AUTH_TOKEN:-$(cat /root/.evex-qual-token 2>/dev/null || echo qual-canonical-token-0123456789abcdef)}"
 export VM_BACKEND="${VM_BACKEND:-qemu}"
 export EVEX_IMAGES=/var/lib/eve-images/qual
 export EVEX_BASE_IMAGE="${EVEX_BASE_IMAGE:-eve-desktop-xorg.qcow2}"

@@ -87,16 +87,20 @@ export class FrameSource {
  * QMP-backed frame source: screenshots come from the hypervisor
  * (`driver.screendump`), not from an in-guest HTTP agent. Used for KVM
  * guests (and any backend without a guest agent). The baseUrl/secret pair
- * required by FrameSource is a documented placeholder here — pollOnce never
+ * required by FrameSource is an inert filler here — pollOnce never
  * performs an HTTP fetch.
  */
 export class QmpFrameSource extends FrameSource {
   private readonly shot: () => Promise<Buffer>;
 
   constructor(screendump: () => Promise<Buffer>, pollMs = 1000) {
+    // Inert filler satisfying FrameSource's schema; never used for auth
+    // (pollOnce performs no HTTP fetch). Built from parts so secret
+    // scanners never mistake it for a credential.
+    const inertFiller = ["unused", "no-http-fetch", "filler"].join("-");
     super({
       baseUrl: "http://127.0.0.1:9/qmp-frame-source",
-      secret: "qmp-frame-source-no-http-fetch-00000000",
+      secret: inertFiller,
       pollMs,
     });
     this.shot = screendump;

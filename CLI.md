@@ -1,11 +1,12 @@
 # CLI
 
-Binary: `eve-x` (`dist/apps/cli/src/index.js`). All commands honor `--json` for
-scripting and exit non-zero with `{code, message}` on failure.
+Binary: `eve-x` (`dist/apps/cli/src/index.js`). Commands print JSON to
+stdout for scripting and exit non-zero (`error: ...` on stderr) on failure.
 
 ## Commands
 
 ```
+eve-x version                         full release identity (product/version/commit/build/digest)
 eve-x init [--dir <path>]               scaffold data dirs + .env
 eve-x doctor                            environment + dependency sanity report
 eve-x vm create [--image N] [--cpu N]   create a VM
@@ -32,12 +33,13 @@ MCP tools (`eve_computer_observe`, `eve_computer_act`); the CLI has no
 ## Environment
 
 `EVEX_API_URL` (default `http://localhost:8080`),
-`EVEX_AUTH_TOKEN` (required for every command except `doctor`),
+`EVEX_AUTH_TOKEN` (required for plane commands: vm/session/benchmark/report/
+model/dataset; `doctor` and `version` are local and need no token),
 `EVEX_CONTROL_PLANE_TIMEOUT_MS` (default 15000).
 
 ## Exit codes
 
-0 success · 1 usage/validation · 2 missing dependency or unreachable plane ·
-3 policy/capability denial · 4 verification or promotion-gate failure.
+0 success, 1 runtime error, 2 usage error.
 `doctor` reports per-check pass/fail lines so operators can fix one item at a
-time; automation should parse `--json` output, not the human tables.
+time. `doctor --production` prints the release identity first and refuses
+(dirty builds, commit mismatch) before blessing a deployment.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 const API = "http://127.0.0.1:8080";
-const H = { "Content-Type": "application/json", Authorization: "Bearer qual-canonical-token-0123456789abcdef" };
+const H = { "Content-Type": "application/json", Authorization: "Bearer " + (process.env.EVEX_AUTH_TOKEN ?? "") };
 const SID = "sess-3e605379";
 const s = await fetch(`${API}/v1/sessions/${SID}`, { headers: H }).then((r) => r.json());
 console.log("vm:", s.vmId);

@@ -35,23 +35,22 @@ scores the experience with statistical rigor plus blinded human judgment.
 | `ml/datasets` | Trajectory → dataset pipeline (`build.py`) |
 | `ml/evaluation` | Benchmark eval runner (`eval.py`) |
 | `ml/inference` | Inference HTTP service (`server.py`) |
-| `infra/deployment` | `docker-compose.yml` local deploy (api/worker/mcp/console/postgres/redis/minio/inference) |
+| `infra/deployment` | `docker-compose.yml` local deploy (api/worker/mcp/console/postgres/redis/garage/inference) |
 | `infra/vm-images` | qcow2 image build script + cloud-init seed |
 | `infra/observability` | Prometheus scrape config |
 | `apps/api` | `openapi.json` — versioned (`/v1`) public API definition |
 | `tests` | `node:test` suites covering state machines, IR, verifier, traces, replay, policy, determinism, authz, splits, genesis |
-| `docs/adr` | Architecture decision records ADR-01 … ADR-13 |
+| `docs/adr` | Architecture decision records ADR-01 … ADR-14 |
 
 ## Quick start
 
 ```bash
 # 1. Typecheck everything (single npm package, strict TS, NodeNext)
-npm install --no-audit --no-fund
-npx tsc --noEmit
+npm ci --no-audit --no-fund
+npm run typecheck
 
-# 2. Run the test suites
-npx tsc -p tsconfig.build.json   # build first if dist/ is used by your runner
-node --test dist/tests/*.test.js
+# 2. Run the test suites (pretest compiles; never runs stale dist)
+npm test
 
 # 3. Reproducible local deploy
 cp .env.example .env   # set EVEX_AUTH_TOKEN, POSTGRES_PASSWORD
@@ -76,6 +75,29 @@ python --version  # sanity: scripts target stock Python 3.10+
 
 Further reading: `ARCHITECTURE.md` → `DEPLOYMENT.md` → `OPERATIONS.md`.
 Security posture: `SECURITY.md` + `THREAT_MODEL.md`.
+Release story: `CHANGELOG.md` + `release-manifest.json` +
+`PRODUCTION_QUALIFICATION.md`.
+
+## System map (1.0.0)
+
+- **VM:** QEMU/KVM guests from the sealed `eve-desktop-xorg.qcow2` base
+  (GNOME/Xorg, guest agent, Firefox); overlays per session, snapshots,
+  fork. See `VM.md`.
+- **Human console:** static UI (timeline, region overlays, step log) +
+  takeover / blind-review / judgment flow. See `HUMAN_VALIDATION.md`.
+- **Agent Skills:** install/verify for claude-code, codex, opencode,
+  cursor, windsurf; `integrations/` ships `mcp.json` for seven platforms;
+  skill scripts drive observe/act/replay. See `AGENT_SKILL.md`.
+- **MCP:** 21 tools over stdio + StreamableHTTP (`mcp/1`). See `MCP.md`.
+- **EVE-CUA:** observe → regions → point→region grounding → verifier →
+  act → re-observe, with stale-409s and epoch fencing. See
+  `COMPUTER_USE.md`, `MODEL.md`, `TRAINING.md`.
+- **Storage (qualified):** file-primary record; Postgres/Redis optional;
+  **Garage v2** is the qualified S3-compatible artifact/backup target
+  (ADR-14). MinIO is a merely supported alternative, not qualified.
+- **Release identity:** every build reports
+  `product/version/commit/tree/buildTime/sourceDigest` via
+  `eve-x version`, `doctor --production`, `/health`, `/version`.
 
 ## Platform split
 
