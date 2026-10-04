@@ -301,7 +301,7 @@ interface SessionRec {
   id: string; taskId: string; goal: string; vmId: string; status: string;
   seq: number; paused: boolean; humanControl: boolean; createdAt: string; updatedAt: string;
   sm: StateMachine<string>; owner: string; lastFrame?: string; modeEnforced?: boolean;
-  lastPngSha?: string; stallCount?: number; modeRetryAt?: number;
+  lastPngSha?: string; stallCount?: number; modeRetryAt?: number; vmLossReason?: string;
   lastRegions?: Array<{ regionId: string; bbox: [number, number, number, number]; label: string }>;
 }
 interface TaskRec { id: string; goal: string; status: string; sessionId: string | null; createdAt: string; result: unknown; owner: string }
@@ -326,9 +326,10 @@ interface ReviewRec {
 const reviews = new Map<string, ReviewRec>();
 
 const SESSION_SM: Record<string, string[]> = {
-  READY: ["RUNNING"], RUNNING: ["PAUSED", "STOPPED", "READY"],
-  PAUSED: ["RUNNING", "STOPPED"], STOPPED: ["RUNNING"],
+  READY: ["RUNNING"], RUNNING: ["PAUSED", "STOPPED", "READY", "FAILED"],
+  PAUSED: ["RUNNING", "STOPPED"], STOPPED: ["RUNNING"], FAILED: ["STOPPED", "RUNNING"],
 };
+export { SESSION_SM };
 
 const SNAP_LABEL_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -357,7 +358,44 @@ function persistSession(s: SessionRec): void {
     id: s.id, goal: s.goal, vmId: s.vmId, status: s.status, taskId: s.taskId,
     seq: s.seq, paused: s.paused, humanControl: s.humanControl, lastFrame: s.lastFrame,
     modeEnforced: s.modeEnforced, modeRetryAt: s.modeRetryAt, owner: s.owner, createdAt: s.createdAt, updatedAt: s.updatedAt,
+    vmLossReason: s.vmLossReason,
   });
+}
+
+/**
+ * Dead-VM truth: driver error codes that mean the guest is gone (not a
+ * transient failure). Sessions whose VM dies must say FAILED with the
+ * reason — never keep reporting RUNNING while observe/act cannot reach
+ * any hypervisor channel.
+ */
+const VM_LOST_CODES = new Set(["QMP_CLOSED", "VM_NOT_RUNNING", "VM_NOT_FOUND"]);
+export function isVmLostCode(code: unknown): boolean {
+  return typeof code === "string" && VM_LOST_CODES.has(code);
+}
+
+function markSessionVmLost(s: SessionRec, reason: string): void {
+  if (s.status === "FAILED") {
+    s.vmLossReason = s.vmLossReason ?? reason;
+    persistSession(s);
+    return;
+  }
+  try { s.sm.transition("FAILED", "vm lost"); } catch { /* already there or map lag */ }
+  s.status = "FAILED";
+  s.vmLossReason = reason;
+  s.updatedAt = nowIso();
+  persistSession(s);
+  closeRuntime(s.id);
+  s.seq += 1;
+  appendStep(s.id, {
+    session_id: s.id, task_id: s.taskId, step_id: uid("step"), seq: s.seq,
+    timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: s.lastFrame ?? "",
+    goal: s.goal, candidate_actions: [], outcome: "vm-lost",
+    vmLossReason: reason,
+    provenance: { source: "system", channel: "api-vm-loss", at: nowIso() },
+    model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+  });
+  broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status, vmLossReason: reason });
+  log("warn", "session VM lost; session marked FAILED", { sessionId: s.id, vmId: s.vmId, reason });
 }
 
 function persistVm(v: VmRec): void {
@@ -690,6 +728,7 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
         lastFrame: typeof d["lastFrame"] === "string" ? String(d["lastFrame"]) : undefined,
         modeEnforced: d["modeEnforced"] === true,
         modeRetryAt: typeof d["modeRetryAt"] === "number" ? d["modeRetryAt"] : undefined,
+        vmLossReason: typeof d["vmLossReason"] === "string" ? String(d["vmLossReason"]) : undefined,
       });
       if (!traces.has(id)) traces.set(id, []);
       out.sessions += 1;
@@ -810,6 +849,30 @@ function appendStep(sessionId: string, step: Record<string, unknown>): void {
     // ignore
   }
   broadcast(sessionId, { kind: "step", sessionId, step });
+}
+
+/**
+ * Full trace across restarts: in-memory steps plus any file-appended steps
+ * missing from memory (deduped by step_id). Memory alone is incomplete
+ * after a restart (it holds only post-restart appends); the file alone
+ * misses nothing but costs a bounded tail read. Every trace consumer must
+ * use this — never `traces.get()` directly.
+ */
+function mergedTraceSteps(sessionId: string, limit = 100000): Array<Record<string, unknown>> {
+  const mem = traces.get(sessionId) ?? [];
+  let file: Array<Record<string, unknown>> = [];
+  if (stor) {
+    try {
+      file = stor.store.readTrace(sessionId, limit) as Array<Record<string, unknown>>;
+    } catch { /* ignore */ }
+  }
+  if (file.length === 0) return mem;
+  const memIds = new Set(mem.map((st) => String(st["step_id"] ?? st["seq"])));
+  const extra = file.filter((st) => !memIds.has(String(st["step_id"] ?? st["seq"])));
+  if (extra.length === 0) return mem;
+  // Same merge order as the replay route (memory appends first); extras are
+  // pre-restart file history missing from this process's memory.
+  return [...mem, ...extra];
 }
 
 function broadcast(sessionId: string, payload: unknown): void {
@@ -1104,12 +1167,7 @@ export function buildApp(): express.Express {
     if (denyIfNotOwner(s, req, res)) return;
     const { sm: _sm, ...rest } = s;
     void _sm;
-    let stepCount = (traces.get(s.id) ?? []).length;
-    if (stepCount === 0) {
-      try {
-        stepCount = stor ? (stor.store.readTrace(s.id, 100000) as Array<unknown>).length : 0;
-      } catch { stepCount = 0; }
-    }
+    const stepCount = mergedTraceSteps(s.id).length;
     res.json({ ...rest, steps: stepCount });
   });
   v1.post("/sessions/:id/stop", requireCap("computer:act"), (req: Request, res: Response) => {
@@ -1382,6 +1440,11 @@ export function buildApp(): express.Express {
     const s = sessions.get(req.params["sessionId"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
+    // A session whose VM died reports FAILED, never a stale RUNNING frame.
+    if (s.status === "FAILED") {
+      res.status(503).json({ error: "vm_unreachable", reason: s.vmLossReason ?? "vm lost" });
+      return;
+    }
     const v = s.vmId ? vms.get(s.vmId) : undefined;
     const drv = v ? driverOf(v) : null;
     if (drv && drv.backend !== "dev-framebuffer") {
@@ -1449,6 +1512,13 @@ export function buildApp(): express.Express {
         res.json({ ...percept, backend: drv.backend, synthetic: false, stalled });
       } catch (err) {
         const code = err instanceof EveError ? err.code : "observe_failed";
+        // The guest is gone: mark the session FAILED (with reason) instead
+        // of letting it claim RUNNING while no channel can reach the VM.
+        if (err instanceof EveError && isVmLostCode(err.code)) {
+          markSessionVmLost(s, `${err.code}: ${err.message}`);
+          res.status(503).json({ error: "vm_unreachable", reason: s.vmLossReason ?? err.code });
+          return;
+        }
         res.status(code === "DEV_BACKEND" ? 500 : 502).json({
           error: code === "DEV_BACKEND" ? "internal" : "observe_failed",
           message: err instanceof Error ? err.message : String(err),
@@ -1475,6 +1545,10 @@ export function buildApp(): express.Express {
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
     if (effectiveHumanControl(s)) { res.status(409).json({ error: "human_control", message: "Human has takeover; release first" }); return; }
+    if (s.status === "FAILED") {
+      res.status(503).json({ error: "vm_unreachable", reason: s.vmLossReason ?? "vm lost" });
+      return;
+    }
     const body = validate(ActBody, req.body, res);
     if (!body) return;
     // A5: action type must be a known ActionIR enum member.
@@ -1518,6 +1592,11 @@ export function buildApp(): express.Express {
         if (body.idempotencyKey) idemResponses.set(`${sessionId}:${body.idempotencyKey}`, resp);
         res.json(resp);
       } catch (err) {
+        if (err instanceof EveError && isVmLostCode(err.code)) {
+          markSessionVmLost(s, `${err.code}: ${err.message}`);
+          res.status(503).json({ error: "vm_unreachable", reason: s.vmLossReason ?? err.code });
+          return;
+        }
         if (err instanceof EveError && (err.code === "STALE_PERCEPTION" || err.code === "UNSUPPORTED")) {
           res.status(err.code === "STALE_PERCEPTION" ? 409 : 501).json({ error: err.code === "STALE_PERCEPTION" ? "stale_perception" : "unsupported_action", message: err.message });
           return;
@@ -1613,31 +1692,16 @@ export function buildApp(): express.Express {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
     if (s && denyIfNotOwner(s, req, res)) return;
-    let steps = traces.get(id);
-    if ((!steps || steps.length === 0) && stor) {
-      try {
-        const file = stor.store.readTrace(id, 2000) as Array<Record<string, unknown>>;
-        if (file.length > 0) { steps = file; traces.set(id, file); }
-      } catch { /* ignore */ }
-    }
-    if (!steps && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
-    res.json({ sessionId: id, steps: steps ?? [] });
+    const steps = mergedTraceSteps(id, 2000);
+    if (steps.length === 0 && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
+    res.json({ sessionId: id, steps });
   });
   v1.post("/replay/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
     if (s && denyIfNotOwner(s, req, res)) return;
-    const mem = traces.get(id) ?? [];
     // Merge worker/file-appended steps missing from memory (dedupe by step_id).
-    let file: Array<Record<string, unknown>> = [];
-    if (stor) {
-      try {
-        file = stor.store.readTrace(id, 100000) as Array<Record<string, unknown>>;
-      } catch { /* ignore */ }
-    }
-    const memIds = new Set(mem.map((st) => String(st["step_id"] ?? st["seq"])));
-    const extra = file.filter((st) => !memIds.has(String(st["step_id"] ?? st["seq"])));
-    const steps = [...mem, ...extra];
+    const steps = mergedTraceSteps(id);
     if (steps.length === 0 && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
     const { replayed, verdict, issues } = verifyReplay(steps);
     res.json({ sessionId: id, replayed, verdict, issues });
@@ -1646,7 +1710,7 @@ export function buildApp(): express.Express {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
     if (s && denyIfNotOwner(s, req, res)) return;
-    const steps = traces.get(id) ?? [];
+    const steps = mergedTraceSteps(id);
     if (!s && steps.length === 0) { res.status(404).json({ error: "not_found" }); return; }
     res.json({
       sessionId: id, goal: s?.goal ?? "", status: s?.status ?? "UNKNOWN",
@@ -1665,7 +1729,7 @@ export function buildApp(): express.Express {
     const s = sessions.get(body.sessionId);
     if (!s) { res.status(404).json({ error: "not_found", message: "no such session" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
-    const steps = traces.get(body.sessionId) ?? [];
+    const steps = mergedTraceSteps(body.sessionId);
     if (steps.length === 0) {
       res.status(404).json({ error: "not_found", message: "session has no steps yet" });
       return;
