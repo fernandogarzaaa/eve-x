@@ -1,0 +1,31 @@
+# EVE-X continuous integration: deterministic lifecycle on both host OSes.
+# install (npm ci) -> build -> test (pretest compiles; never stale dist) ->
+# typecheck -> lint -> security audit. No VM/KVM needed: unit suites run
+# against the dev-framebuffer and hermetic fixtures.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run security:audit
+      - run: npm audit --omit=dev
