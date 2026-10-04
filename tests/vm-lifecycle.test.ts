@@ -181,11 +181,13 @@ describe("vm lifecycle (hardened)", () => {
   it("VNC display allocation is unique, bounded, and reusable", async () => {
     // Hermetic bases: production defaults (18080/22000) may be held by
     // out-of-band processes on a dev box; the probe must skip those.
-    const q = new QemuDriver({ vncBase: 50, agentBase: 38080, sshBase: 42000 });
+    // VNC base 400 (ports 6300+) stays clear of WinRM 5985/5986, which
+    // squat GitHub Windows runners inside the old 5900+display range.
+    const q = new QemuDriver({ vncBase: 400, agentBase: 48120, sshBase: 52340 });
     const seen = new Set<number>();
     for (let i = 0; i < 40; i++) {
       const d = await q.allocateDisplay(`vm-${i}`);
-      assert.ok(d >= 50 && d < 90, `display ${d} out of range`);
+      assert.ok(d >= 400 && d < 440, `display ${d} out of range`);
       assert.ok(!seen.has(d), `display ${d} allocated twice`);
       seen.add(d);
     }
@@ -200,22 +202,23 @@ describe("vm lifecycle (hardened)", () => {
     // "claim", so two simultaneous boots took the same display and the
     // second QEMU died on a bound VNC port. The reservation is synchronous
     // now; N same-tick claims must yield N distinct displays.
-    const q = new QemuDriver({ vncBase: 70, agentBase: 38280, sshBase: 42280 });
+    // Base 410 (ports 6310+) avoids WinRM 5985/5986 (see above).
+    const q = new QemuDriver({ vncBase: 410, agentBase: 48280, sshBase: 52480 });
     const ds = await Promise.all(Array.from({ length: 8 }, (_, i) => q.allocateDisplay(`vm-race-${i}`)));
     assert.equal(new Set(ds).size, 8, `concurrent claims collided: ${ds}`);
-    for (const d of ds) assert.ok(d >= 70 && d < 110, `display ${d} out of range`);
+    for (const d of ds) assert.ok(d >= 410 && d < 450, `display ${d} out of range`);
   });
 
   it("display allocator skips ports held by out-of-band processes", async () => {
     const { createServer } = await import("node:net");
-    // Squat the VNC port of display 50 so the allocator must skip it.
+    // Squat the VNC port of the first display so the allocator must skip it.
     const squat = createServer(() => undefined);
-    await new Promise<void>((resolve) => squat.listen(5950, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => squat.listen(6300, "127.0.0.1", resolve));
     try {
-      const q = new QemuDriver({ vncBase: 50, agentBase: 38180, sshBase: 42180 });
+      const q = new QemuDriver({ vncBase: 400, agentBase: 48180, sshBase: 52380 });
       const d = await q.allocateDisplay("vm-skip");
-      assert.notEqual(d, 50, "display with busy VNC port must be skipped, never stolen");
-      assert.ok(d >= 51 && d < 90);
+      assert.notEqual(d, 400, "display with busy VNC port must be skipped, never stolen");
+      assert.ok(d >= 401 && d < 440);
     } finally {
       await new Promise<void>((resolve) => squat.close(() => resolve()));
     }
@@ -252,6 +255,15 @@ describe("vm lifecycle (hardened)", () => {
     const sockPath = process.platform === "win32"
       ? `\\\\?\\pipe\\evex-qmp-${process.pid}-${Date.now()}`
       : join(dir, "qmp.sock");
+    // Serialize replies 25 ms apart. Rationale: QMP is newline-delimited
+    // JSON, so a reply split MID-LINE across two replies (chunkA1, chunkB1,
+    // chunkA2, chunkB2 on the wire) is unrecoverable by ANY line parser —
+    // real QEMU never splits a reply write, and the product must not be
+    // tested against an impossible stream (this exact interleave failed
+    // deterministically on Node 20 while passing on Node 26 by TCP
+    // segmentation luck). Splits WITHIN one reply still prove reassembly
+    // and no-double-buffering; the gap keeps replies line-aligned.
+    let replyGate: Promise<void> = Promise.resolve();
     const server = createServer((conn: Socket) => {
       conn.write(`${JSON.stringify({ QMP: { version: {}, capabilities: [] } })}\n`);
       let acc = "";
@@ -266,11 +278,16 @@ describe("vm lifecycle (hardened)", () => {
             const payload = msg.execute === "qmp_capabilities"
               ? `${JSON.stringify({ return: {}, id: msg.id })}\n`
               : `${JSON.stringify({ return: { echo: msg.execute }, id: msg.id })}\n`;
-            // Split every reply across two chunks: proves reassembly works and
+            // Split this reply across two chunks: proves reassembly works and
             // that no byte is buffered twice (duplication would corrupt JSON).
             const mid = Math.floor(payload.length / 2);
-            conn.write(payload.slice(0, mid));
-            setImmediate(() => conn.write(payload.slice(mid)));
+            const prior = replyGate;
+            let release: () => void = () => undefined;
+            replyGate = new Promise<void>((r) => { release = r; });
+            void prior.then(() => new Promise<void>((r) => setTimeout(r, 25))).then(() => {
+              conn.write(payload.slice(0, mid));
+              setImmediate(() => { conn.write(payload.slice(mid)); release(); });
+            });
           }
           nl = acc.indexOf("\n");
         }
