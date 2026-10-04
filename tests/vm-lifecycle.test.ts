@@ -252,6 +252,15 @@ describe("vm lifecycle (hardened)", () => {
     const sockPath = process.platform === "win32"
       ? `\\\\?\\pipe\\evex-qmp-${process.pid}-${Date.now()}`
       : join(dir, "qmp.sock");
+    // Serialize replies 25 ms apart. Rationale: QMP is newline-delimited
+    // JSON, so a reply split MID-LINE across two replies (chunkA1, chunkB1,
+    // chunkA2, chunkB2 on the wire) is unrecoverable by ANY line parser —
+    // real QEMU never splits a reply write, and the product must not be
+    // tested against an impossible stream (this exact interleave failed
+    // deterministically on Node 20 while passing on Node 26 by TCP
+    // segmentation luck). Splits WITHIN one reply still prove reassembly
+    // and no-double-buffering; the gap keeps replies line-aligned.
+    let replyGate: Promise<void> = Promise.resolve();
     const server = createServer((conn: Socket) => {
       conn.write(`${JSON.stringify({ QMP: { version: {}, capabilities: [] } })}\n`);
       let acc = "";
@@ -266,11 +275,16 @@ describe("vm lifecycle (hardened)", () => {
             const payload = msg.execute === "qmp_capabilities"
               ? `${JSON.stringify({ return: {}, id: msg.id })}\n`
               : `${JSON.stringify({ return: { echo: msg.execute }, id: msg.id })}\n`;
-            // Split every reply across two chunks: proves reassembly works and
+            // Split this reply across two chunks: proves reassembly works and
             // that no byte is buffered twice (duplication would corrupt JSON).
             const mid = Math.floor(payload.length / 2);
-            conn.write(payload.slice(0, mid));
-            setImmediate(() => conn.write(payload.slice(mid)));
+            const prior = replyGate;
+            let release: () => void = () => undefined;
+            replyGate = new Promise<void>((r) => { release = r; });
+            void prior.then(() => new Promise<void>((r) => setTimeout(r, 25))).then(() => {
+              conn.write(payload.slice(0, mid));
+              setImmediate(() => { conn.write(payload.slice(mid)); release(); });
+            });
           }
           nl = acc.indexOf("\n");
         }
