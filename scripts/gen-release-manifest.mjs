@@ -35,6 +35,13 @@ const manifest = {
       "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
       "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
     },
+    releaseImages: {
+      "evex-api:1.0.0": "sha256:3e52592b965c11ca57035d1794bcf74d2638ed4bd017c8b5af04445777abb3a8",
+      "evex-worker:1.0.0": "sha256:34b4a1e7f6e91ed9c57d005320ed2e5183d83f65d048d2302c2e3130f684e6f9",
+      "evex-mcp:1.0.0": "sha256:7a6c25edc174ff893467a337b67f4b357a2f210b19b73e16966d0069271f1097",
+      "evex-console:1.0.0": "sha256:0c256235aba5f4b87cecd675db9ba01929430b68a4a38828ff12902f4c85bab7",
+      "evex-inference:1.0.0": "sha256:56ca1a13158be3486a412aeaa570443b6b690ce8a19fb2a1f1643ebdb52d0209",
+    },
   },
   guest: {
     image: "eve-desktop-xorg.qcow2",

@@ -1,0 +1,62 @@
+{
+  "product": "eve-x",
+  "version": "1.0.0",
+  "source": {
+    "commit": "7d4695f52c3e04a14e2e3a1eca02677b4f194918",
+    "tree": "a34b2914fb8ae9a105445ec4b7049f7147def64b",
+    "dirty": true,
+    "tag": ""
+  },
+  "generatedAt": "2026-10-04T00:48:17.721Z",
+  "dependencies": {
+    "package-lock.json": "81ef2884be6e3109a974f861fc6f1b6db3c9acbdba41255d3c0823fb0f8ff9dd",
+    "node": "v26.7.0",
+    "npm": "11.19.0",
+    "python": "Python 3.11.9"
+  },
+  "build": {
+    "scripts": [
+      "gen-release-identity.mjs",
+      "clean.mjs",
+      "copy-static.mjs",
+      "repro-build.mjs"
+    ],
+    "reproducibility": "bit-identical dist across clean builds except release.gen.* (buildTime stamp)"
+  },
+  "containers": {
+    "baseDigests": {
+      "node:20-slim": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
+      "python:3.11-slim": "sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b",
+      "dxflrs/garage:v2.0.0": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
+      "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+      "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+    }
+  },
+  "guest": {
+    "image": "eve-desktop-xorg.qcow2",
+    "imageSha256": "38afb22b948e61c11fa044204a2cf2372bbb1ba80fb94075dcac9d45ae5b4249",
+    "baseImage": "eve-desktop-noble.qcow2",
+    "baseSha256": "e19b77ba669ef5e813213a145a99efeeb3d4f58a0fc220dad2f9b4891679273b",
+    "sealedReadonly": true,
+    "reproducibility": "logical (sealed base digest + bake manifest); not claimed bit-for-bit"
+  },
+  "qualification": {
+    "unitTests": "200/200 node:test (41 suites)",
+    "canonicalE2E": "28/28 graphical KVM",
+    "postCanonical": "11/11 genesis/eval/promotion",
+    "concurrency": "5/5 dual-desktop + trace isolation",
+    "escapeProbes": "clean (metadata/QMP/secrets/loopback blocked)",
+    "objectQual": "9/9 Garage S3",
+    "modelRollback": "A→production, B→production, retire B, A sole production",
+    "backupRestore": "Garage byte-identical; DATA_DIR 32→0→32",
+    "securityAudit": "0 findings",
+    "npmAudit": "0 vulnerabilities"
+  },
+  "evidence": {
+    "artifacts/release/baseline.json": "49bf49f7fc8c95bce264a5e08ff7a668960f341fa4d7c099552ec44639c9d960",
+    "artifacts/release/garage-backup-restore.json": "b34303a96904c8055ea1ba8b47da408be1654e3ea085f57c72749384c58fb11e",
+    "artifacts/release/artifact-integrity.json": "5b5a51c3692609a9446f710e758677ac64b3211e2fc4e053eb43617e60beda72",
+    "release-manifest.json": "5a16a564a0dae5034242645300fec9c144c971d3de4e5cf7130203b2b006e9ff",
+    "PRODUCTION_QUALIFICATION.md": "0b7e5b494e2389a2a65979e03b606b15264f492735aa201e9ce4cbcadbc53afd"
+  }
+}
