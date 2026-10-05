@@ -1,15 +1,15 @@
 {
   "product": "eve-x",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "source": {
-    "commit": "7d4695f52c3e04a14e2e3a1eca02677b4f194918",
-    "tree": "a34b2914fb8ae9a105445ec4b7049f7147def64b",
+    "commit": "3c8d88ae0406832968dc838b320ddec46c333c70",
+    "tree": "ecd01938feeca5fca7f494b2456b01ca15beb6a3",
     "dirty": true,
     "tag": ""
   },
-  "generatedAt": "2026-10-04T00:48:17.721Z",
+  "generatedAt": "2026-10-05T02:30:33.577Z",
   "dependencies": {
-    "package-lock.json": "81ef2884be6e3109a974f861fc6f1b6db3c9acbdba41255d3c0823fb0f8ff9dd",
+    "package-lock.json": "d50c63b40eb30d4778444022bec787cc02183c06a89606da5f2603a7efa787a1",
     "node": "v26.7.0",
     "npm": "11.19.0",
     "python": "Python 3.11.9"
@@ -56,7 +56,7 @@
     "artifacts/release/baseline.json": "49bf49f7fc8c95bce264a5e08ff7a668960f341fa4d7c099552ec44639c9d960",
     "artifacts/release/garage-backup-restore.json": "b34303a96904c8055ea1ba8b47da408be1654e3ea085f57c72749384c58fb11e",
     "artifacts/release/artifact-integrity.json": "5b5a51c3692609a9446f710e758677ac64b3211e2fc4e053eb43617e60beda72",
-    "release-manifest.json": "5a16a564a0dae5034242645300fec9c144c971d3de4e5cf7130203b2b006e9ff",
+    "release-manifest.json": "6fda95e2d77b20799e3d0ef79718e172e57d8cda3312339e24d44bdd6562ae29",
     "PRODUCTION_QUALIFICATION.md": "0b7e5b494e2389a2a65979e03b606b15264f492735aa201e9ce4cbcadbc53afd"
   }
 }

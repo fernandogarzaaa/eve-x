@@ -1,17 +1,17 @@
 {
   "product": "eve-x",
-  "version": "1.0.0",
-  "commit": "7d4695f52c3e04a14e2e3a1eca02677b4f194918",
-  "tree": "a34b2914fb8ae9a105445ec4b7049f7147def64b",
+  "version": "1.0.1",
+  "commit": "3c8d88ae0406832968dc838b320ddec46c333c70",
+  "tree": "ecd01938feeca5fca7f494b2456b01ca15beb6a3",
   "dirty": true,
-  "generatedAt": "2026-10-04T00:48:16.778Z",
+  "generatedAt": "2026-10-05T02:30:31.276Z",
   "toolchain": {
     "node": "v26.7.0",
     "npm": "11.19.0",
     "python": "Python 3.11.9"
   },
   "lockfiles": {
-    "package-lock.json": "81ef2884be6e3109a974f861fc6f1b6db3c9acbdba41255d3c0823fb0f8ff9dd"
+    "package-lock.json": "d50c63b40eb30d4778444022bec787cc02183c06a89606da5f2603a7efa787a1"
   },
   "containers": {
     "baseImages": {
@@ -22,11 +22,11 @@
       "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
     },
     "releaseImages": {
-      "evex-api:1.0.0": "sha256:3e52592b965c11ca57035d1794bcf74d2638ed4bd017c8b5af04445777abb3a8",
-      "evex-worker:1.0.0": "sha256:34b4a1e7f6e91ed9c57d005320ed2e5183d83f65d048d2302c2e3130f684e6f9",
-      "evex-mcp:1.0.0": "sha256:7a6c25edc174ff893467a337b67f4b357a2f210b19b73e16966d0069271f1097",
-      "evex-console:1.0.0": "sha256:0c256235aba5f4b87cecd675db9ba01929430b68a4a38828ff12902f4c85bab7",
-      "evex-inference:1.0.0": "sha256:56ca1a13158be3486a412aeaa570443b6b690ce8a19fb2a1f1643ebdb52d0209"
+      "evex-api:1.0.1": "sha256:ceed62ba0254f77f1cc6261cf5a0bcd3e7caa4fd72f002c8aa565097cafbe6a0",
+      "evex-worker:1.0.1": "sha256:61384930b22ebbf130014803d2b6d6f6f4f76dc0f3ba728f8f905aca53e5493c",
+      "evex-mcp:1.0.1": "sha256:0af312620bada33a33676c1e73e57696bb46a37f379525c473becd4722b21c70",
+      "evex-console:1.0.1": "sha256:033ca682e873fdf515c31d96a9ef6d2c05ed142b770eba0351461ae8a3ce2dbf",
+      "evex-inference:1.0.1": "sha256:71dec1610382ec3ce83dff32250856c5459bdbc9209ca18b4ef670168231485c"
     }
   },
   "guest": {
