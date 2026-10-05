@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "EVE-X Control Plane API",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "description": "Versioned public API for the EVE-X isolated-VM computer-use validation platform. Operational probes live at root (/health, /ready, /metrics); all product routes live under /v1. Auth: Bearer token (EVEX_AUTH_TOKEN) with per-route capability checks. This document describes the actual implementation.",
     "license": {
       "name": "MIT"

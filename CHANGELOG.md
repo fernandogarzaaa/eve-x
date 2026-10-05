@@ -1,5 +1,14 @@
 # Changelog
 
+## EVE-X 1.0.3
+
+- Advisory inference loop: `POST /v1/computer/:id/suggest` proposes an
+  action from the inference plane (model_id + degraded reported, never
+  actuated, trace untouched, explicit 502/503 fallbacks). Proven live
+  against r16-serving inference on a real guest.
+- Training pipeline: learnable toy signals, full-head checkpoints, phase
+  LM weights, trailing-window gate accuracy (r16 experimental, gates hold).
+
 ## EVE-X 1.0.2
 
 - Virgin deploy rehearsal fixes: worker/mcp entry paths, MCP port mapping
