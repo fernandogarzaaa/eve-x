@@ -6,7 +6,7 @@ cd /root/evex-prod
 export EVEX_AUTH_TOKEN="${EVEX_AUTH_TOKEN:-$(cat /root/.evex-qual-token 2>/dev/null || echo qual-canonical-token-0123456789abcdef)}"
 export VM_BACKEND="${VM_BACKEND:-qemu}"
 export EVEX_IMAGES=/var/lib/eve-images/qual
-export EVEX_BASE_IMAGE="${EVEX_BASE_IMAGE:-eve-desktop-xorg.qcow2}"
+export EVEX_BASE_IMAGE="${EVEX_BASE_IMAGE:-eve-desktop-autologin.qcow2}"
 export DATA_DIR=/root/evex-prod/data
 export DATABASE_URL="${DATABASE_URL:-postgres://evex:evex-qual@127.0.0.1:5433/evex}"
 export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6380}"
