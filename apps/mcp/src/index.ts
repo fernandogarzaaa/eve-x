@@ -162,7 +162,7 @@ function errResult(err: unknown): ToolResult {
 }
 
 export function buildMcpServer(): McpServer {
-  const server = new McpServer({ name: "eve-x", version: "1.0.0" });
+  const server = new McpServer({ name: "eve-x", version: "1.0.1" });
 
   server.registerTool("eve_session_create",
     { description: "Create an EVE-X computer-use session", inputSchema: TOOL_SCHEMAS["eve_session_create"] },

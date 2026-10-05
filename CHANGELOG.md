@@ -1,5 +1,17 @@
 # Changelog
 
+## EVE-X 1.0.1
+
+Patch over 1.0.0 (PR #1, CI-green on ubuntu + windows):
+
+- Sessions whose VM died no longer report RUNNING: dead-VM codes mark the
+  session FAILED with persisted reason, a `vm-lost` trace step, and
+  broadcast; observe/act answer 503 `vm_unreachable`.
+- Post-restart trace amnesia fixed: `mergedTraceSteps()` serves full
+  history to session counts, `/trace`, `/report`, `/reviews`, `/replay`.
+- CI added (ubuntu + windows): deterministic test entry (no shell glob),
+  QMP framing test de-flaked, display-allocator test ports off WinRM range.
+
 ## EVE-X 1.0.0
 
 Production VM execution, human console, computer use, human validation,
