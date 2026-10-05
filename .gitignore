@@ -10,5 +10,6 @@ models/
 coverage/
 infra/deployment/tls/certs/
 infra/deployment/object-storage/.runtime-qual/
+infra/deployment/object-storage/garage.toml
 gpu-ckpt.pt
 packages/core/src/release.gen.ts

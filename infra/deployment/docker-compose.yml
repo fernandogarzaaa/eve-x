@@ -108,24 +108,25 @@ services:
       INFERENCE_URL: http://inference:8090
       EVEX_AUTH_TOKEN: ${EVEX_AUTH_TOKEN:-change-me}
       DATA_DIR: /data
-    command: ["node", "dist/apps/worker/index.js"]
+    command: ["node", "dist/apps/worker/src/index.js"]
     volumes:
       - evexdata:/data
 
   mcp:
     build:
       context: ../..
-      dockerfile: infra/docker/Dockerfile.api
+      dockerfile: infra/docker/Dockerfile.mcp
     restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
     environment:
+      MCP_PORT: 8091
       EVEX_CONTROL_PLANE_URL: http://api:8080
       EVEX_AUTH_TOKEN: ${EVEX_AUTH_TOKEN:-change-me}
-    command: ["node", "dist/apps/mcp/index.js"]
+    command: ["node", "dist/apps/mcp/src/index.js", "http"]
     ports:
-      - "${MCP_PORT:-8081}:8081"
+      - "${MCP_PORT:-8081}:8091"
 
   console:
     build:

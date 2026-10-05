@@ -18,7 +18,7 @@ Services, ports, and volumes below mirror
 | `inference` | `infra/docker/Dockerfile.inference`, `python ml/inference/server.py --host 0.0.0.0 --port 8090 --cpu` | `${INFERENCE_PORT:-8090}:8090` | healthy via `GET /health` |
 | `api` | `infra/docker/Dockerfile.api`, `PORT=8080`, `DATA_DIR=/data` | `${API_PORT:-8080}:8080` | `evexdata:/data`; depends on postgres+redis healthy, garage started |
 | `worker` | `infra/docker/Dockerfile.worker`, `node dist/apps/worker/src/index.js` | none published | `evexdata:/data`; depends on api+redis healthy |
-| `mcp` | `infra/docker/Dockerfile.mcp`, `node dist/apps/mcp/src/index.js` | `${MCP_PORT:-8081}:8081` | depends on api healthy; serves StreamableHTTP at `/mcp` |
+| `mcp` | `infra/docker/Dockerfile.mcp`, `node dist/apps/mcp/src/index.js` | `${MCP_PORT:-8081}:8091` (container serves `MCP_PORT=8091`) | depends on api healthy; serves StreamableHTTP at `/mcp` |
 | `console` | `infra/docker/Dockerfile.console`, `EVEX_API_URL=http://api:8080` | `${CONSOLE_PORT:-3000}:3000` | depends on api healthy |
 
 Volumes: `pgdata`, `redisdata`, `garagedata-meta`, `garagedata-data`,
