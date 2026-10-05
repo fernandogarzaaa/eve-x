@@ -242,7 +242,12 @@ def torch_run(cfg: dict, out_dir: str, resume_weights: "str | None" = None):
         try:
             saved = torch.load(resume_weights, map_location="cpu", weights_only=False)
             backbone.load_state_dict(saved["backbone"])
-            print(f"resumed weights from {resume_weights}", flush=True)
+            # Heads travel with the checkpoint; older backbone-only files
+            # resume the backbone and retrain heads from scratch.
+            for name, module in (("lm_head", lm_head), ("ground_head", ground_head),
+                                 ("verifier", verifier)):
+                if isinstance(saved, dict) and name in saved:
+                    module.load_state_dict(saved[name])
         except Exception as e:  # noqa: BLE001 - corrupt weights must fail loudly
             raise SystemExit(f"ERROR: cannot load resume weights {resume_weights}: {e}")
     params = list(backbone.parameters()) + list(lm_head.parameters()) \
@@ -255,28 +260,54 @@ def torch_run(cfg: dict, out_dir: str, resume_weights: "str | None" = None):
 
     def synth_batch(n: int):
         toks = torch.randint(0, vocab, (n, seq_len))
-        nxt = torch.randint(0, vocab, (n,))
-        boxes = torch.rand(n, 4)
+        # Learnable LM signal: copy the first token (uniform random targets
+        # are unlearnable noise — 50 SFT steps on them demonstrably destroy
+        # the shared backbone for the later grounding phase).
+        nxt = toks[:, 0].clone()
+        # Learnable grounding signal: each box coordinate is one token's
+        # normalized value plus small noise — the analogue of inferring a
+        # region from content. Full-variance single tokens (not slice means,
+        # which cluster at 0.5 and let a constant predictor beat the 0.2 MAE
+        # bar without learning anything — the r3/r4 0.999 was vacuous).
+        t = toks.float() / max(1, vocab - 1)
+        coords = torch.stack([t[:, i % seq_len] for i in range(4)], dim=1)
+        boxes = (coords + 0.02 * torch.randn(n, 4)).clamp(0, 1)
         valid = (torch.rand(n) > 0.3).float()
         return toks, nxt, boxes, valid
 
-    def loop(name: str, steps: int, w_ground: float, w_ver: float) -> dict:
+    # Phase loss weights: the next-token targets are uniform noise, so its
+    # cross-entropy (~6.2, pure chance) would drown the grounding MSE (~0.08)
+    # through the shared backbone if left at full weight during grounding.
+    # Each phase sets its own LM weight from config (defaults preserve the
+    # historical 1.0 behavior); grounding typically trains with w_lm small
+    # or 0 so the head converges instead of chasing LM noise.
+    def loop(name: str, steps: int, w_ground: float, w_ver: float, w_lm: float = 1.0) -> dict:
         backbone.train()
         losses = []
         g_correct = 0
         g_total = 0
-        for _ in range(steps):
+        g_tail_correct = 0
+        g_tail_total = 0
+        tail_from = max(0, steps - 50)
+        for step_i in range(steps):
             _poll_interrupt()
             toks, nxt, boxes, valid = synth_batch(16)
             h = backbone(toks)
             logits = lm_head(h)
-            loss = ce(logits, nxt)
+            loss = w_lm * ce(logits, nxt)
             if w_ground > 0:
                 pred_boxes = torch.sigmoid(ground_head(h))
                 loss = loss + w_ground * mse(pred_boxes, boxes)
                 with torch.no_grad():
-                    g_correct += int((((pred_boxes - boxes).abs().mean(dim=1)) < 0.2).sum())
+                    # Trailing window (last 50 batches) measures FINAL quality.
+                    # The all-steps mean is dragged down by early untrained
+                    # steps and understates what the checkpoint can do.
+                    hit = int((((pred_boxes - boxes).abs().mean(dim=1)) < 0.2).sum())
+                    g_correct += hit
                     g_total += pred_boxes.shape[0]
+                    if step_i >= tail_from:
+                        g_tail_correct += hit
+                        g_tail_total += pred_boxes.shape[0]
             if w_ver > 0:
                 v = verifier(h.detach()).squeeze(-1)
                 loss = loss + w_ver * bce(v, valid)
@@ -287,27 +318,33 @@ def torch_run(cfg: dict, out_dir: str, resume_weights: "str | None" = None):
         phase = {"steps": steps,
                  "final_loss": sum(losses[-5:]) / max(1, len(losses[-5:])),
                  "mean_loss": sum(losses) / max(1, len(losses)),
-                 "accuracy": (g_correct / max(1, g_total)) if g_total else 0.0}
+                 "accuracy": (g_correct / max(1, g_total)) if g_total else 0.0,
+                 "final_accuracy": (g_tail_correct / max(1, g_tail_total)) if g_tail_total else 0.0}
         metrics["phases"][name] = phase
         return phase
 
     sft = loop("sft", int(cfg.get("sft_steps", 20)), 0.0, 0.0)
-    ground = loop("grounding_head", int(cfg.get("grounding_steps", 10)), 1.0, 0.0)
-    verifier_passed = bool(ground["accuracy"] >= 0.5)
+    ground = loop("grounding_head", int(cfg.get("grounding_steps", 10)), 1.0, 0.0,
+                  float(cfg.get("grounding_lm_weight", 1.0)))
+    # The gate reads FINAL (trailing-window) accuracy: what the checkpoint
+    # actually does, not its training-curve average.
+    verifier_passed = bool(ground["final_accuracy"] >= 0.5)
     metrics["phases"]["verifier"] = {"passed": verifier_passed, "threshold": 0.5,
-                                     "accuracy": ground["accuracy"]}
+                                     "accuracy": ground["final_accuracy"]}
     if not verifier_passed:
         print("WARNING: verifier gate failed; continuing to preference pass for diagnostics",
               file=sys.stderr)
     pref = loop("preference", int(cfg.get("preference_steps", 10)), 0.25, 0.5)
     metrics["summary"] = {"sft_final_loss": sft["final_loss"],
-                          "grounding_accuracy": ground["accuracy"],
+                          "grounding_accuracy": ground["final_accuracy"],
                           "verifier_passed": verifier_passed,
                           "preference_final_loss": pref["final_loss"]}
-    # Persist weights (state dict) next to the lineage files (atomic).
+    # Persist ALL weights (a checkpoint without its heads cannot ground).
     weights_path = os.path.join(out_dir, "weights.pt")
     tmp_weights = weights_path + ".tmp"
-    torch.save({"backbone": backbone.state_dict(), "config": cfg}, tmp_weights)
+    torch.save({"backbone": backbone.state_dict(), "lm_head": lm_head.state_dict(),
+                "ground_head": ground_head.state_dict(), "verifier": verifier.state_dict(),
+                "config": cfg}, tmp_weights)
     os.replace(tmp_weights, weights_path)
     metrics["weights_path"] = weights_path
     return metrics

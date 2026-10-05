@@ -174,3 +174,12 @@ FAILED rows: none. All P0/P1 fixed; the two formerly external blockers are resol
 | Registry | register r2 with lineage + sha | VERIFIED | `model-082abdf5` experimental in live registry |
 | Promotion gate | staging without scores | VERIFIED (refusal correct) | gate refuses: no benchmark scores; weak checkpoint stays experimental |
 | Inference serving | server --weights weights.pt | VERIFIED | `/ready` true, degraded false |
+
+Training dynamics found and fixed during the track (all in `train.py`,
+thresholds untouched): unlearnable noise targets → learnable copy/signal
+tasks; checkpoints now persist all heads; phase LM weights; trailing-window
+`final_accuracy` for the gate. Best run r14: train-accuracy 1.0, fresh-seed
+MAE 0.057, eval IoU test 0.15 / held-out 0.2 — registered as
+`model-a9e4c200` experimental with measured scores; staging gate refuses
+below the 0.5 bars, itemized. The toy does not reach IoU 0.5: more
+capacity/steps needed, not weaker gates.

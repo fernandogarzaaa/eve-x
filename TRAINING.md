@@ -49,6 +49,18 @@ config's sha256 becomes `config_hash`, the reproducibility anchor recorded in
   `train.py`), parent model, UTC timestamp. This is what the model registry
   stores when the version is registered.
 
+## Toy signal design (learnability notes)
+
+- Grounding boxes derive from input tokens (single-token coords + noise):
+  boxes independent of inputs are unlearnable (optimal constant scores
+  ~0.25 forever); slice means cluster at 0.5 and let constants beat the bar
+  vacuously. Full-variance signals only.
+- Checkpoints persist ALL heads (backbone-only checkpoints cannot ground).
+- `grounding_lm_weight` phases the LM loss during grounding (noise-CE
+  through a shared backbone drowns grounding gradients).
+- Accuracy is reported as trailing-window `final_accuracy` (what the
+  checkpoint does); the all-steps mean understates final quality.
+
 ## Registering the result
 
 ```bash
