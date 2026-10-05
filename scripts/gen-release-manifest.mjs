@@ -36,11 +36,11 @@ const manifest = {
       "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
     },
     releaseImages: {
-      "evex-api:1.0.1": "sha256:ceed62ba0254f77f1cc6261cf5a0bcd3e7caa4fd72f002c8aa565097cafbe6a0",
-      "evex-worker:1.0.1": "sha256:61384930b22ebbf130014803d2b6d6f6f4f76dc0f3ba728f8f905aca53e5493c",
-      "evex-mcp:1.0.1": "sha256:0af312620bada33a33676c1e73e57696bb46a37f379525c473becd4722b21c70",
-      "evex-console:1.0.1": "sha256:033ca682e873fdf515c31d96a9ef6d2c05ed142b770eba0351461ae8a3ce2dbf",
-      "evex-inference:1.0.1": "sha256:71dec1610382ec3ce83dff32250856c5459bdbc9209ca18b4ef670168231485c",
+      "evex-api:1.0.2": "sha256:fcc987bf6f201536ac3f51db003c950ee4238ef9be6b49944b419f4c68e11a6c",
+      "evex-worker:1.0.2": "sha256:f7b24b6534640806286976c225eefe86477eee53c61cbf3156abac8c4b961bef",
+      "evex-mcp:1.0.2": "sha256:e7c6cb7673b45d95cea87193f6763cbd800055379dc83cf7bebe1b203f0adfa7",
+      "evex-console:1.0.2": "sha256:ac4a2a3c58cfd291b738e2a086c4b1ad604b5f8e7dcdae88dc95e9b9b5bafe2e",
+      "evex-inference:1.0.2": "sha256:b661a2c911b08322ae24383ef46679cb669094f7d61cd67270871d03fac43774",
     },
   },
   guest: {
