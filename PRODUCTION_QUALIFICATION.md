@@ -164,3 +164,13 @@ P2 (39): prior 36 + point→region grounding (real acts resolve click points aga
 P3 (6): console static resolution; openapi/API.md drift; MCP stub comment; worker lint comment token; docs port/command drift; session GET steps display.
 
 FAILED rows: none. All P0/P1 fixed; the two formerly external blockers are resolved in-tree (Garage v2 per ADR-14; sealed graphical desktop base). No NOT_AVAILABLE rows remain on the Linux/KVM path.
+
+## 10. Post-1.0.1 model track (first real weights, experimental)
+
+| Capability | Test | Result | Evidence |
+|---|---|---|---|
+| Trace dataset | live traces → build.py dedup/redact/split | VERIFIED | 97 rows → 8 kept (79 deduped, 10 actionless dropped, 8 secrets redacted); train digest `28b09622…` |
+| Full training | torch CPU, cua-small, fixed seed 7, 2 runs | VERIFIED | r1 grounding 0.25, r2 (600 ground steps) 0.249; verifier gate refused both (honest, threshold 0.5); 9.2 MB `weights.pt` |
+| Registry | register r2 with lineage + sha | VERIFIED | `model-082abdf5` experimental in live registry |
+| Promotion gate | staging without scores | VERIFIED (refusal correct) | gate refuses: no benchmark scores; weak checkpoint stays experimental |
+| Inference serving | server --weights weights.pt | VERIFIED | `/ready` true, degraded false |
