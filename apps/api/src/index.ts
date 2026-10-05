@@ -1539,6 +1539,94 @@ export function buildApp(): express.Express {
     void parsed;
     res.json(percept);
   });
+  // ── inference suggestion (§model-loop): ask the inference plane what to
+  // do about the CURRENT percept. Advisory only: nothing is actuated, the
+  // trace is untouched, and every inference failure maps to an explicit
+  // 502 (the caller falls back to heuristic/manual action). The response
+  // carries model_id + degraded so callers never mistake a heuristic
+  // suggestion for a model one.
+  v1.post("/computer/:sessionId/suggest", requireCap("computer:observe"), async (req: Request, res: Response) => {
+    const sessionId = req.params["sessionId"] as string;
+    const s = sessions.get(sessionId);
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
+    if (s.status === "FAILED") {
+      res.status(503).json({ error: "vm_unreachable", reason: s.vmLossReason ?? "vm lost" });
+      return;
+    }
+    const v = s.vmId ? vms.get(s.vmId) : undefined;
+    const drv = v ? driverOf(v) : null;
+    let percept: { frameId: string; width: number; height: number; pngBase64: string; regions: unknown[] };
+    try {
+      if (drv && drv.backend !== "dev-framebuffer") {
+        const { runtime } = await runtimeFor(req, s);
+        const p = await runtime.observe();
+        percept = {
+          frameId: String((p as { frameId?: unknown }).frameId ?? s.lastFrame ?? `f-${s.seq}`),
+          width: Number((p as { width?: unknown }).width ?? 1920),
+          height: Number((p as { height?: unknown }).height ?? 1080),
+          pngBase64: String((p as { pngBase64?: unknown }).pngBase64 ?? ""),
+          regions: Array.isArray((p as { regions?: unknown }).regions)
+            ? (p as { regions: unknown[] }).regions : [],
+        };
+        s.lastFrame = percept.frameId;
+        s.updatedAt = nowIso();
+        persistSession(s);
+      } else {
+        // Dev backend: synthetic percept (empty pixels). Product inference
+        // servers reject empty png_base64; that 400 surfaces as 502 below.
+        percept = {
+          frameId: `f-${s.seq}`, width: 1920, height: 1080, pngBase64: "",
+          regions: [{ regionId: "r-taskbar", bbox: [0, 1040, 1919, 1079], label: "taskbar", confidence: 0.99 }],
+        };
+      }
+    } catch (err) {
+      if (err instanceof EveError && isVmLostCode(err.code)) {
+        markSessionVmLost(s, `${err.code}: ${err.message}`);
+        res.status(503).json({ error: "vm_unreachable", reason: s.vmLossReason ?? err.code });
+        return;
+      }
+      res.status(502).json({ error: "observe_failed", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    const inferUrl = (process.env["INFERENCE_URL"] ?? "http://localhost:8090").replace(/\/$/, "");
+    const timeoutMs = Math.max(100, Math.min(120000,
+      Number(process.env["EVEX_INFERENCE_TIMEOUT_MS"] ?? 15000) || 15000));
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(`${inferUrl}/infer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          frame_id: percept.frameId, goal: s.goal,
+          width: percept.width, height: percept.height,
+          png_base64: percept.pngBase64, regions: percept.regions,
+          timeout_ms: timeoutMs,
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!r.ok) {
+        res.status(502).json({ error: "inference_unavailable", detail: `inference HTTP ${r.status}` });
+        return;
+      }
+      const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!j || typeof j !== "object" || !j["action"]) {
+        res.status(502).json({ error: "inference_unavailable", detail: "inference returned no action" });
+        return;
+      }
+      res.json({
+        sessionId: s.id, frameId: percept.frameId, suggestion: j["action"],
+        model_id: j["model_id"] ?? "unknown", latency_ms: j["latency_ms"] ?? null,
+        degraded: j["degraded"] ?? true, inference: inferUrl,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      const reason = err instanceof Error && err.name === "AbortError" ? "inference timeout" : (err instanceof Error ? err.message : String(err));
+      res.status(502).json({ error: "inference_unavailable", detail: reason.slice(0, 200) });
+    }
+  });
   v1.post("/computer/:sessionId/act", requireCap("computer:act"), async (req: Request, res: Response) => {
     const sessionId = req.params["sessionId"] as string;
     const s = sessions.get(sessionId);

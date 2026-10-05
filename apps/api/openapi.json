@@ -4,144 +4,834 @@
     "title": "EVE-X Control Plane API",
     "version": "1.0.2",
     "description": "Versioned public API for the EVE-X isolated-VM computer-use validation platform. Operational probes live at root (/health, /ready, /metrics); all product routes live under /v1. Auth: Bearer token (EVEX_AUTH_TOKEN) with per-route capability checks. This document describes the actual implementation.",
-    "license": { "name": "MIT" }
+    "license": {
+      "name": "MIT"
+    }
   },
-  "servers": [{ "url": "http://localhost:8080" }],
-  "security": [{ "bearerAuth": [] }],
+  "servers": [
+    {
+      "url": "http://localhost:8080"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
   "components": {
     "securitySchemes": {
-      "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "opaque" }
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque"
+      }
     },
     "schemas": {
-      "Point": { "type": "object", "required": ["x", "y"], "properties": { "x": { "type": "integer", "minimum": 0 }, "y": { "type": "integer", "minimum": 0 } } },
-      "BBox": { "type": "array", "prefixItems": [{ "type": "number" }, { "type": "number" }, { "type": "number" }, { "type": "number" }], "minItems": 4, "maxItems": 4 },
+      "Point": {
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "y": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "BBox": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "number"
+          }
+        ],
+        "minItems": 4,
+        "maxItems": 4
+      },
       "ActionIR": {
         "type": "object",
-        "required": ["type", "confidence"],
+        "required": [
+          "type",
+          "confidence"
+        ],
         "properties": {
-          "type": { "type": "string", "enum": ["click", "double_click", "move", "drag", "type", "key", "hotkey", "scroll", "wait", "observe", "zoom", "crop", "open_application", "terminal", "tool", "ask_human", "terminate"] },
-          "target": { "type": "object", "properties": { "kind": { "const": "visual-region" }, "regionId": { "type": "string" }, "bbox": { "$ref": "#/components/schemas/BBox" }, "label": { "type": "string" }, "confidence": { "type": "number" } } },
-          "text": { "type": "string", "maxLength": 4096 },
-          "keys": { "type": "array", "items": { "type": "string" } },
-          "x": { "type": "integer", "description": "Flat-form pointer x (API act shorthand)" },
-          "y": { "type": "integer", "description": "Flat-form pointer y (API act shorthand)" },
-          "ms": { "type": "integer" },
-          "intent": { "type": "string" },
-          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-          "from": { "$ref": "#/components/schemas/Point" },
-          "to": { "$ref": "#/components/schemas/Point" }
+          "type": {
+            "type": "string",
+            "enum": [
+              "click",
+              "double_click",
+              "move",
+              "drag",
+              "type",
+              "key",
+              "hotkey",
+              "scroll",
+              "wait",
+              "observe",
+              "zoom",
+              "crop",
+              "open_application",
+              "terminal",
+              "tool",
+              "ask_human",
+              "terminate"
+            ]
+          },
+          "target": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "visual-region"
+              },
+              "regionId": {
+                "type": "string"
+              },
+              "bbox": {
+                "$ref": "#/components/schemas/BBox"
+              },
+              "label": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "number"
+              }
+            }
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "x": {
+            "type": "integer",
+            "description": "Flat-form pointer x (API act shorthand)"
+          },
+          "y": {
+            "type": "integer",
+            "description": "Flat-form pointer y (API act shorthand)"
+          },
+          "ms": {
+            "type": "integer"
+          },
+          "intent": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "from": {
+            "$ref": "#/components/schemas/Point"
+          },
+          "to": {
+            "$ref": "#/components/schemas/Point"
+          }
         }
       },
       "VmSpec": {
         "type": "object",
         "properties": {
-          "image": { "type": "string", "default": "ubuntu-desktop-v1" },
-          "snapshot": { "type": "string", "default": "clean" },
-          "cpu": { "type": "integer", "default": 4 },
-          "memoryMb": { "type": "integer", "default": 8192 },
-          "diskGb": { "type": "integer", "default": 32 },
-          "width": { "type": "integer", "default": 1920 },
-          "height": { "type": "integer", "default": 1080 },
-          "locale": { "type": "string", "default": "en-US" },
-          "timezone": { "type": "string", "default": "UTC" },
-          "network": { "type": "string", "enum": ["none", "allowlisted", "full"], "default": "allowlisted" }
+          "image": {
+            "type": "string",
+            "default": "ubuntu-desktop-v1"
+          },
+          "snapshot": {
+            "type": "string",
+            "default": "clean"
+          },
+          "cpu": {
+            "type": "integer",
+            "default": 4
+          },
+          "memoryMb": {
+            "type": "integer",
+            "default": 8192
+          },
+          "diskGb": {
+            "type": "integer",
+            "default": 32
+          },
+          "width": {
+            "type": "integer",
+            "default": 1920
+          },
+          "height": {
+            "type": "integer",
+            "default": 1080
+          },
+          "locale": {
+            "type": "string",
+            "default": "en-US"
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "none",
+              "allowlisted",
+              "full"
+            ],
+            "default": "allowlisted"
+          }
         }
       },
-      "Error": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" }, "message": { "type": "string" } } }
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      }
     }
   },
   "paths": {
     "/health": {
-      "get": { "operationId": "health", "security": [], "summary": "Liveness probe", "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "health",
+        "security": [],
+        "summary": "Liveness probe",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/ready": {
-      "get": { "operationId": "ready", "security": [], "summary": "Readiness probe (sessions/vms counts)", "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "ready",
+        "security": [],
+        "summary": "Readiness probe (sessions/vms counts)",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/metrics": {
-      "get": { "operationId": "metrics", "summary": "Prometheus-format operational metrics", "responses": { "200": { "description": "prometheus text" } } }
+      "get": {
+        "operationId": "metrics",
+        "summary": "Prometheus-format operational metrics",
+        "responses": {
+          "200": {
+            "description": "prometheus text"
+          }
+        }
+      }
     },
     "/v1/sessions": {
-      "get": { "operationId": "listSessions", "summary": "List sessions (requires computer:observe)", "responses": { "200": { "description": "ok" } } },
-      "post": { "operationId": "createSession", "summary": "Create session + VM (requires task:execute). Body: {goal, persona?, taskId?, vm?}", "responses": { "200": { "description": "created: {id, taskId, vmId, status}" } } }
+      "get": {
+        "operationId": "listSessions",
+        "summary": "List sessions (requires computer:observe)",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createSession",
+        "summary": "Create session + VM (requires task:execute). Body: {goal, persona?, taskId?, vm?}",
+        "responses": {
+          "200": {
+            "description": "created: {id, taskId, vmId, status}"
+          }
+        }
+      }
     },
     "/v1/sessions/{id}": {
-      "get": { "operationId": "getSession", "summary": "Get session (requires computer:observe)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" }, "404": { "description": "not found" } } }
+      "get": {
+        "operationId": "getSession",
+        "summary": "Get session (requires computer:observe)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
     },
     "/v1/sessions/{id}/pause": {
-      "post": { "operationId": "pauseSession", "summary": "Pause agent (observer mode)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "paused" } } }
+      "post": {
+        "operationId": "pauseSession",
+        "summary": "Pause agent (observer mode)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "paused"
+          }
+        }
+      }
     },
     "/v1/sessions/{id}/step": {
-      "post": { "operationId": "stepSession", "summary": "Single-step while paused", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "stepped" } } }
+      "post": {
+        "operationId": "stepSession",
+        "summary": "Single-step while paused",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "stepped"
+          }
+        }
+      }
     },
     "/v1/sessions/{id}/stop": {
-      "post": { "operationId": "stopSession", "summary": "Stop session", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "stopped" } } }
+      "post": {
+        "operationId": "stopSession",
+        "summary": "Stop session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "stopped"
+          }
+        }
+      }
     },
     "/v1/vms": {
-      "get": { "operationId": "listVms", "summary": "List VMs", "responses": { "200": { "description": "ok" } } },
-      "post": { "operationId": "createVm", "summary": "Provision a VM (requires vm:create)", "responses": { "200": { "description": "created" } } }
+      "get": {
+        "operationId": "listVms",
+        "summary": "List VMs",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createVm",
+        "summary": "Provision a VM (requires vm:create)",
+        "responses": {
+          "200": {
+            "description": "created"
+          }
+        }
+      }
     },
     "/v1/vms/{id}": {
-      "get": { "operationId": "getVm", "summary": "Get VM record", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" }, "404": { "description": "not found" } } }
+      "get": {
+        "operationId": "getVm",
+        "summary": "Get VM record",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
     },
     "/v1/vms/{id}/status": {
-      "get": { "operationId": "vmStatus", "summary": "VM lifecycle status", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "vmStatus",
+        "summary": "VM lifecycle status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/v1/vms/{id}/snapshot": {
-      "post": { "operationId": "vmSnapshot", "summary": "Snapshot VM (requires vm:control). Body: {label?}", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "snapshotted" } } }
+      "post": {
+        "operationId": "vmSnapshot",
+        "summary": "Snapshot VM (requires vm:control). Body: {label?}",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "snapshotted"
+          }
+        }
+      }
     },
     "/v1/vms/{id}/restore": {
-      "post": { "operationId": "vmRestore", "summary": "Restore VM snapshot (requires vm:control). Body: {snapshot?}", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "restored" } } }
+      "post": {
+        "operationId": "vmRestore",
+        "summary": "Restore VM snapshot (requires vm:control). Body: {snapshot?}",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "restored"
+          }
+        }
+      }
     },
     "/v1/vms/{id}/fork": {
-      "post": { "operationId": "vmFork", "summary": "Fork VM into a branch (requires vm:create)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "forked" } } }
+      "post": {
+        "operationId": "vmFork",
+        "summary": "Fork VM into a branch (requires vm:create)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "forked"
+          }
+        }
+      }
     },
     "/v1/computer/{sessionId}/observe": {
-      "get": { "operationId": "observe", "summary": "Observe session computer (screenshot + regions + provenance)", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "percept" }, "404": { "description": "no such session" } } }
+      "get": {
+        "operationId": "observe",
+        "summary": "Observe session computer (screenshot + regions + provenance)",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "percept"
+          },
+          "404": {
+            "description": "no such session"
+          }
+        }
+      }
     },
     "/v1/computer/{sessionId}/act": {
-      "post": { "operationId": "act", "summary": "Execute a flat-form action {type, x?, y?, text?, keys?, ms?, confidence} (requires computer:act; 409 while human has takeover)", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["type"], "properties": { "type": { "type": "string" }, "x": { "type": "integer" }, "y": { "type": "integer" }, "text": { "type": "string" }, "keys": { "type": "array", "items": { "type": "string" } }, "ms": { "type": "integer" }, "confidence": { "type": "number" } } } } } }, "responses": { "200": { "description": "applied: {sessionId, seq, action}" }, "400": { "description": "validation failed" }, "409": { "description": "human has takeover" } } }
+      "post": {
+        "operationId": "act",
+        "summary": "Execute a flat-form action {type, x?, y?, text?, keys?, ms?, confidence} (requires computer:act; 409 while human has takeover)",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string"
+                  },
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "keys": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "ms": {
+                    "type": "integer"
+                  },
+                  "confidence": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "applied: {sessionId, seq, action}"
+          },
+          "400": {
+            "description": "validation failed"
+          },
+          "409": {
+            "description": "human has takeover"
+          }
+        }
+      }
     },
     "/v1/human/request": {
-      "post": { "operationId": "humanRequest", "summary": "Request human help. Body: {sessionId, reason?}", "responses": { "200": { "description": "broadcast" } } }
+      "post": {
+        "operationId": "humanRequest",
+        "summary": "Request human help. Body: {sessionId, reason?}",
+        "responses": {
+          "200": {
+            "description": "broadcast"
+          }
+        }
+      }
     },
     "/v1/human/takeover": {
-      "post": { "operationId": "takeover", "summary": "Human takes control (requires human:takeover). Body: {sessionId, reason?}", "responses": { "200": { "description": "{sessionId, humanControl:true}" }, "403": { "description": "capability denied" } } }
+      "post": {
+        "operationId": "takeover",
+        "summary": "Human takes control (requires human:takeover). Body: {sessionId, reason?}",
+        "responses": {
+          "200": {
+            "description": "{sessionId, humanControl:true}"
+          },
+          "403": {
+            "description": "capability denied"
+          }
+        }
+      }
     },
     "/v1/human/release": {
-      "post": { "operationId": "release", "summary": "Human releases; agent must re-observe (requires human:takeover). Body: {sessionId}", "responses": { "200": { "description": "{sessionId, humanControl:false}" } } }
+      "post": {
+        "operationId": "release",
+        "summary": "Human releases; agent must re-observe (requires human:takeover). Body: {sessionId}",
+        "responses": {
+          "200": {
+            "description": "{sessionId, humanControl:false}"
+          }
+        }
+      }
     },
     "/v1/tasks/start": {
-      "post": { "operationId": "taskStart", "summary": "Start an evaluation task (requires task:execute)", "responses": { "200": { "description": "started" } } }
+      "post": {
+        "operationId": "taskStart",
+        "summary": "Start an evaluation task (requires task:execute)",
+        "responses": {
+          "200": {
+            "description": "started"
+          }
+        }
+      }
     },
     "/v1/tasks/{id}/status": {
-      "get": { "operationId": "taskStatus", "summary": "Task status", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "taskStatus",
+        "summary": "Task status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/v1/tasks/{id}/validate": {
-      "post": { "operationId": "taskValidate", "summary": "Validate task outcome with evidence", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "validated" } } }
+      "post": {
+        "operationId": "taskValidate",
+        "summary": "Validate task outcome with evidence",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "validated"
+          }
+        }
+      }
     },
     "/v1/trace/{sessionId}": {
-      "get": { "operationId": "readTrace", "summary": "Read session trace steps (requires trace:read)", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "{sessionId, steps[]}" } } }
+      "get": {
+        "operationId": "readTrace",
+        "summary": "Read session trace steps (requires trace:read)",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{sessionId, steps[]}"
+          }
+        }
+      }
     },
     "/v1/replay/{sessionId}": {
-      "post": { "operationId": "replay", "summary": "Deterministic replay check over stored steps. Returns {sessionId, replayed, verdict}", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" } } }
+      "post": {
+        "operationId": "replay",
+        "summary": "Deterministic replay check over stored steps. Returns {sessionId, replayed, verdict}",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/v1/report/{sessionId}": {
-      "get": { "operationId": "report", "summary": "Evidence-backed session report {sessionId, goal, status, steps, success, findings[]}", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "report",
+        "summary": "Evidence-backed session report {sessionId, goal, status, steps, success, findings[]}",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/v1/judgments": {
-      "post": { "operationId": "submitJudgment", "summary": "Submit blind human judgment (requires trace:export)", "responses": { "200": { "description": "recorded" } } }
+      "post": {
+        "operationId": "submitJudgment",
+        "summary": "Submit blind human judgment (requires trace:export)",
+        "responses": {
+          "200": {
+            "description": "recorded"
+          }
+        }
+      }
     },
     "/v1/benchmarks": {
-      "post": { "operationId": "runBenchmark", "summary": "Run a benchmark suite (requires task:execute)", "responses": { "200": { "description": "started" } } }
+      "post": {
+        "operationId": "runBenchmark",
+        "summary": "Run a benchmark suite (requires task:execute)",
+        "responses": {
+          "200": {
+            "description": "started"
+          }
+        }
+      }
     },
     "/v1/benchmarks/{id}": {
-      "get": { "operationId": "benchmarkStatus", "summary": "Benchmark status", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "benchmarkStatus",
+        "summary": "Benchmark status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/v1/models/status": {
-      "get": { "operationId": "modelStatus", "summary": "Inference backend status {inferenceUrl, model, reachable}", "responses": { "200": { "description": "ok" } } }
+      "get": {
+        "operationId": "modelStatus",
+        "summary": "Inference backend status {inferenceUrl, model, reachable}",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     },
     "/v1/stream/{sessionId}": {
-      "get": { "operationId": "stream", "summary": "WebSocket: live frames + overlays + timeline (upgrade to WS)", "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "101": { "description": "switching protocols" } } }
+      "get": {
+        "operationId": "stream",
+        "summary": "WebSocket: live frames + overlays + timeline (upgrade to WS)",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "switching protocols"
+          }
+        }
+      }
+    },
+    "/v1/computer/{sessionId}/suggest": {
+      "post": {
+        "operationId": "suggest",
+        "summary": "Advisory action suggestion from the inference plane (no actuation, no trace)",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "suggestion + model_id + degraded"
+          },
+          "404": {
+            "description": "no such session"
+          },
+          "502": {
+            "description": "inference unavailable"
+          },
+          "503": {
+            "description": "vm unreachable"
+          }
+        }
+      }
     }
   }
 }
