@@ -11,7 +11,7 @@ import { totalmem } from "node:os";
 import { evaluateProduction } from "../../../packages/security/src/index.js";
 import { releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
 
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const ROOT = process.cwd();
 
 function apiBase(): string {

@@ -1,5 +1,17 @@
 # Changelog
 
+## EVE-X 1.0.2
+
+- Virgin deploy rehearsal fixes: worker/mcp entry paths, MCP port mapping
+  + http mode, `docker-compose.release.yml` for prebuilt images, garage
+  config renderer. Rehearsal passed on fresh volumes (8/8 services, S3
+  round-trip, session + worker + console + MCP).
+- Training pipeline: learnable toy signals, full-head checkpoints, phase
+  LM weights, trailing-window gate accuracy. Best run r14 (train-acc 1.0,
+  fresh MAE 0.057) registered experimental with measured eval scores;
+  staging gate holds below IoU bars.
+- Model track recorded in PRODUCTION_QUALIFICATION.md §10.
+
 ## EVE-X 1.0.1
 
 Patch over 1.0.0 (PR #1, CI-green on ubuntu + windows):
