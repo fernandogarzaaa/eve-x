@@ -1,33 +1,18 @@
 import { z } from "zod";
-import { EveError, sha1hex } from "../../core/src/index.js";
+import { EveError, canonicalJson, sha256hex } from "../../core/src/index.js";
 import { TraceStep, type TraceStep as TraceStepType } from "../../protocol/src/index.js";
 
 // ── Append-only TraceStore: one JSONL stream per session, immutable append,
-// digest chain per step via sha1hex, exports JSON + JSONL + CSV (parquet-compat). ──
+// SHA-256 digest chain per step, exports JSON + JSONL + CSV (parquet-compat). ──
 
 export const StoredStepSchema = TraceStep.extend({
-  prevDigest: z.string().length(40),
-  digest: z.string().length(40),
+  prevDigest: z.string().length(64),
+  digest: z.string().length(64),
 });
 export type StoredStep = z.infer<typeof StoredStepSchema>;
 
-const GENESIS_DIGEST = "0".repeat(40);
-
-/** Canonical JSON: stable key order so digests are reproducible. */
-export function canonicalJson(value: unknown): string {
-  if (value === null) return "null";
-  if (value === undefined) return "null";
-  if (typeof value === "string") return JSON.stringify(value) as string;
-  if (typeof value === "number" || typeof value === "boolean") return JSON.stringify(value) as string;
-  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
-  }
-  return JSON.stringify(String(value)) as string;
-}
+const GENESIS_DIGEST = "0".repeat(64);
+export { canonicalJson };
 
 const CSV_COLUMNS = [
   "session_id",
@@ -84,7 +69,7 @@ export class TraceStore {
       throw new EveError("SEQ_GAP", `Expected seq ${expectedSeq}, got ${step.seq} — append-only store rejects gaps/reorders`);
     }
     const prevDigest = this.steps.length === 0 ? GENESIS_DIGEST : ((this.steps[this.steps.length - 1]?.digest ?? GENESIS_DIGEST) as string);
-    const digest = sha1hex(`${prevDigest}.${canonicalJson(step)}`);
+    const digest = sha256hex(`${prevDigest}.${canonicalJson(step)}`);
     const stored = StoredStepSchema.parse({ ...step, prevDigest, digest });
     this.steps.push(stored);
     return { ...stored };
@@ -127,7 +112,7 @@ export class TraceStore {
       const { prevDigest: _p, digest: _d, ...body } = s;
       void _p;
       void _d;
-      const recomputed = sha1hex(`${prev}.${canonicalJson(TraceStep.parse(body))}`);
+      const recomputed = sha256hex(`${prev}.${canonicalJson(TraceStep.parse(body))}`);
       if (recomputed !== s.digest) throw new EveError("CHAIN_BROKEN", `digest mismatch at seq=${i} — step was mutated`);
       prev = s.digest;
     }

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { EveError, nowIso, sha1hex, uid } from "../../core/src/index.js";
+import { EveError, nowIso, sha256hex, uid } from "../../core/src/index.js";
 
 // ── Genesis assurance client: evaluator artifacts are adversarially audited
 // (self-grading detection, boundary checks). Verdicts are SOUND | EXPLOITABLE
@@ -15,7 +15,7 @@ export type EvaluatorClaim = z.infer<typeof EvaluatorClaimSchema>;
 export const EvaluatorArtifactSchema = z.object({
   artifactId: z.string().min(1),
   evaluatorId: z.string().min(1).max(128),
-  codeHash: z.string().regex(/^[0-9a-f]{40}$/, "codeHash must be 40 lowercase hex chars"),
+  codeHash: z.string().regex(/^[0-9a-f]{64}$/, "codeHash must be 64 lowercase hex chars (SHA-256)"),
   codeText: z.string().max(200_000).optional(),
   claims: z.array(EvaluatorClaimSchema).min(1),
   gradedSessionId: z.string().min(1).optional(),
@@ -71,7 +71,7 @@ const CHECKS: Check[] = [
     name: "code-hash-integrity",
     run: (a) => {
       if (a.codeText !== undefined) {
-        const recomputed = sha1hex(a.codeText);
+        const recomputed = sha256hex(a.codeText);
         if (recomputed !== a.codeHash) return `codeHash mismatch: declared ${a.codeHash} but code hashes to ${recomputed}`;
       }
       return null;
@@ -149,7 +149,7 @@ export class GenesisClient {
       .object({
         artifactId: z.string().min(1).optional(),
         evaluatorId: z.string().min(1).max(128),
-        codeHash: z.string().regex(/^[0-9a-f]{40}$/),
+        codeHash: z.string().regex(/^[0-9a-f]{64}$/),
         codeText: z.string().max(200_000).optional(),
         claims: z.array(EvaluatorClaimSchema).min(1),
         gradedSessionId: z.string().min(1).optional(),

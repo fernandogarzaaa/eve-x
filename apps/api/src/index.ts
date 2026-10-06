@@ -8,8 +8,9 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 
 // Static imports of guaranteed-present siblings.
-import { uid, nowIso, prng, sha1hex, EveError, StateMachine, VM_TRANSITIONS, releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
+import { uid, nowIso, sha256hex, canonicalJson, EveError, StateMachine, VM_TRANSITIONS, RELEASE, releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
 import { ActionIR, ActionType, ComputerPercept, VmSpec, TaskSpec } from "../../../packages/protocol/src/index.js";
+import { validateEvidence, EvidenceBundleSchema } from "../../../packages/validation/src/index.js";
 import {
   VmManager, selectDriver, QemuDriver, DockerDesktopDriver, DevFramebufferDriver,
 } from "../../../packages/vm/src/index.js";
@@ -21,8 +22,10 @@ type StorageMod = typeof import("../../../packages/storage/src/index.js");
 type BenchMod = {
   buildRegistry: () => Array<{
     benchTaskId: string; category: string; goal: string; split: string;
-    seed: number; maxSteps: number; stepsOptimal: number;
+    seed: number; maxSteps: number; stepsOptimal: number; successSignals: string[];
   }>;
+  evaluateBenchTask: (input: unknown) => Record<string, unknown>;
+  mockAgentAdapter: (seed: number, label?: string) => unknown;
   runBench: (registry: unknown, agentFn: unknown, opts: unknown) => Promise<Record<string, unknown>>;
 };
 let sec: SecurityMod | null = null;
@@ -316,6 +319,11 @@ const streams = new Map<string, Set<WebSocket>>();
 const idemResponses = new Map<string, unknown>();
 // Judgment dedupe: "<stepId>:<reviewer>".
 const judgmentKeys = new Set<string>();
+interface JudgmentRec {
+  id: string; stepId: string; sessionId: string; reviewer: string;
+  reasonable: boolean; targetCorrect: boolean; at: string;
+}
+const judgmentRecs = new Map<string, JudgmentRec>();
 // Blind reviews: "<reviewId>" -> pending review (server-side blinding).
 interface ReviewRec {
   reviewId: string; sessionId: string; stepId: string;
@@ -514,7 +522,7 @@ function mgrOwner(req: Request): string {
 }
 
 /** Get-or-build the live computer runtime for a session (real backends only). */
-async function runtimeFor(req: Request, s: SessionRec): Promise<SessionRuntime> {
+async function runtimeForOwner(owner: string, s: SessionRec): Promise<SessionRuntime> {
   const v = s.vmId ? vms.get(s.vmId) : undefined;
   const d = v ? driverOf(v) : null;
   if (!d || d.backend === "dev-framebuffer") {
@@ -523,7 +531,6 @@ async function runtimeFor(req: Request, s: SessionRec): Promise<SessionRuntime> 
   const hit = runtimes.get(s.id);
   if (hit) return hit;
   const { mgr } = await vmManager();
-  const owner = mgrOwner(req);
   // Force reattach for stale post-restart entries BEFORE resolving ports:
   // status() re-establishes QMP-proven control (or fails loudly), so the
   // VNC port below always belongs to this VM, never a recycled number.
@@ -562,6 +569,20 @@ function closeRuntime(sessionId: string): void {
   // so there is nothing else to release.
 }
 
+/** Cache perceived regions on the session for point→region grounding at act
+ *  time. Best-effort: a cache failure never fails the observation. */
+function cachePerceivedRegions(s: SessionRec, regions: unknown): void {
+  try {
+    const regs = (regions ?? []) as Array<{ regionId?: unknown; bbox?: unknown; label?: unknown }>;
+    s.lastRegions = regs
+      .filter((r) => typeof r.regionId === "string" && Array.isArray(r.bbox) && r.bbox.length === 4)
+      .map((r) => ({
+        regionId: String(r.regionId),
+        bbox: (r.bbox as number[]).slice(0, 4) as [number, number, number, number],
+        label: typeof r.label === "string" ? String(r.label) : "",
+      }));
+  } catch { /* grounding cache is best-effort */ }
+}
 /** Provision (create+boot) a driver VM for an API vm record. Throws loudly on failure. */
 async function provisionDriverVm(owner: string, spec: Record<string, unknown>): Promise<{ driverVmId: string; backend: string }> {
   const { mgr, backend } = await vmManager();
@@ -589,7 +610,7 @@ type FlatAction = {
  * statuses, anything else becomes actuation_failed.
  */
 async function realAct(
-  req: Request,
+  owner: string,
   s: SessionRec,
   v: VmRec,
   drv: { driverVmId: string; backend: string },
@@ -597,8 +618,7 @@ async function realAct(
   action: FlatAction,
 ): Promise<Record<string, unknown>> {
   const { mgr } = await vmManager();
-  const owner = mgrOwner(req);
-  const { runtime, backend } = await runtimeFor(req, s);
+  const { runtime, backend } = await runtimeForOwner(owner, s);
   const frameId = body.frameId ?? runtime.observedFrameId() ?? s.lastFrame;
   const type = action.type;
   if (type === "terminal" || type === "tool") {
@@ -699,6 +719,10 @@ async function realAct(
     goal: s.goal, candidate_actions: [action],
     selected_action: { ...action, confidence: body.confidence, ...(target ? { target } : {}) },
     ...(grounding ? { grounding } : {}),
+    // Execution verification (NOT goal verification): the actuation ran
+    // through the runtime and a post-action frame was captured. Whether the
+    // goal advanced is decided by task oracles / human judgment, never here.
+    verification: { passed: true, reason: `actuated via ${backend}; post-action frame ${String(after.frameId)} captured` },
     screen_after: String(after.frameId), outcome: "acted",
     provenance: { source: "screenshot", channel: `api-act:${backend}`, at: nowIso() },
     model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
@@ -706,6 +730,122 @@ async function realAct(
   appendStep(s.id, step);
   broadcast(s.id, { kind: "frame", sessionId: s.id, frameId: after.frameId, at: nowIso() });
   return { sessionId: s.id, seq: s.seq, action, frameId: after.frameId, synthetic: false };
+}
+
+// ── inference plane client ──────────────────────────────────────────────
+// Shared by /suggest and the benchmark RealAgentAdapter. Every inference
+// failure throws (callers map to an explicit 502 / inconclusive verdict) —
+// the control plane never synthesizes an action when the model is down.
+// When EVEX_INFERENCE_TOKEN is set it is forwarded as a bearer token so a
+// hardened inference plane can authenticate callers.
+
+export interface InferenceResult {
+  action: Record<string, unknown>;
+  modelId: string;
+  modelVersion?: string;
+  modelSha256?: string | null;
+  degraded: boolean;
+  latencyMs?: number;
+}
+
+export interface InferenceModelInfo {
+  model_id: string;
+  model_version?: string;
+  model_sha256?: string | null;
+  architecture?: string;
+  device?: string;
+  degraded: boolean;
+}
+
+function inferenceUrl(): string {
+  return (process.env["INFERENCE_URL"] ?? "http://localhost:8090").replace(/\/$/, "");
+}
+
+function inferenceTimeoutMs(): number {
+  return Math.max(100, Math.min(120000, Number(process.env["EVEX_INFERENCE_TIMEOUT_MS"] ?? 15000) || 15000));
+}
+
+function inferenceHeaders(): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const tok = (process.env["EVEX_INFERENCE_TOKEN"] ?? "").trim();
+  if (tok) h["authorization"] = `Bearer ${tok}`;
+  return h;
+}
+
+export async function fetchInference(percept: {
+  frameId: string; goal: string; width: number; height: number;
+  pngBase64: string; regions: unknown;
+}): Promise<InferenceResult> {
+  const timeoutMs = inferenceTimeoutMs();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${inferenceUrl()}/infer`, {
+      method: "POST",
+      headers: inferenceHeaders(),
+      body: JSON.stringify({
+        frame_id: percept.frameId, goal: percept.goal,
+        width: percept.width, height: percept.height,
+        png_base64: percept.pngBase64, regions: percept.regions,
+        timeout_ms: timeoutMs,
+      }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (r.status === 401 || r.status === 403) {
+      throw new EveError("INFERENCE_AUTH", "inference plane refused credentials (set EVEX_INFERENCE_TOKEN)");
+    }
+    if (!r.ok) throw new EveError("INFERENCE_FAILED", `inference HTTP ${r.status}`);
+    const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+    const action = (j !== null && typeof j === "object" ? (j["action"] as unknown) : null) as Record<string, unknown> | null;
+    if (!action || typeof action !== "object") {
+      throw new EveError("INFERENCE_FAILED", "inference returned no action");
+    }
+    return {
+      action,
+      modelId: String((j as Record<string, unknown>)["model_id"] ?? "unknown"),
+      modelVersion: typeof (j as Record<string, unknown>)["model_version"] === "string"
+        ? ((j as Record<string, unknown>)["model_version"] as string)
+        : undefined,
+      modelSha256: typeof (j as Record<string, unknown>)["model_sha256"] === "string"
+        ? ((j as Record<string, unknown>)["model_sha256"] as string)
+        : null,
+      degraded: ((j as Record<string, unknown>)["degraded"] as boolean) !== false,
+      latencyMs: typeof (j as Record<string, unknown>)["latency_ms"] === "number"
+        ? ((j as Record<string, unknown>)["latency_ms"] as number)
+        : undefined,
+    };
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof EveError) throw err;
+    const reason = err instanceof Error && err.name === "AbortError" ? "inference timeout" : (err instanceof Error ? err.message : String(err));
+    throw new EveError("INFERENCE_FAILED", reason.slice(0, 200));
+  }
+}
+
+/** Best-effort model identity for benchmark provenance. Null when the plane
+ *  is unreachable — recorded as null with reason, never invented. */
+export async function fetchModelInfo(): Promise<InferenceModelInfo | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(`${inferenceUrl()}/model-info`, { headers: inferenceHeaders(), signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) return null;
+    const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!j || typeof j["model_id"] !== "string") return null;
+    return {
+      model_id: j["model_id"] as string,
+      model_version: typeof j["model_version"] === "string" ? (j["model_version"] as string) : undefined,
+      model_sha256: typeof j["model_sha256"] === "string" ? (j["model_sha256"] as string) : null,
+      architecture: typeof j["architecture"] === "string" ? (j["architecture"] as string) : undefined,
+      device: typeof j["device"] === "string" ? (j["device"] as string) : undefined,
+      degraded: (j["degraded"] as boolean) === true,
+    };
+  } catch {
+    clearTimeout(timer);
+    return null;
+  }
 }
 
 /** Best-effort restart recovery: load persisted sessions/tasks/vms into memory. */
@@ -763,6 +903,20 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
       if (!kind.startsWith("review")) {
         const k = `${String(d["stepId"] ?? "")}:${String(d["reviewer"] ?? "")}`;
         if (k !== ":") judgmentKeys.add(k);
+        // Rehydrate judgment verdicts so task validation keeps its human
+        // evidence across restarts (unknown ids stay unknown — no forging).
+        if (typeof d["id"] === "string" && typeof d["stepId"] === "string") {
+          const jid = String(d["id"]);
+          if (!judgmentRecs.has(jid)) {
+            judgmentRecs.set(jid, {
+              id: jid, stepId: String(d["stepId"]),
+              sessionId: typeof d["sessionId"] === "string" ? String(d["sessionId"]) : "",
+              reviewer: String(d["reviewer"] ?? ""),
+              reasonable: d["reasonable"] === true, targetCorrect: d["targetCorrect"] === true,
+              at: String(d["at"] ?? nowIso()),
+            });
+          }
+        }
       }
       // Rehydrate pending blind reviews (full step re-resolved at unlock).
       if (String(d["kind"] ?? "") === "review-pending" && typeof d["id"] === "string") {
@@ -793,7 +947,7 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
 export function __clearMemory(): void {
   for (const sid of runtimes.keys()) closeRuntime(sid);
   vms.clear(); sessions.clear(); tasks.clear(); traces.clear();
-  benchmarks.clear(); idemResponses.clear(); judgmentKeys.clear(); rateBuckets.clear();
+  benchmarks.clear(); idemResponses.clear(); judgmentKeys.clear(); judgmentRecs.clear(); rateBuckets.clear();
   reviews.clear();
   manager = null;
   managerBackend = "";
@@ -839,16 +993,70 @@ function resolveFullStep(sessionId: string, stepId: string): Record<string, unkn
   return undefined;
 }
 
+/** Locate the owning session for a step id across live sessions. Returns
+ *  undefined when no session holds the step — callers must fail closed. */
+function findSessionForStep(stepId: string): string | undefined {
+  for (const [sid] of sessions) {
+    try {
+      const steps = mergedTraceSteps(sid, 2000);
+      if (steps.some((st) => String(st["step_id"] ?? "") === stepId)) return sid;
+    } catch { /* ignore unreadable sessions */ }
+  }
+  return undefined;
+}
+
+function broadcast(sessionId: string, payload: unknown): void {
+  const set = streams.get(sessionId);
+  if (!set) return;
+  const text = JSON.stringify(payload);
+  for (const ws of set) {
+    try {
+      if (ws.readyState === 1) ws.send(text);
+    } catch {
+      // ignore dead sockets
+    }
+  }
+}
+
+const CHAIN_GENESIS_DIGEST = "0".repeat(64);
+const traceHeads = new Map<string, string>();
+
+/** Chain-stamp a step with the session's SHA-256 append-only digest before
+ *  it is stored or broadcast. Replayed/validated later by verifyReplay:
+ *  any post-hoc mutation, reorder, deletion, or duplication of a chained
+ *  step breaks verification. Heads survive in memory; after a restart the
+ *  head is rebuilt from the persisted tail so the chain never forks. */
+function chainStamp(sessionId: string, step: Record<string, unknown>): Record<string, unknown> {
+  let head = traceHeads.get(sessionId);
+  if (head === undefined) {
+    head = CHAIN_GENESIS_DIGEST;
+    if (stor) {
+      try {
+        const tail = stor.store.readTrace(sessionId, 1) as Array<Record<string, unknown>>;
+        const last = tail.length > 0 ? tail[tail.length - 1] : undefined;
+        const d = last !== undefined ? String(last["digest"] ?? "") : "";
+        if (/^[0-9a-f]{64}$/.test(d)) head = d;
+      } catch { /* no history: genesis head */ }
+    }
+  }
+  const { digest: _d, prevDigest: _p, prev: _pv, ...body } = step;
+  void _d; void _p; void _pv;
+  const digest = sha256hex(`${head}.${canonicalJson(body)}`);
+  traceHeads.set(sessionId, digest);
+  return { ...step, prevDigest: head, digest };
+}
+
 function appendStep(sessionId: string, step: Record<string, unknown>): void {
+  const stamped = chainStamp(sessionId, step);
   const arr = traces.get(sessionId) ?? [];
-  arr.push(step);
+  arr.push(stamped);
   traces.set(sessionId, arr);
   try {
-    stor?.store.appendTrace(sessionId, step);
+    stor?.store.appendTrace(sessionId, stamped);
   } catch {
     // ignore
   }
-  broadcast(sessionId, { kind: "step", sessionId, step });
+  broadcast(sessionId, { kind: "step", sessionId, step: stamped });
 }
 
 /**
@@ -870,22 +1078,10 @@ function mergedTraceSteps(sessionId: string, limit = 100000): Array<Record<strin
   const memIds = new Set(mem.map((st) => String(st["step_id"] ?? st["seq"])));
   const extra = file.filter((st) => !memIds.has(String(st["step_id"] ?? st["seq"])));
   if (extra.length === 0) return mem;
-  // Same merge order as the replay route (memory appends first); extras are
-  // pre-restart file history missing from this process's memory.
-  return [...mem, ...extra];
-}
-
-function broadcast(sessionId: string, payload: unknown): void {
-  const set = streams.get(sessionId);
-  if (!set) return;
-  const text = JSON.stringify(payload);
-  for (const ws of set) {
-    try {
-      if (ws.readyState === 1) ws.send(text);
-    } catch {
-      // ignore dead sockets
-    }
-  }
+  // Extras are pre-restart file history missing from this process's memory,
+  // so they come FIRST; the merged stream is ordered by seq so replay's
+  // physical-order check sees the true append order, not a restart artifact.
+  return [...extra, ...mem].sort((a, b) => Number(a["seq"] ?? 0) - Number(b["seq"] ?? 0));
 }
 
 function syntheticFrame(sessionId: string, seq: number): Record<string, unknown> {
@@ -954,9 +1150,15 @@ const BenchmarkStart = z.object({
   cases: z.array(z.string()).default(["login", "file-save", "web-form"]),
   size: z.number().int().min(1).max(200).default(6),
   seed: z.number().int().default(42),
+  /** Execution agent. "real" drives real sessions/VMs through the control
+   *  plane. "mock-test-only" is the explicit harness double: it requires
+   *  testOnly:true and the record is stamped synthetic/test_only. */
+  agent: z.enum(["real", "mock-test-only"]).default("real"),
+  testOnly: z.boolean().default(false),
 });
 const JudgmentBody = z.object({
   stepId: z.string(),
+  sessionId: z.string().min(1).max(128).optional(),
   reviewer: z.string().default("reviewer"),
   reasonable: z.boolean(),
   targetCorrect: z.boolean(),
@@ -970,6 +1172,9 @@ const ReviewEnqueue = z.object({
   sessionId: z.string().min(1),
   stepId: z.string().min(1).optional(),
 });
+const ValidateRequest = z.object({
+  evidence: EvidenceBundleSchema,
+});
 
 function validate<T extends z.ZodTypeAny>(schema: T, body: unknown, res: Response): z.infer<T> | null {
   const r = schema.safeParse(body);
@@ -978,13 +1183,6 @@ function validate<T extends z.ZodTypeAny>(schema: T, body: unknown, res: Respons
     return null;
   }
   return r.data as z.infer<T>;
-}
-
-function stableJson(v: unknown): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "";
-  if (Array.isArray(v)) return `[${v.map((e) => stableJson(e)).join(",")}]`;
-  const o = v as Record<string, unknown>;
-  return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`).join(",")}}`;
 }
 
 type ReplayVerdict = "deterministic-replay-ok" | "replay-divergent";
@@ -1025,19 +1223,25 @@ export function verifyReplay(
   steps.forEach((st, idx) => {
     if (st["seq"] !== idx) issues.push(`out-of-order seq at position ${idx} (seq ${String(st["seq"])})`);
   });
-  // Digest chain: only when every step carries the digest+prev convention.
-  const hasChain = steps.length > 0 && steps.every((st) => typeof st["digest"] === "string" && "prev" in st);
+  // Digest chain: only when every step carries the SHA-256 digest+prevDigest
+  // convention stamped by appendStep. Legacy 40-hex digests (pre-SHA-256
+  // toy hash) are flagged, never trusted: they cannot verify tampering.
+  const hasChain = steps.length > 0 && steps.every((st) => typeof st["digest"] === "string" && (typeof st["prevDigest"] === "string" || "prev" in st));
   if (hasChain) {
     let prevDigest = "";
     for (const st of steps) {
-      const { digest: _d, prev: _p, ...rest } = st as Record<string, unknown> & { digest: unknown; prev: unknown };
-      void _d; void _p;
-      const pStr = String(st["prev"] ?? "");
+      const { digest: _d, prev: _p, prevDigest: _pd, ...rest } = st as Record<string, unknown> & { digest: unknown; prev: unknown; prevDigest: unknown };
+      void _d; void _p; void _pd;
+      const pStr = String(st["prevDigest"] ?? st["prev"] ?? "");
       const dStr = String(st["digest"] ?? "");
+      if (!/^[0-9a-f]{64}$/.test(dStr) || (pStr !== "" && !/^[0-9a-f]{64}$/.test(pStr))) {
+        issues.push(`weak legacy digest at seq ${String(st["seq"])} (not SHA-256 — cannot verify tampering)`);
+        continue;
+      }
       if (prevDigest !== "" && pStr !== prevDigest) {
         issues.push(`digest chain break at seq ${String(st["seq"])}: prev mismatch`);
       }
-      const recomputed = sha1hex(`${pStr}|${stableJson(rest)}`);
+      const recomputed = sha256hex(`${pStr}.${canonicalJson(rest)}`);
       if (recomputed !== dStr) issues.push(`digest mismatch at seq ${String(st["seq"])}`);
       prevDigest = dStr;
     }
@@ -1450,7 +1654,7 @@ export function buildApp(): express.Express {
     if (drv && drv.backend !== "dev-framebuffer") {
       // REAL path: hypervisor screendump → perception → candidate regions.
       try {
-        const { runtime } = await runtimeFor(req, s);
+        const { runtime } = await runtimeForOwner(mgrOwner(req), s);
         let percept = await runtime.observe();
         // Lazy resolution enforcement: the guest negotiates its own initial
         // mode (GDM/Xorg) and may drift later (idle resets); whenever the
@@ -1480,23 +1684,14 @@ export function buildApp(): express.Express {
         s.updatedAt = nowIso();
         persistSession(s);
         // Cache perceived regions for point→region grounding at act time.
-        try {
-          const regs = (percept.regions ?? []) as Array<{ regionId?: unknown; bbox?: unknown; label?: unknown }>;
-          s.lastRegions = regs
-            .filter((r) => typeof r.regionId === "string" && Array.isArray(r.bbox) && r.bbox.length === 4)
-            .map((r) => ({
-              regionId: String(r.regionId),
-              bbox: (r.bbox as number[]).slice(0, 4) as [number, number, number, number],
-              label: typeof r.label === "string" ? String(r.label) : "",
-            }));
-        } catch { /* grounding cache is best-effort */ }
+        cachePerceivedRegions(s, percept.regions);
         // Stall annotation: consecutive byte-identical frames mean the guest
         // is producing no visual change (wedged boot, frozen compositor, or
         // a genuinely idle screen). Advisory only — the console surfaces it;
         // no state change is inferred from pixels alone.
         let stalled = false;
         try {
-          const sha = sha1hex(String(percept.pngBase64 ?? ""));
+          const sha = sha256hex(String(percept.pngBase64 ?? ""));
           if (s.lastPngSha !== undefined && s.lastPngSha === sha) {
             s.stallCount = (s.stallCount ?? 0) + 1;
           } else {
@@ -1559,7 +1754,7 @@ export function buildApp(): express.Express {
     let percept: { frameId: string; width: number; height: number; pngBase64: string; regions: unknown[] };
     try {
       if (drv && drv.backend !== "dev-framebuffer") {
-        const { runtime } = await runtimeFor(req, s);
+        const { runtime } = await runtimeForOwner(mgrOwner(req), s);
         const p = await runtime.observe();
         percept = {
           frameId: String((p as { frameId?: unknown }).frameId ?? s.lastFrame ?? `f-${s.seq}`),
@@ -1592,38 +1787,20 @@ export function buildApp(): express.Express {
     const inferUrl = (process.env["INFERENCE_URL"] ?? "http://localhost:8090").replace(/\/$/, "");
     const timeoutMs = Math.max(100, Math.min(120000,
       Number(process.env["EVEX_INFERENCE_TIMEOUT_MS"] ?? 15000) || 15000));
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const r = await fetch(`${inferUrl}/infer`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          frame_id: percept.frameId, goal: s.goal,
-          width: percept.width, height: percept.height,
-          png_base64: percept.pngBase64, regions: percept.regions,
-          timeout_ms: timeoutMs,
-        }),
-        signal: ctrl.signal,
+      const out = await fetchInference({
+        frameId: percept.frameId, goal: s.goal,
+        width: percept.width, height: percept.height,
+        pngBase64: percept.pngBase64, regions: percept.regions,
       });
-      clearTimeout(timer);
-      if (!r.ok) {
-        res.status(502).json({ error: "inference_unavailable", detail: `inference HTTP ${r.status}` });
-        return;
-      }
-      const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
-      if (!j || typeof j !== "object" || !j["action"]) {
-        res.status(502).json({ error: "inference_unavailable", detail: "inference returned no action" });
-        return;
-      }
       res.json({
-        sessionId: s.id, frameId: percept.frameId, suggestion: j["action"],
-        model_id: j["model_id"] ?? "unknown", latency_ms: j["latency_ms"] ?? null,
-        degraded: j["degraded"] ?? true, inference: inferUrl,
+        sessionId: s.id, frameId: percept.frameId, suggestion: out.action,
+        model_id: out.modelId, model_version: out.modelVersion ?? null,
+        model_sha256: out.modelSha256 ?? null, latency_ms: out.latencyMs,
+        degraded: out.degraded, inference: inferUrl,
       });
     } catch (err) {
-      clearTimeout(timer);
-      const reason = err instanceof Error && err.name === "AbortError" ? "inference timeout" : (err instanceof Error ? err.message : String(err));
+      const reason = err instanceof Error ? err.message : String(err);
       res.status(502).json({ error: "inference_unavailable", detail: reason.slice(0, 200) });
     }
   });
@@ -1676,7 +1853,7 @@ export function buildApp(): express.Express {
       // REAL path: verify → actuate through the computer runtime →
       // re-observe the outcome. Failures never advance the trajectory.
       try {
-        const resp = await realAct(req, s, v as VmRec, drv, body, action);
+        const resp = await realAct(mgrOwner(req), s, v as VmRec, drv, body, action);
         if (body.idempotencyKey) idemResponses.set(`${sessionId}:${body.idempotencyKey}`, resp);
         res.json(resp);
       } catch (err) {
@@ -1769,10 +1946,50 @@ export function buildApp(): express.Express {
     const t = tasks.get(req.params["id"] as string);
     if (!t) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(t, req, res)) return;
-    t.status = "DONE";
-    t.result = { verdict: "pass", checkedAt: nowIso(), input: req.body ?? {} };
+    // Independent validation: a verdict is DERIVED from server-resolved
+    // trace evidence + oracle assertions + human judgments. Calling this
+    // endpoint never manufactures success — without evidence the result is
+    // INCONCLUSIVE or INVALID_EVIDENCE, never PASS.
+    const parsed = ValidateRequest.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "evidence_required", message: "validation requires an evidence bundle", issues: parsed.error.issues });
+      return;
+    }
+    const ev = parsed.data.evidence;
+    const s = sessions.get(ev.sessionId);
+    if (!s) { res.status(404).json({ error: "not_found", message: "evidence session unknown" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
+    const steps = mergedTraceSteps(ev.sessionId);
+    const replay = verifyReplay(steps);
+    const chained = steps.length > 0 && steps.every(
+      (st) => /^[0-9a-f]{64}$/.test(String(st["digest"] ?? "")) &&
+        (/^[0-9a-f]{64}$/.test(String(st["prevDigest"] ?? "")) || /^[0-9a-f]{64}$/.test(String(st["prev"] ?? ""))),
+    );
+    const byId = new Map(steps.map((st) => [String(st["step_id"] ?? ""), st]));
+    const resolvedSteps = ev.stepIds
+      .map((id) => byId.get(id))
+      .filter((st): st is Record<string, unknown> => st !== undefined)
+      .map((st) => ({
+        step_id: String(st["step_id"] ?? ""),
+        seq: Number(st["seq"] ?? 0),
+        outcome: typeof st["outcome"] === "string" ? (st["outcome"] as string) : undefined,
+        grounding: (st["grounding"] ?? undefined) as { verified?: boolean } | undefined,
+        verification: (st["verification"] ?? undefined) as { passed?: boolean } | undefined,
+        raw: st,
+      }));
+    const judgments = ev.judgmentIds
+      .map((id) => judgmentRecs.get(id))
+      .filter((j): j is JudgmentRec => j !== undefined)
+      .map((j) => ({ id: j.id, stepId: j.stepId, reviewer: j.reviewer, reasonable: j.reasonable, targetCorrect: j.targetCorrect }));
+    const result = validateEvidence({
+      taskId: t.id, evidence: ev, resolvedSteps,
+      replay: { verdict: replay.verdict, issues: replay.issues, chained },
+      judgments, traceChained: chained,
+    });
+    t.result = result;
+    if (result.verdict === "PASS" || result.verdict === "FAILED") t.status = "DONE";
     persistTask(t);
-    res.json(t);
+    res.json({ task: { id: t.id, status: t.status }, validation: result });
   });
 
   // ── trace / replay / report ──
@@ -1857,7 +2074,12 @@ export function buildApp(): express.Express {
     }
     // Blind-review unlock path: a reviewId pins this judgment to a pending
     // server-side blind review. Double-submit of the same reviewId → 409.
+    // Owner enforcement: the owning session must exist and belong to the
+    // caller. Review-bound judgments inherit the review's session; direct
+    // judgments carry sessionId or are resolved by step scan. Unknown
+    // sessions/steps fail closed (404) — no orphan or cross-tenant judgments.
     let review: ReviewRec | undefined;
+    let judgmentSessionId: string | undefined;
     if (body.reviewId) {
       review = reviews.get(body.reviewId);
       if (!review) { res.status(404).json({ error: "not_found", message: "no such review" }); return; }
@@ -1869,6 +2091,30 @@ export function buildApp(): express.Express {
         res.status(400).json({ error: "bad_request", message: "stepId does not match the blind review" });
         return;
       }
+      judgmentSessionId = review.sessionId;
+    } else if (body.sessionId) {
+      judgmentSessionId = body.sessionId;
+    } else {
+      judgmentSessionId = findSessionForStep(body.stepId);
+      if (!judgmentSessionId) {
+        res.status(404).json({ error: "not_found", message: "step is unknown to every live session" });
+        return;
+      }
+    }
+    const js = sessions.get(judgmentSessionId);
+    if (!js) { res.status(404).json({ error: "not_found", message: "owning session unknown" }); return; }
+    if (denyIfNotOwner(js, req, res)) return;
+    // The judged step must exist in the owning session's trace: judgments
+    // on phantom steps are evidence failure, not verdicts.
+    try {
+      const steps = mergedTraceSteps(judgmentSessionId, 2000);
+      if (!steps.some((st) => String(st["step_id"] ?? "") === body.stepId)) {
+        res.status(404).json({ error: "not_found", message: "step is unknown to the owning session" });
+        return;
+      }
+    } catch {
+      res.status(404).json({ error: "not_found", message: "owning session trace unreadable" });
+      return;
     }
     const key = `${body.stepId}:${reviewer}`;
     if (judgmentKeys.has(key)) {
@@ -1877,8 +2123,14 @@ export function buildApp(): express.Express {
     }
     judgmentKeys.add(key);
     const id = uid("judg");
+    const rec: JudgmentRec = {
+      id, stepId: body.stepId, sessionId: judgmentSessionId,
+      reviewer, reasonable: body.reasonable === true, targetCorrect: body.targetCorrect === true,
+      at: nowIso(),
+    };
+    judgmentRecs.set(id, rec);
     try {
-      stor?.store.put("judgments", { id, ...body, reviewer, at: nowIso(), blind: true });
+      stor?.store.put("judgments", { id, ...body, reviewer, sessionId: judgmentSessionId, at: rec.at, blind: true });
     } catch { /* ignore */ }
     if (review) {
       review.status = "complete";
@@ -1899,6 +2151,202 @@ export function buildApp(): express.Express {
   });
 
   // ── benchmarks / models ──
+  // RealAgentAdapter: every benchmark task executes against a REAL
+  // session/VM through the same observe → infer → act path as production
+  // traffic (observe via ComputerRuntime, action from the inference plane,
+  // actuation via realAct with grounding + stale enforcement + evidence
+  // steps). There is no synthetic inline agent: benchmark numbers come
+  // from executed trajectories scored by the IndependentEvaluator, or the
+  // run reports invalid/inconclusive counts instead of numbers.
+  async function runRealBenchTask(
+    owner: string,
+    mod: BenchMod,
+    task: {
+      benchTaskId: string; category: string; goal: string; split: string;
+      seed: number; maxSteps: number; stepsOptimal: number; successSignals: string[];
+    },
+    modelInfo: InferenceModelInfo | null,
+  ): Promise<Record<string, unknown>> {
+    const modelIdentity = modelInfo
+      ? {
+        model_id: modelInfo.model_id,
+        ...(modelInfo.model_version !== undefined ? { model_version: modelInfo.model_version } : {}),
+        model_sha256: modelInfo.model_sha256 ?? null,
+        degraded: modelInfo.degraded,
+      }
+      : null;
+    const invalid = (): Record<string, unknown> => mod.evaluateBenchTask({
+      task, steps: [], evidenceDigests: [],
+      agentIdentity: "evex-real-agent", modelIdentity, backendSynthetic: true,
+    }) as Record<string, unknown>;
+    const spec = { image: "ubuntu-desktop-v1", width: 1280, height: 800 };
+    let provisioned: { driverVmId: string; backend: string };
+    try {
+      provisioned = await provisionDriverVm(owner, spec as Record<string, unknown>);
+    } catch {
+      return invalid();
+    }
+    const sid = uid("sess");
+    const vmId = uid("vm");
+    const rec: VmRec = {
+      id: vmId, spec: spec as Record<string, unknown>, state: "READY", createdAt: nowIso(),
+      snapshots: [], owner, driverVmId: provisioned.driverVmId, backend: provisioned.backend,
+    };
+    vms.set(vmId, rec);
+    persistVm(rec);
+    const sm = new StateMachine<string>("READY", SESSION_SM);
+    const srec: SessionRec = {
+      id: sid, taskId: task.benchTaskId, goal: task.goal, vmId,
+      status: "RUNNING", seq: 0, paused: false, humanControl: false,
+      createdAt: nowIso(), updatedAt: nowIso(), sm, owner,
+    };
+    try { sm.transition("RUNNING", "benchmark task start"); } catch { /* already */ }
+    sessions.set(sid, srec);
+    traces.set(sid, []);
+    persistSession(srec);
+    appendStep(sid, {
+      session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: 0,
+      timestamp: nowIso(), actor: "system", vm_state_before: "READY", screen_before: "",
+      goal: task.goal, candidate_actions: [],
+      provenance: { source: "system", channel: "api-bench", at: nowIso() },
+      model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+    });
+    const realPath = provisioned.backend !== "dev-framebuffer";
+    const drv = { driverVmId: provisioned.driverVmId, backend: provisioned.backend };
+    let lastModel = modelIdentity;
+    let terminated = false;
+    try {
+      const maxSteps = Math.min(Math.max(task.maxSteps, 1), 200);
+      for (let i = 0; i < maxSteps && !terminated; i += 1) {
+        if (effectiveHumanControl(srec)) break;
+        if (!realPath) {
+          // Dev backend: no pixels exist. Advance with an explicitly
+          // synthetic step so the loop shape is exercised; the evaluator
+          // scores the trajectory invalid (counted, never scored).
+          srec.seq += 1;
+          srec.lastFrame = `f-${srec.seq}`;
+          srec.updatedAt = nowIso();
+          persistSession(srec);
+          appendStep(sid, {
+            session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+            timestamp: nowIso(), actor: "eve-agent", vm_state_before: "RUNNING", screen_before: `f-${srec.seq - 1}`,
+            goal: task.goal, candidate_actions: [{ type: "observe", confidence: 0.5 }],
+            screen_after: `f-${srec.seq}`, outcome: "acted", synthetic: true,
+            provenance: { source: "evaluator-tool", channel: "api-bench:dev-synthetic", at: nowIso() },
+            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+          });
+          continue;
+        }
+        let frameId: string;
+        let percept: { frameId: string; width: number; height: number; pngBase64: string; regions: unknown };
+        try {
+          const { runtime } = await runtimeForOwner(owner, srec);
+          const p = await runtime.observe();
+          frameId = String((p as { frameId?: unknown }).frameId ?? "");
+          if (!frameId) throw new EveError("OBSERVE_FAILED", "runtime returned no frame");
+          percept = {
+            frameId,
+            width: Number((p as { width?: unknown }).width ?? 0) || 0,
+            height: Number((p as { height?: unknown }).height ?? 0) || 0,
+            pngBase64: String((p as { pngBase64?: unknown }).pngBase64 ?? ""),
+            regions: (p as { regions?: unknown }).regions ?? [],
+          };
+          srec.lastFrame = frameId;
+          srec.updatedAt = nowIso();
+          persistSession(srec);
+          cachePerceivedRegions(srec, percept.regions);
+        } catch (err) {
+          if (err instanceof EveError && isVmLostCode(err.code)) {
+            markSessionVmLost(srec, `${err.code}: ${err.message}`);
+          } else {
+            srec.seq += 1;
+            appendStep(sid, {
+              session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+              timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: srec.lastFrame ?? "",
+              goal: task.goal, candidate_actions: [], outcome: "observe-failed",
+              provenance: { source: "system", channel: "api-bench", at: nowIso() },
+              model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+            });
+          }
+          break;
+        }
+        let inf: InferenceResult;
+        try {
+          inf = await fetchInference({ ...percept, goal: task.goal });
+        } catch {
+          srec.seq += 1;
+          appendStep(sid, {
+            session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+            timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: frameId,
+            goal: task.goal, candidate_actions: [], outcome: "inference-failed",
+            provenance: { source: "system", channel: "api-bench", at: nowIso() },
+            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+          });
+          break;
+        }
+        lastModel = {
+          model_id: inf.modelId,
+          ...(inf.modelVersion !== undefined ? { model_version: inf.modelVersion } : {}),
+          model_sha256: inf.modelSha256 ?? null,
+          degraded: inf.degraded,
+        };
+        const a = inf.action;
+        const pt = (a["to"] ?? a["from"]) as { x?: unknown; y?: unknown } | undefined;
+        const action = {
+          type: String(a["type"] ?? "observe"),
+          text: typeof a["text"] === "string" ? (a["text"] as string) : undefined,
+          keys: Array.isArray(a["keys"]) ? (a["keys"] as string[]) : undefined,
+          from: pt !== undefined && typeof pt.x === "number" && typeof pt.y === "number"
+            ? { x: pt.x as number, y: pt.y as number }
+            : undefined,
+          ms: typeof a["ms"] === "number" ? (a["ms"] as number) : undefined,
+          confidence: typeof a["confidence"] === "number" ? (a["confidence"] as number) : 0.5,
+        };
+        try {
+          const resp = await realAct(owner, srec, rec, drv, { frameId, confidence: action.confidence }, action) as Record<string, unknown>;
+          if (resp["terminated"] === true) terminated = true;
+        } catch (err) {
+          if (err instanceof EveError && err.code === "STALE_PERCEPTION") continue;
+          if (err instanceof EveError && isVmLostCode(err.code)) {
+            markSessionVmLost(srec, `${err.code}: ${err.message}`);
+            break;
+          }
+          srec.seq += 1;
+          appendStep(sid, {
+            session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+            timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: frameId,
+            goal: task.goal, candidate_actions: [], outcome: "actuation-failed",
+            provenance: { source: "system", channel: "api-bench", at: nowIso() },
+            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+          });
+          break;
+        }
+      }
+    } finally {
+      // Bound benchmark resources: destroy the driver VM, stop the session.
+      try {
+        const { mgr } = await vmManager();
+        await mgr.destroy(drv.driverVmId, owner);
+      } catch { /* best effort */ }
+      closeRuntime(sid);
+      try { srec.sm.transition("STOPPED", "benchmark task complete"); } catch { /* already terminal */ }
+      srec.status = "STOPPED";
+      srec.updatedAt = nowIso();
+      persistSession(srec);
+    }
+    const steps = mergedTraceSteps(sid);
+    const last = steps.length > 0 ? steps[steps.length - 1] : undefined;
+    const headDigest = last !== undefined ? String(last["digest"] ?? "") : "";
+    return mod.evaluateBenchTask({
+      task,
+      steps,
+      evidenceDigests: /^[0-9a-f]{64}$/.test(headDigest) ? [headDigest] : [],
+      agentIdentity: "evex-real-agent",
+      modelIdentity: lastModel,
+      backendSynthetic: !realPath,
+    }) as Record<string, unknown>;
+  }
+
   v1.post("/benchmarks", requireCap("task:execute"), async (req: Request, res: Response) => {
     const body = validate(BenchmarkStart, req.body, res);
     if (!body) return;
@@ -1937,42 +2385,68 @@ export function buildApp(): express.Express {
       }
       const selected = picked.slice(0, Math.min(Math.max(body.size, 1), 200));
       const splits = [...new Set(selected.map((t) => t.split))];
-      // Deterministic inline agent: seeded by task.seed, returns schema-valid steps.
-      const agentFn = async (task: {
-        benchTaskId: string; goal: string; seed: number; maxSteps: number; stepsOptimal: number;
-      }): Promise<Record<string, unknown>> => {
-        const rand = prng(task.seed);
-        const n = Math.max(1, Math.min(task.maxSteps, task.stepsOptimal + Math.floor(rand() * 3)));
-        const steps: Array<Record<string, unknown>> = [];
-        for (let i = 0; i < n; i += 1) {
-          steps.push({
-            session_id: `bench-${task.benchTaskId}`, task_id: task.benchTaskId, step_id: `bstep-${i}`,
-            seq: i, timestamp: nowIso(), actor: "eve-agent",
-            vm_state_before: "RUNNING", screen_before: `f-${i}`,
-            goal: task.goal,
-            candidate_actions: [{ type: "observe", confidence: 0.9 }],
-            provenance: { source: "evaluator-tool", channel: "bench-inline", at: nowIso() },
-            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+      const owner = ownerOf(req);
+      let agentFn: (task: unknown) => Promise<Record<string, unknown>>;
+      let agentIdentity = "evex-real-agent";
+      let testOnly = false;
+      let modelIdentity: InferenceModelInfo | null = null;
+      if (body.agent === "mock-test-only") {
+        // Explicit harness double: requires testOnly:true, and the record
+        // is stamped so production consumers refuse it.
+        if (body.testOnly !== true) {
+          res.status(400).json({
+            error: "mock_agent_requires_test_only",
+            message: "mock-test-only agent requires testOnly:true — production benchmarks refuse mock evidence",
           });
+          return;
         }
-        const success = rand() < 0.6;
-        return {
-          success,
-          actionSuccesses: success ? n : Math.max(0, n - 1), actionTotal: n,
-          groundedCorrect: success ? n : Math.max(0, n - 1), groundedTotal: n,
-          stepsUsed: n, predictionsCorrect: n, predictionsTotal: n,
-          recovered: 0, recoveryOpportunities: 0,
-          humanAgreements: 0, humanJudged: 0,
-          unsafe: false, takeover: false,
-          latenciesMs: steps.map((_, i) => 100 + ((task.seed + i * 37) % 400)),
-          steps,
-        };
-      };
-      const record = await mod.runBench(selected, agentFn, { splits, runId: id });
-      const full: Record<string, unknown> = { id, name: body.name, seed: body.seed, ...record };
+        if (typeof mod.mockAgentAdapter !== "function") {
+          res.status(503).json({ error: "benchmark-unavailable" });
+          return;
+        }
+        testOnly = true;
+        agentIdentity = "mock-test-only";
+        agentFn = mod.mockAgentAdapter(body.seed, "mock-test-only") as (task: unknown) => Promise<Record<string, unknown>>;
+      } else {
+        if (body.testOnly === true) {
+          res.status(400).json({
+            error: "contradictory_request",
+            message: "testOnly:true is only meaningful with agent mock-test-only",
+          });
+          return;
+        }
+        if (typeof mod.evaluateBenchTask !== "function") {
+          res.status(503).json({ error: "benchmark-unavailable" });
+          return;
+        }
+        modelIdentity = await fetchModelInfo();
+        const vmImageDigest = typeof process.env["EVEX_BASE_IMAGE_SHA256"] === "string" && process.env["EVEX_BASE_IMAGE_SHA256"]
+          ? String(process.env["EVEX_BASE_IMAGE_SHA256"])
+          : null;
+        agentFn = async (task: unknown): Promise<Record<string, unknown>> =>
+          runRealBenchTask(owner, mod, task as Parameters<typeof runRealBenchTask>[2], modelIdentity);
+      }
+      const record = await mod.runBench(selected, agentFn, {
+        splits, runId: id, testOnly, agentIdentity,
+        modelIdentity: modelIdentity
+          ? {
+            model_id: modelIdentity.model_id,
+            ...(modelIdentity.model_version !== undefined ? { model_version: modelIdentity.model_version } : {}),
+            model_sha256: modelIdentity.model_sha256 ?? null,
+            degraded: modelIdentity.degraded,
+          }
+          : null,
+        environmentIdentity: `backend:${process.env["VM_BACKEND"] ?? "auto"} node:${process.version}`,
+        vmImageDigest: typeof process.env["EVEX_BASE_IMAGE_SHA256"] === "string" && process.env["EVEX_BASE_IMAGE_SHA256"]
+          ? String(process.env["EVEX_BASE_IMAGE_SHA256"])
+          : null,
+        sourceCommit: String(RELEASE.commit ?? ""),
+        sourceTree: String(RELEASE.tree ?? ""),
+      });
+      const full: Record<string, unknown> = { id, name: body.name, seed: body.seed, owner, ...record };
       benchmarks.set(id, full);
       try {
-        stor?.store.put("benchmarks", { id, name: body.name, status: "DONE", at: nowIso(), taskCount: selected.length, owner: ownerOf(req) });
+        stor?.store.put("benchmarks", { id, name: body.name, status: "DONE", at: nowIso(), taskCount: selected.length, owner });
       } catch { /* ignore */ }
       res.status(201).json(full);
     } catch (err) {
@@ -1989,11 +2463,32 @@ export function buildApp(): express.Express {
     }
     res.json(b);
   });
-  v1.get("/models/status", requireCap("computer:observe"), (_req: Request, res: Response) => {
+  v1.get("/models/status", requireCap("computer:observe"), async (_req: Request, res: Response) => {
+    // Live probe: reachable reflects an actual /ready round-trip, and the
+    // model identity is read from the plane — never asserted by config.
+    const url = inferenceUrl();
+    let reachable = false;
+    let ready: Record<string, unknown> | null = null;
+    let model: InferenceModelInfo | null = null;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const r = await fetch(`${url}/ready`, { signal: ctrl.signal });
+        reachable = r.ok;
+        ready = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch { /* unreachable: reported, not thrown */ }
+    if (reachable) model = await fetchModelInfo();
     res.json({
-      inferenceUrl: process.env["INFERENCE_URL"] ?? "http://localhost:8090",
-      model: process.env["EVEX_MODEL"] ?? "evex-cua-1",
-      reachable: false,
+      inferenceUrl: url,
+      model: model?.model_id ?? process.env["EVEX_MODEL"] ?? "evex-cua-1",
+      reachable,
+      ready: ready?.["ready"] ?? false,
+      degraded: ready?.["degraded"] ?? model?.degraded ?? true,
+      modelIdentity: model,
       at: nowIso(),
     });
   });

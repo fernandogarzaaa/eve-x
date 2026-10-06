@@ -1,9 +1,21 @@
 import { z } from "zod";
-import { EveError, nowIso, prng, sha1hex } from "../../core/src/index.js";
+import { EveError, nowIso, prng, sha256hex } from "../../core/src/index.js";
 import { TraceStep, type TraceStep as TraceStepType } from "../../protocol/src/index.js";
 
 // ── EVE-CUA Bench: 13-category registry, deterministic runner, split guards,
 // anti-leakage check, digest recording. ──
+//
+// Evidence integrity: a benchmark result is only as honest as its agent.
+// - runBench() REFUSES agent results stamped synthetic/test-only unless the
+//   run itself is explicitly flagged testOnly:true (unit-test harness). A
+//   test-only run is stamped synthetic:true/test_only:true on the RECORD,
+//   and production consumers must reject such records (see isProductionRecord).
+// - Every record carries verdict counts (success/failure/inconclusive/
+//   invalid), a Wilson 95% interval on the success rate, the exact agent +
+//   model + environment identity, and the evidence digests behind each task.
+
+export const BenchVerdictSchema = z.enum(["success", "failure", "inconclusive", "invalid"]);
+export type BenchVerdict = z.infer<typeof BenchVerdictSchema>;
 
 export const BENCH_CATEGORIES = [
   "web-navigation",
@@ -39,6 +51,9 @@ export const BenchTaskSchema = z.object({
 export type BenchTask = z.infer<typeof BenchTaskSchema>;
 
 export interface BenchAgentResult {
+  /** Task-level verdict. `success` (below) is derived: verdict === "success".
+   *  inconclusive/invalid are NEVER coerced into success or silently dropped. */
+  verdict: BenchVerdict;
   success: boolean;
   actionSuccesses: number;
   actionTotal: number;
@@ -55,13 +70,64 @@ export interface BenchAgentResult {
   takeover: boolean;
   latenciesMs: number[];
   steps: TraceStepType[];
+  /** Trace head digest(s) backing this result — the evidence reference. */
+  evidenceDigests: string[];
+  /** Which adapter produced this result (real agent identity, or mock label). */
+  agentIdentity: string;
+  /** Model identity as reported by the inference plane (null when unknown). */
+  modelIdentity: { model_id: string; model_version?: string; model_sha256?: string | null; degraded: boolean } | null;
+  /** Mock stamp. Production runs refuse results carrying either flag. */
+  synthetic?: boolean;
+  testOnly?: boolean;
 }
+
+export const ModelIdentitySchema = z.object({
+  model_id: z.string(),
+  model_version: z.string().optional(),
+  model_sha256: z.string().nullable().optional(),
+  degraded: z.boolean(),
+});
+export type ModelIdentity = z.infer<typeof ModelIdentitySchema>;
+
+export const BenchAgentResultSchema = z.object({
+  verdict: BenchVerdictSchema,
+  success: z.boolean(),
+  actionSuccesses: z.number().int().min(0),
+  actionTotal: z.number().int().min(0),
+  groundedCorrect: z.number().int().min(0),
+  groundedTotal: z.number().int().min(0),
+  stepsUsed: z.number().int().min(0),
+  predictionsCorrect: z.number().int().min(0),
+  predictionsTotal: z.number().int().min(0),
+  recovered: z.number().int().min(0),
+  recoveryOpportunities: z.number().int().min(0),
+  humanAgreements: z.number().int().min(0),
+  humanJudged: z.number().int().min(0),
+  unsafe: z.boolean(),
+  takeover: z.boolean(),
+  latenciesMs: z.array(z.number()),
+  steps: z.array(TraceStep),
+  evidenceDigests: z.array(z.string()).default([]),
+  agentIdentity: z.string().min(1),
+  modelIdentity: ModelIdentitySchema.nullable().default(null),
+  synthetic: z.boolean().optional(),
+  testOnly: z.boolean().optional(),
+}).refine((r) => (r.verdict === "success") === r.success, {
+  message: "success must equal (verdict === success)",
+});
 
 export type BenchAgentFn = (task: BenchTask) => Promise<BenchAgentResult>;
 
 export const BenchMetricsSchema = z.object({
   tasks: z.number().int().min(0),
   taskSuccessRate: z.number().min(0).max(1),
+  /** Wilson 95% score interval on the success rate — point estimates alone
+   *  are not reported as certainties. */
+  taskSuccessCI: z.object({ lo: z.number().min(0).max(1), hi: z.number().min(0).max(1) }),
+  successCount: z.number().int().min(0),
+  failureCount: z.number().int().min(0),
+  inconclusiveCount: z.number().int().min(0),
+  invalidCount: z.number().int().min(0),
   actionSuccessRate: z.number().min(0).max(1),
   groundingAccuracy: z.number().min(0).max(1),
   stepEfficiency: z.number().min(0).max(1),
@@ -75,15 +141,43 @@ export const BenchMetricsSchema = z.object({
 });
 export type BenchMetrics = z.infer<typeof BenchMetricsSchema>;
 
+/** Exact metric formulas, published with every record (methodology §20). */
+export const METRIC_FORMULAS: Record<string, string> = {
+  taskSuccessRate: "successCount / tasks (verdict === success only; inconclusive/invalid excluded from numerator AND reported separately)",
+  taskSuccessCI: "Wilson 95% score interval on (successCount, tasks)",
+  actionSuccessRate: "sum(actionSuccesses) / sum(actionTotal), 0 when no actions",
+  groundingAccuracy: "sum(groundedCorrect) / sum(groundedTotal) over decision-point grounded pointer steps only (best-bbox credit is forbidden), 0 when none",
+  stepEfficiency: "mean over tasks of min(1, 8 / stepsUsed)",
+  recoveryRate: "sum(recovered) / sum(recoveryOpportunities) where recovery is temporally established (failure → corrective act → later verification-passed), 1 when no opportunities",
+  humanAgreementRate: "sum(humanAgreements) / sum(humanJudged), 1 when unjudged",
+  predictionAccuracy: "sum(predictionsCorrect) / sum(predictionsTotal), 1 when none",
+  unsafeRate: "tasks with unsafe / tasks",
+  takeoverRate: "tasks with takeover / tasks",
+};
+
 export const BenchRunRecordSchema = z.object({
   runId: z.string(),
+  benchmarkId: z.string().default("evex-cua-bench"),
+  benchmarkVersion: z.string().default("1"),
   categories: z.array(BenchCategorySchema),
   splits: z.array(BenchSplitSchema),
+  taskIds: z.array(z.string()),
+  agentIdentity: z.string(),
+  modelIdentity: ModelIdentitySchema.nullable(),
+  environmentIdentity: z.string(),
+  vmImageDigest: z.string().nullable(),
+  sourceCommit: z.string().nullable(),
+  sourceTree: z.string().nullable(),
+  evidenceDigests: z.array(z.string()),
+  methodology: z.string(),
+  formulas: z.record(z.string(), z.string()),
   metrics: BenchMetricsSchema,
   perCategory: z.record(BenchCategorySchema, BenchMetricsSchema),
-  digest: z.string().length(40),
+  digest: z.string().length(64),
   ranAt: z.string(),
   taskCount: z.number().int().min(0),
+  synthetic: z.boolean().default(false),
+  testOnly: z.boolean().default(false),
 });
 export type BenchRunRecord = z.infer<typeof BenchRunRecordSchema>;
 
@@ -166,9 +260,27 @@ function percentile(sorted: number[], p: number): number {
   return sorted[idx] as number;
 }
 
+/** Wilson 95% score interval for (successes, n). */
+export function wilsonCI(successesInput: unknown, nInput: unknown): { lo: number; hi: number } {
+  const successes = z.number().int().min(0).parse(successesInput);
+  const n = z.number().int().min(0).parse(nInput);
+  if (n === 0 || successes > n) return { lo: 0, hi: 0 };
+  const z95 = 1.96;
+  const p = successes / n;
+  const denom = 1 + (z95 * z95) / n;
+  const center = p + (z95 * z95) / (2 * n);
+  const spread = z95 * Math.sqrt((p * (1 - p)) / n + (z95 * z95) / (4 * n * n));
+  const clamp = (v: number): number => Math.max(0, Math.min(1, v));
+  return { lo: clamp((center - spread) / denom), hi: clamp((center + spread) / denom) };
+}
+
 function aggregate(results: BenchAgentResult[]): BenchMetrics {
   const tasks = results.length;
   if (tasks === 0) throw new EveError("NO_RESULTS", "Cannot aggregate metrics over zero results");
+  const successCount = results.filter((r) => r.verdict === "success").length;
+  const failureCount = results.filter((r) => r.verdict === "failure").length;
+  const inconclusiveCount = results.filter((r) => r.verdict === "inconclusive").length;
+  const invalidCount = results.filter((r) => r.verdict === "invalid").length;
   const sum = (ns: number[]): number => ns.reduce((a, b) => a + b, 0);
   const lat = results.flatMap((r) => r.latenciesMs).sort((a, b) => a - b);
   const actionTotal = sum(results.map((r) => r.actionTotal));
@@ -177,9 +289,12 @@ function aggregate(results: BenchAgentResult[]): BenchMetrics {
   const recOpp = sum(results.map((r) => r.recoveryOpportunities));
   const judged = sum(results.map((r) => r.humanJudged));
   const eff = results.map((r) => Math.min(1, (r.stepsUsed > 0 ? 8 / r.stepsUsed : 0)));
+  const ci = wilsonCI(successCount, tasks);
   return BenchMetricsSchema.parse({
     tasks,
-    taskSuccessRate: results.filter((r) => r.success).length / tasks,
+    taskSuccessRate: successCount / tasks,
+    taskSuccessCI: ci,
+    successCount, failureCount, inconclusiveCount, invalidCount,
     actionSuccessRate: actionTotal === 0 ? 0 : sum(results.map((r) => r.actionSuccesses)) / actionTotal,
     groundingAccuracy: groundedTotal === 0 ? 0 : sum(results.map((r) => r.groundedCorrect)) / groundedTotal,
     stepEfficiency: eff.reduce((a, b) => a + b, 0) / eff.length,
@@ -193,11 +308,145 @@ function aggregate(results: BenchAgentResult[]): BenchMetrics {
   });
 }
 
+// ── IndependentEvaluator ──────────────────────────────────────────────────
+// Maps a REAL executed trajectory (server-written steps) to a scored
+// result. Grounding credit is decision-point only: a pointer step counts as
+// grounded iff its own record carries server-verified grounding for the
+// frame it acted on — never best-bbox across predictions. Recovery is
+// temporal: a failure outcome, then a corrective act, then a later
+// verification-passed step. Success requires a success signal in the
+// trajectory AND a final verification-passed step; anything weaker is
+// failure or inconclusive — never success.
+
+function isFailureOutcome(o: string): boolean {
+  return /fail|error|stuck|blocked|crash|budget|unsupported|unreachable|refused/i.test(o);
+}
+
+export function evaluateBenchTask(input: {
+  task: BenchTask;
+  steps: TraceStepType[];
+  evidenceDigests: string[];
+  agentIdentity: string;
+  modelIdentity: BenchAgentResult["modelIdentity"];
+  unsafe?: boolean;
+  takeover?: boolean;
+  latenciesMs?: number[];
+  backendSynthetic?: boolean;
+}): BenchAgentResult {
+  const task = BenchTaskSchema.parse((input as { task: unknown }).task);
+  const steps = z.array(TraceStep).parse((input as { steps: unknown }).steps);
+  if (input.backendSynthetic === true) {
+    return BenchAgentResultSchema.parse({
+      verdict: "invalid", success: false,
+      actionSuccesses: 0, actionTotal: 0, groundedCorrect: 0, groundedTotal: 0,
+      stepsUsed: steps.length, predictionsCorrect: 0, predictionsTotal: 0,
+      recovered: 0, recoveryOpportunities: 0, humanAgreements: 0, humanJudged: 0,
+      unsafe: false, takeover: false, latenciesMs: input.latenciesMs ?? [], steps,
+      evidenceDigests: input.evidenceDigests, agentIdentity: input.agentIdentity,
+      modelIdentity: input.modelIdentity,
+    });
+  }
+  const pointerKinds = new Set(["click", "double_click", "move", "drag", "scroll"]);
+  let groundedCorrect = 0;
+  let groundedTotal = 0;
+  let verifiedFinal = false;
+  for (const s of steps) {
+    const t = s.selected_action?.type;
+    if (t !== undefined && pointerKinds.has(String(t))) {
+      groundedTotal += 1;
+      if (s.grounding?.verified === true) groundedCorrect += 1;
+    }
+    if (s.verification?.passed === true) verifiedFinal = true;
+  }
+  // Temporal recovery: failure → later act → later verification-passed.
+  let recoveryOpportunities = 0;
+  let recovered = 0;
+  for (let i = 0; i < steps.length; i += 1) {
+    const o = String(steps[i]?.outcome ?? "");
+    if (!isFailureOutcome(o)) continue;
+    recoveryOpportunities += 1;
+    let actedAfter = false;
+    for (let j = i + 1; j < steps.length; j += 1) {
+      const sj = steps[j] as TraceStepType;
+      if (sj.selected_action !== undefined) actedAfter = true;
+      if (actedAfter && sj.verification?.passed === true) { recovered += 1; break; }
+    }
+  }
+  const traceText = JSON.stringify(steps.map((s) => ({
+    out: s.outcome ?? "", after: s.screen_after ?? "", goal: s.goal ?? "",
+    sel: s.selected_action?.type ?? "",
+  })));
+  const signalsHit = task.successSignals.filter((sig) => traceText.includes(sig));
+  let verdict: BenchVerdict;
+  if (steps.length === 0) verdict = "inconclusive";
+  else if (signalsHit.length === task.successSignals.length && verifiedFinal) verdict = "success";
+  else if (steps.some((s) => /vm_unreachable|vm-lost|unsupported|inference/i.test(String(s.outcome ?? "")))) verdict = "inconclusive";
+  else verdict = "failure";
+  return BenchAgentResultSchema.parse({
+    verdict, success: verdict === "success",
+    actionSuccesses: steps.filter((s) => (s.outcome ?? "") === "acted").length,
+    actionTotal: steps.length,
+    groundedCorrect, groundedTotal,
+    stepsUsed: steps.length, predictionsCorrect: 0, predictionsTotal: 0,
+    recovered, recoveryOpportunities,
+    humanAgreements: 0, humanJudged: 0,
+    unsafe: input.unsafe ?? false, takeover: input.takeover ?? false,
+    latenciesMs: input.latenciesMs ?? [], steps,
+    evidenceDigests: input.evidenceDigests, agentIdentity: input.agentIdentity,
+    modelIdentity: input.modelIdentity,
+  });
+}
+
+/** Explicit test-only agent. Stamped synthetic+test_only; production
+ *  runBench() refuses it unless the run is flagged testOnly:true, and the
+ *  resulting record is stamped so production consumers reject it too. */
+export function mockAgentAdapter(seed: number, label = "mock-test-only"): BenchAgentFn {
+  const rand = prng(seed);
+  return async (task: BenchTask): Promise<BenchAgentResult> => {
+    const n = Math.max(1, Math.min(task.maxSteps, task.stepsOptimal + Math.floor(rand() * 3)));
+    const success = rand() < 0.6;
+    return BenchAgentResultSchema.parse({
+      verdict: success ? "success" : "failure",
+      success,
+      actionSuccesses: success ? n : Math.max(0, n - 1), actionTotal: n,
+      groundedCorrect: 0, groundedTotal: 0,
+      stepsUsed: n, predictionsCorrect: 0, predictionsTotal: 0,
+      recovered: 0, recoveryOpportunities: 0, humanAgreements: 0, humanJudged: 0,
+      unsafe: false, takeover: false, latenciesMs: [], steps: [],
+      evidenceDigests: [], agentIdentity: label, modelIdentity: null,
+      synthetic: true, testOnly: true,
+    });
+  };
+}
+
+/** Production consumer guard: refuse test-only/synthetic benchmark records. */
+export function isProductionRecord(rec: { synthetic?: boolean; testOnly?: boolean }): boolean {
+  return rec.synthetic !== true && rec.testOnly !== true;
+}
+
+export function assertProductionRecord(rec: { synthetic?: boolean; testOnly?: boolean; runId?: string }): void {
+  if (!isProductionRecord(rec)) {
+    throw new EveError("SYNTHETIC_BENCHMARK_REFUSED", `benchmark record ${String(rec.runId ?? "?")} is synthetic/test-only — refusing production use`);
+  }
+}
+
 export interface RunBenchOptions {
   categories?: BenchCategory[];
   splits?: BenchSplit[];
   allowHeldout?: boolean;
   runId?: string;
+  /** Explicit test-only harness flag. Mock (synthetic/test-only) agent
+   *  results are refused unless this is true — and the record is then
+   *  stamped synthetic/test_only so production consumers refuse it too. */
+  testOnly?: boolean;
+  agentIdentity?: string;
+  modelIdentity?: BenchAgentResult["modelIdentity"];
+  environmentIdentity?: string;
+  vmImageDigest?: string | null;
+  sourceCommit?: string | null;
+  sourceTree?: string | null;
+  benchmarkId?: string;
+  benchmarkVersion?: string;
 }
 
 const RunBenchOptionsSchema = z.object({
@@ -205,6 +454,15 @@ const RunBenchOptionsSchema = z.object({
   splits: z.array(BenchSplitSchema).optional(),
   allowHeldout: z.boolean().default(false),
   runId: z.string().min(1).optional(),
+  testOnly: z.boolean().default(false),
+  agentIdentity: z.string().min(1).optional(),
+  modelIdentity: ModelIdentitySchema.nullable().optional(),
+  environmentIdentity: z.string().min(1).optional(),
+  vmImageDigest: z.string().nullable().optional(),
+  sourceCommit: z.string().nullable().optional(),
+  sourceTree: z.string().nullable().optional(),
+  benchmarkId: z.string().min(1).optional(),
+  benchmarkVersion: z.string().min(1).optional(),
 });
 
 /** Execute bench tasks against an agent fn; heldout is quarantined unless explicitly allowed. */
@@ -229,8 +487,15 @@ export async function runBench(
   }
   const perTask: Array<{ task: BenchTask; result: BenchAgentResult }> = [];
   for (const task of selected) {
-    const result = await agentFn(task);
+    const raw = await agentFn(task);
+    const result = BenchAgentResultSchema.parse(raw);
     for (const s of result.steps) TraceStep.parse(s);
+    if ((result.synthetic === true || result.testOnly === true) && opts.testOnly !== true) {
+      throw new EveError(
+        "SYNTHETIC_RESULT_REFUSED",
+        `agent result for ${task.benchTaskId} is synthetic/test-only — production benchmark runs refuse mock evidence (pass testOnly:true for harness runs)`,
+      );
+    }
     perTask.push({ task, result });
   }
   const metrics = aggregate(perTask.map((p) => p.result));
@@ -239,21 +504,43 @@ export async function runBench(
     const inCat = perTask.filter((p) => p.task.category === cat).map((p) => p.result);
     if (inCat.length > 0) perCategory[cat] = aggregate(inCat);
   }
-  const digest = sha1hex(
+  const evidenceDigests = [...new Set(perTask.flatMap((p) => p.result.evidenceDigests))];
+  const modelIdentities = [...new Set(perTask.map((p) => JSON.stringify(p.result.modelIdentity ?? null)))];
+  const modelIdentity = modelIdentities.length === 1
+    ? (JSON.parse(modelIdentities[0] as string) as BenchAgentResult["modelIdentity"])
+    : null;
+  const agentIdentities = [...new Set(perTask.map((p) => p.result.agentIdentity))];
+  const digest = sha256hex(
     JSON.stringify({
       tasks: selected.map((t) => t.benchTaskId),
-      success: perTask.map((p) => (p.result.success ? 1 : 0).toString()),
+      verdicts: perTask.map((p) => p.result.verdict),
       splits,
+      evidence: evidenceDigests,
     }),
   );
+  const runId = opts.runId ?? `benchrun-${Date.now().toString(36)}`;
   return BenchRunRecordSchema.parse({
-    runId: opts.runId ?? `benchrun-${Date.now().toString(36)}`,
+    runId,
+    benchmarkId: opts.benchmarkId ?? "evex-cua-bench",
+    benchmarkVersion: opts.benchmarkVersion ?? "1",
     categories: [...new Set(selected.map((t) => t.category))] as BenchCategory[],
     splits,
+    taskIds: selected.map((t) => t.benchTaskId),
+    agentIdentity: opts.agentIdentity ?? (agentIdentities.length === 1 ? (agentIdentities[0] as string) : `mixed:${agentIdentities.length}`),
+    modelIdentity: opts.modelIdentity ?? modelIdentity,
+    environmentIdentity: opts.environmentIdentity ?? "unknown",
+    vmImageDigest: opts.vmImageDigest ?? null,
+    sourceCommit: opts.sourceCommit ?? null,
+    sourceTree: opts.sourceTree ?? null,
+    evidenceDigests,
+    methodology: "RealAgentAdapter executes each task against a real session/VM; IndependentEvaluator scores server-written trace evidence (decision-point grounding, temporal recovery, signal + verification success rule). Mock adapters are refused unless testOnly:true.",
+    formulas: METRIC_FORMULAS,
     metrics,
     perCategory,
     digest,
     ranAt: nowIso(),
     taskCount: selected.length,
+    synthetic: opts.testOnly,
+    testOnly: opts.testOnly,
   });
 }

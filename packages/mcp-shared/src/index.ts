@@ -187,6 +187,8 @@ export const BenchmarkBody = z.object({
   cases: z.array(z.string().min(1).max(128)).max(50).optional(),
   size: z.number().int().min(1).max(200).default(6),
   seed: Seed,
+  agent: z.enum(["real", "mock-test-only"]).optional(),
+  testOnly: z.boolean().optional(),
 });
 export type BenchmarkBody = z.infer<typeof BenchmarkBody>;
 

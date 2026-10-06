@@ -230,10 +230,19 @@ describe("api hardening", () => {
   });
 
   it("judgment duplicates on (stepId, reviewer) return 409", async () => {
+    // Judgments bind to real, owned steps: unknown steps fail closed (404).
+    const sess = await createSession(MASTER, "judgment dedupe case");
+    const act = await api("POST", `/v1/computer/${sess}/act`, MASTER, { type: "wait", ms: 10, confidence: 0.9 });
+    assert.equal(act.status, 200);
+    const tr = await api("GET", `/v1/trace/${sess}`, MASTER);
+    const steps = tr.json.steps as Array<{ step_id: string }>;
+    assert.ok(steps.length > 0);
     const body = {
-      stepId: "step-dedupe-1", reviewer: "r1",
+      stepId: String(steps[0]?.step_id), sessionId: sess, reviewer: "r1",
       reasonable: true, targetCorrect: true, understandable: true, expected: true, recoveryOk: true,
     };
+    const unknown = await api("POST", "/v1/judgments", MASTER, { ...body, stepId: "step-ghost-xyz" });
+    assert.equal(unknown.status, 404);
     const first = await api("POST", "/v1/judgments", MASTER, body);
     assert.equal(first.status, 201);
     const dup = await api("POST", "/v1/judgments", MASTER, body);
@@ -273,6 +282,17 @@ describe("api hardening", () => {
 
   it("persisted docs survive a restart (clear + hydrate)", async () => {
     const sess = await createSession(MASTER, "restart case");
+    const act = await api("POST", `/v1/computer/${sess}/act`, MASTER, { type: "wait", ms: 10, confidence: 0.9 });
+    assert.equal(act.status, 200);
+    const tr = await api("GET", `/v1/trace/${sess}`, MASTER);
+    const steps = tr.json.steps as Array<{ step_id: string }>;
+    assert.ok(steps.length > 0);
+    const stepId = String(steps[0]?.step_id);
+    const first = await api("POST", "/v1/judgments", MASTER, {
+      stepId, sessionId: sess, reviewer: "r-restart",
+      reasonable: true, targetCorrect: true, understandable: true, expected: true, recoveryOk: true,
+    });
+    assert.equal(first.status, 201);
     __clearMemory();
     const counts = hydrateFromDisk();
     assert.ok(counts.sessions >= 1, `expected hydrated sessions, got ${JSON.stringify(counts)}`);
@@ -281,7 +301,7 @@ describe("api hardening", () => {
     assert.equal(got.json.status, "RUNNING");
     // Dedupe state also survives: the earlier judgment is still a duplicate.
     const dup = await api("POST", "/v1/judgments", MASTER, {
-      stepId: "step-dedupe-1", reviewer: "r1",
+      stepId, sessionId: sess, reviewer: "r-restart",
       reasonable: true, targetCorrect: true, understandable: true, expected: true, recoveryOk: true,
     });
     assert.equal(dup.status, 409);
