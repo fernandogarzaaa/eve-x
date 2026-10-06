@@ -195,7 +195,13 @@ export async function readGuestSecret(workdir: string): Promise<string | null> {
 
 /** Default NoCloud user-data: locked guest account, qemu-guest-agent,
  *  openssh, and the per-VM EVE agent secret written for the in-guest
- *  runtime. The secret travels only inside the seed ISO, never in logs. */
+ *  runtime. The secret travels only inside the seed ISO, never in logs.
+ *
+ *  Privilege separation: the agent account (eveagent) has NO sudo — the
+ *  in-guest workload runs unprivileged. Privileged guest maintenance
+ *  (display mode, power, gdm config) runs through the authenticated root
+ *  QGA channel (host-side VmManager.guestExecSync), never through the
+ *  agent account. There is intentionally no NOPASSWD blanket grant. */
 export function defaultSeedUserData(input: { hostname: string; sshKey?: string; guestSecret: string }): string {
   const keyBlock = input.sshKey
     ? `    ssh_authorized_keys:\n      - ${input.sshKey}\n`
@@ -205,7 +211,7 @@ hostname: ${input.hostname}
 manage_etc_hosts: true
 users:
   - name: eveagent
-    sudo: ALL=(ALL) NOPASSWD:ALL
+    sudo: false
     shell: /bin/bash
     lock_passwd: true
 ${keyBlock}packages:
