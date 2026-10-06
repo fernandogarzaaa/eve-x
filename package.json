@@ -17,6 +17,7 @@
     "pretest": "node scripts/gen-release-identity.mjs && tsc -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
     "test:all": "node scripts/run-tests.mjs",
+    "ml:test": "node scripts/ml-selftest.mjs",
     "doctor": "node dist/apps/cli/src/index.js doctor",
     "server": "node dist/apps/api/src/index.js",
     "worker": "node dist/apps/worker/src/index.js",

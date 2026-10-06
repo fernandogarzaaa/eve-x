@@ -16,7 +16,8 @@ let base = "";
 let srv: Server | null = null;
 let inferSrv: Server | null = null;
 let inferBase = "";
-let inferBehavior: "ok" | "http500" | "noaction" | "slow" = "ok";
+let inferBehavior: "ok" | "http500" | "noaction" | "slow" | "auth" | "degraded" = "ok";
+let lastInferHeaders: Record<string, string | string[] | undefined> = {};
 let lastInferBody: Record<string, unknown> | null = null;
 const MASTER = "test-suggest-master-xyz";
 const SECRET = "test-suggest-hmac-abc";
@@ -36,6 +37,10 @@ before(async () => {
   process.env["EVEX_AUTH_TOKEN"] = MASTER;
   process.env["EVEX_TOKEN_SECRET"] = SECRET;
   process.env["VM_BACKEND"] = "dev-framebuffer";
+  process.env["EVEX_MAX_VMS_PER_TENANT"] = "64";
+  process.env["EVEX_MAX_TOTAL_VMS"] = "512";
+  process.env["EVEX_MAX_CPU_PER_TENANT"] = "256";
+  process.env["EVEX_MAX_MEM_MB_PER_TENANT"] = "524288";
   // Stub inference plane: behavior scripted per test.
   inferSrv = createServer((req, res) => {
     if (req.url !== "/infer" || req.method !== "POST") {
@@ -43,6 +48,7 @@ before(async () => {
       res.end("{}");
       return;
     }
+    lastInferHeaders = { ...(req.headers as Record<string, string | string[] | undefined>) };
     let text = "";
     req.on("data", (c) => { text += String(c); });
     req.on("end", () => {
@@ -52,8 +58,18 @@ before(async () => {
         res.end(JSON.stringify(obj));
       };
       if (inferBehavior === "http500") { send(500, { error: "boom" }); return; }
+      if (inferBehavior === "auth") { send(401, { error: "unauthorized" }); return; }
       if (inferBehavior === "noaction") { send(200, { model_id: "x" }); return; }
       if (inferBehavior === "slow") return; // never reply: client must time out
+      if (inferBehavior === "degraded") {
+        send(200, {
+          action: { type: "move", to: { x: 640, y: 400 }, confidence: 0.2, intent: "recenter" },
+          action_source: "heuristic-v1", model_id: "heuristic-v1", model_version: "0",
+          model_sha256: null, architecture: null, device: "cpu",
+          latency_ms: 1.1, degraded: true, weights_verified: false,
+        });
+        return;
+      }
       send(200, {
         action: { type: "click", to: { x: 960, y: 540 }, confidence: 0.77, intent: "click taskbar" },
         model_id: "stub-weights-1", latency_ms: 3.5, degraded: false, frame_id: lastInferBody?.["frame_id"],
@@ -109,11 +125,13 @@ describe("inference suggest", () => {
     assert.equal(r.status, 404);
   });
 
-  it("502 when inference errors, answers empty, times out, or is down", async () => {
+  it("502 when inference errors, answers empty, times out, is down, or refuses auth", async () => {
     const sid = await createSession();
     inferBehavior = "http500";
     assert.equal((await api("POST", `/v1/computer/${sid}/suggest`)).status, 502);
     inferBehavior = "noaction";
+    assert.equal((await api("POST", `/v1/computer/${sid}/suggest`)).status, 502);
+    inferBehavior = "auth";
     assert.equal((await api("POST", `/v1/computer/${sid}/suggest`)).status, 502);
     inferBehavior = "slow";
     assert.equal((await api("POST", `/v1/computer/${sid}/suggest`)).status, 502);
@@ -121,6 +139,29 @@ describe("inference suggest", () => {
     process.env["INFERENCE_URL"] = "http://127.0.0.1:9";
     assert.equal((await api("POST", `/v1/computer/${sid}/suggest`)).status, 502);
     process.env["INFERENCE_URL"] = inferBase;
+  });
+
+  it("degraded heuristic answers pass through labeled (never upgraded)", async () => {
+    inferBehavior = "degraded";
+    const sid = await createSession();
+    const r = await api("POST", `/v1/computer/${sid}/suggest`);
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json["model_id"], "heuristic-v1");
+    assert.equal(r.json["degraded"], true);
+    assert.equal(r.json["model_sha256"], null);
+  });
+
+  it("forwards the inference bearer token when configured", async () => {
+    inferBehavior = "ok";
+    process.env["EVEX_INFERENCE_TOKEN"] = "plane-secret-xyz";
+    try {
+      const sid = await createSession();
+      const r = await api("POST", `/v1/computer/${sid}/suggest`);
+      assert.equal(r.status, 200, JSON.stringify(r.json));
+      assert.equal(lastInferHeaders["authorization"], "Bearer plane-secret-xyz");
+    } finally {
+      delete process.env["EVEX_INFERENCE_TOKEN"];
+    }
   });
 
   it("suggestion never advances the trajectory", async () => {
