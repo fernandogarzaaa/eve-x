@@ -22,7 +22,7 @@ export type SkillPlatform = keyof typeof PLATFORM_DIRS;
 export const SKILL_PLATFORMS = Object.keys(PLATFORM_DIRS) as SkillPlatform[];
 
 export const SkillManifest = z.object({
-  name: z.string().min(1).max(128),
+  name: z.string().min(1).max(128).regex(/^[a-z0-9-]+$/, "skill name must be lowercase alphanumeric + hyphens (and match its directory)"),
   version: z.string().min(1).max(64),
   description: z.string().min(1).max(2048),
   entrypoint: z.string().min(1).max(256).default("SKILL.md"),
@@ -31,6 +31,35 @@ export const SkillManifest = z.object({
   mcpVersion: z.string().min(1).default("mcp/1"),
 });
 export type SkillManifest = z.infer<typeof SkillManifest>;
+
+/** Agent-Skills frontmatter: the entrypoint must open with a YAML block
+ *  carrying at least name + description, with name matching the manifest
+ *  (and therefore the directory). Progressive disclosure (references/),
+ *  relative links, and a non-monolithic body are checked by convention
+ *  tests in tests/skill-compliance.test.ts. */
+export const SkillFrontmatterSchema = z.object({
+  name: z.string().min(1).max(128).regex(/^[a-z0-9-]+$/),
+  description: z.string().min(1).max(2048),
+}).catchall(z.unknown());
+export type SkillFrontmatter = z.infer<typeof SkillFrontmatterSchema>;
+
+export function parseFrontmatter(body: string): { frontmatter: SkillFrontmatter; rest: string } {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(body);
+  if (!m) throw new Error("entrypoint lacks YAML frontmatter (--- name/description block required)");
+  const raw: Record<string, unknown> = {};
+  for (const line of (m[1] ?? "").split(/\r?\n/)) {
+    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
+    if (kv) {
+      const key = kv[1] as string;
+      let val = (kv[2] ?? "").trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      raw[key] = val;
+    }
+  }
+  return { frontmatter: SkillFrontmatterSchema.parse(raw), rest: body.slice(m[0].length) };
+}
 
 export interface DiscoveryEntry {
   name: string;
@@ -158,6 +187,25 @@ export function discoveryCheck(installedPath: string): { visible: boolean; entry
   }
   const entryAbs = join(installedPath, manifest.entrypoint);
   if (!existsSync(entryAbs)) problems.push(`entrypoint missing: ${manifest.entrypoint}`);
+  // Name must match the installed directory (spec compliance).
+  const dirName = installedPath.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "";
+  if (dirName !== manifest.name) {
+    problems.push(`manifest name ${JSON.stringify(manifest.name)} does not match directory ${JSON.stringify(dirName)}`);
+  }
+  // Entrypoint frontmatter must carry name + description agreeing with the manifest.
+  if (existsSync(entryAbs)) {
+    try {
+      const { frontmatter } = parseFrontmatter(readFileSync(entryAbs, "utf8"));
+      if (frontmatter.name !== manifest.name) {
+        problems.push(`frontmatter name ${JSON.stringify(frontmatter.name)} disagrees with manifest ${JSON.stringify(manifest.name)}`);
+      }
+      if (!frontmatter.description || frontmatter.description.length < 10) {
+        problems.push("frontmatter description is missing or vacuous");
+      }
+    } catch (err: unknown) {
+      problems.push(`frontmatter invalid: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   // Infer platform from the path suffix.
   let platform: SkillPlatform = "opencode";
   for (const p of SKILL_PLATFORMS) {

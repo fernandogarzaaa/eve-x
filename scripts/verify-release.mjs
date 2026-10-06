@@ -48,6 +48,12 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
   check("manifest mcp server matches", String(m.mcp?.server ?? "") === `eve-x ${version}`, `got ${m.mcp?.server}`);
   const shared = read("packages/mcp-shared/src/index.ts").match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1];
   check("manifest toolSurface == MCP_TOOL_VERSION", m.mcp?.toolSurface === shared, `manifest=${m.mcp?.toolSurface} src=${shared}`);
+  try {
+    const installedSdk = JSON.parse(read("node_modules/@modelcontextprotocol/sdk/package.json")).version;
+    check("manifest mcp.sdk == installed SDK", m.mcp?.sdk === installedSdk, `manifest=${m.mcp?.sdk} installed=${installedSdk}`);
+  } catch {
+    check("manifest mcp.sdk == installed SDK", m.mcp?.sdk === "unknown", "SDK not installed; manifest must say unknown");
+  }
   const mcpSrc = read("apps/mcp/src/index.ts");
   const counted = [...mcpSrc.matchAll(/registerTool\("([^"]+)"/g)].map((x) => x[1]);
   check("manifest toolCount matches source", m.mcp?.toolCount === counted.length, `manifest=${m.mcp?.toolCount} src=${counted.length}`);

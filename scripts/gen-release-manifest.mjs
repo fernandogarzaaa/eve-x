@@ -21,6 +21,11 @@ const tools = [...mcpSrc.matchAll(/registerTool\("([^"]+)"/g)].map((m) => m[1]);
 const mcpServerVersion = mcpSrc.match(/new\s+McpServer\(\{\s*name:\s*"eve-x",\s*version:\s*"([^"]+)"/)?.[1] ?? "unknown";
 const sharedSrc = readFileSync(join(ROOT, "packages", "mcp-shared", "src", "index.ts"), "utf8");
 const toolSurface = sharedSrc.match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1] ?? "unknown";
+// SDK line, measured from the installed dependency (never asserted).
+let sdkVersion = "unknown";
+try {
+  sdkVersion = JSON.parse(readFileSync(join(ROOT, "node_modules", "@modelcontextprotocol", "sdk", "package.json"), "utf8")).version;
+} catch { /* uninstalled tree: recorded as unknown */ }
 // Guest base: an in-tree bake manifest when the bake host published one;
 // otherwise an explicit UNMANIFESTED marker (never a stale digest).
 let guestManifest = null;
@@ -71,7 +76,7 @@ const manifest = {
     registry: "filesystem-first (DATA_DIR/models), gated promotion, sha256 checkpoints",
     smokePath: "stdlib-only selftest (ml/inference/selftest.py; torch paths via stub injection)",
   },
-  mcp: { server: `eve-x ${mcpServerVersion}`, toolSurface, tools, toolCount: tools.length },
+  mcp: { server: `eve-x ${mcpServerVersion}`, toolSurface, sdk: sdkVersion, tools, toolCount: tools.length },
   skills: { contract: "AGENT_SKILL.md", integrations: ["claude-code", "codex", "generic", "hermes", "openclaw", "opencode", "pi"], installerTargets: ["claude-code", "codex", "opencode", "cursor", "windsurf"] },
 };
 writeFileSync(join(ROOT, "release-manifest.json"), JSON.stringify(manifest, null, 2) + "\n");

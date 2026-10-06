@@ -30,7 +30,7 @@
     "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs && node scripts/verify-release.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "express": "^4.19.2",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
