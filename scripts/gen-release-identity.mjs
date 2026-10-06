@@ -3,8 +3,14 @@
 // build/typecheck/test-compile. The release identity (product/version/
 // commit/tree/buildTime/sourceDigest) is baked into the build so CLI, API,
 // doctor, and /version all report the exact source revision.
-// Fails closed when the tree is dirty unless EVEX_ALLOW_DIRTY_BUILD=1
-// (dev only; dirty builds are stamped dirty:true and must never release).
+//
+// Honesty rules (the release command owns release invariants; no operator
+// memory required):
+// - commit/tree are ALWAYS measured from HEAD. There is no override knob:
+//   a baked identity that disagrees with its own source tree is a lie, and
+//   a commit-override env var would put that lie one export away.
+// - A dirty tree FAILS CLOSED unless EVEX_ALLOW_DIRTY_BUILD=1 (dev only).
+//   Dirty builds are stamped dirty:true and must never release.
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -18,7 +24,7 @@ const sh = (cmd) => {
 };
 
 const version = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version;
-const commit = process.env["EVEX_RELEASE_COMMIT"] || sh("git rev-parse HEAD") || "unknown";
+const commit = sh("git rev-parse HEAD") || "unknown";
 // NOTE: the revision is double-quoted: cmd.exe treats ^ as an escape and
 // would otherwise turn HEAD^{tree} into HEAD{tree}.
 const tree = sh('git rev-parse "HEAD^{tree}"') || "unknown";
@@ -26,8 +32,8 @@ const status = sh("git status --porcelain");
 const dirty = status.length > 0;
 const sourceDigest = createHash("sha256").update(`commit:${commit}\ntree:${tree}\nstatus:\n${status}`).digest("hex");
 
-if (dirty && process.env["EVEX_ALLOW_DIRTY_BUILD"] !== "1" && process.env["EVEX_RELEASE_STRICT"] === "1") {
-  console.error("release-identity: dirty tree refused (EVEX_RELEASE_STRICT=1):\n" + status.slice(0, 2000));
+if (dirty && process.env["EVEX_ALLOW_DIRTY_BUILD"] !== "1") {
+  console.error("release-identity: dirty tree refused (set EVEX_ALLOW_DIRTY_BUILD=1 for dev builds only):\n" + status.slice(0, 2000));
   process.exit(1);
 }
 

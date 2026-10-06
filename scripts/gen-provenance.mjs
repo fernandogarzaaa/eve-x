@@ -21,7 +21,7 @@ const prov = {
     commit: sh("git rev-parse HEAD"),
     tree: sh('git rev-parse "HEAD^{tree}"'),
     dirty: sh("git status --porcelain").length > 0,
-    tag: sh("git describe --tags --exact-match 2>nul") || sh("git describe --tags --exact-match"),
+    tag: sh("git describe --tags --exact-match") || null,
   },
   generatedAt: new Date().toISOString(),
   dependencies: {

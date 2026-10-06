@@ -17,6 +17,16 @@ const shaFile = (p) => createHash("sha256").update(readFileSync(join(ROOT, p))).
 // MCP tool inventory straight from source (no stale definitions).
 const mcpSrc = readFileSync(join(ROOT, "apps", "mcp", "src", "index.ts"), "utf8");
 const tools = [...mcpSrc.matchAll(/registerTool\("([^"]+)"/g)].map((m) => m[1]);
+// MCP server + tool-surface versions straight from source (never hardcoded).
+const mcpServerVersion = mcpSrc.match(/new\s+McpServer\(\{\s*name:\s*"eve-x",\s*version:\s*"([^"]+)"/)?.[1] ?? "unknown";
+const sharedSrc = readFileSync(join(ROOT, "packages", "mcp-shared", "src", "index.ts"), "utf8");
+const toolSurface = sharedSrc.match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1] ?? "unknown";
+// Guest base: an in-tree bake manifest when the bake host published one;
+// otherwise an explicit UNMANIFESTED marker (never a stale digest).
+let guestManifest = null;
+try {
+  guestManifest = JSON.parse(readFileSync(join(ROOT, "images", "guest-manifest.json"), "utf8"));
+} catch { /* no published bake manifest in-tree */ }
 
 const manifest = {
   product: "eve-x",
@@ -43,21 +53,25 @@ const manifest = {
       "evex-inference:1.0.3": "sha256:6467745333ac25ce9f053650b6374ca3c25bf22b70801065221a3fbb7409cad2",
     },
   },
-  guest: {
-    image: "eve-desktop-xorg.qcow2",
-    imageSha256: "38afb22b948e61c11fa044204a2cf2372bbb1ba80fb94075dcac9d45ae5b4249",
-    baseImage: "eve-desktop-noble.qcow2",
-    baseSha256: "e19b77ba669ef5e813213a145a99efeeb3d4f58a0fc220dad2f9b4891679273b",
+  guest: guestManifest ?? {
+    image: "eve-desktop-autologin.qcow2",
+    imageSha256: null,
+    status: "UNMANIFESTED: no bake manifest published in-tree (images/guest-manifest.json missing) — production boots the sealed base per EVEX_BASE_IMAGE_SHA256, not this file",
     sealedReadonly: true,
     reproducibility: "logical (sealed base digest + bake manifest); not claimed bit-for-bit",
   },
   model: {
-    // 1.0.0 ships the evaluator/registry + stdlib smoke path; release
-    // checkpoints are recorded in the registry with digests at promotion.
+    // ModelRuntime (ml/inference/server.py): weights are verified
+    // (existence, size, sha256, container format, torch load + parameter
+    // census) before ready=true; served actions come from the explicit
+    // heuristic-v1 policy (always degraded=true) until a model-forward
+    // action path exists. Release checkpoints are recorded in the
+    // registry with digests at promotion.
+    runtime: "ModelRuntime (verify-then-load; explicit heuristic fallback only)",
     registry: "filesystem-first (DATA_DIR/models), gated promotion, sha256 checkpoints",
-    smokePath: "stdlib-only (no torch required)",
+    smokePath: "stdlib-only selftest (ml/inference/selftest.py; torch paths via stub injection)",
   },
-  mcp: { server: "eve-x 1.0.0", toolSurface: "mcp/1", tools, toolCount: tools.length },
+  mcp: { server: `eve-x ${mcpServerVersion}`, toolSurface, tools, toolCount: tools.length },
   skills: { contract: "AGENT_SKILL.md", integrations: ["claude-code", "codex", "generic", "hermes", "openclaw", "opencode", "pi"], installerTargets: ["claude-code", "codex", "opencode", "cursor", "windsurf"] },
 };
 writeFileSync(join(ROOT, "release-manifest.json"), JSON.stringify(manifest, null, 2) + "\n");

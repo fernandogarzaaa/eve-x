@@ -25,8 +25,9 @@
     "cli": "node dist/apps/cli/src/index.js",
     "benchmark": "node dist/apps/cli/src/index.js benchmark run",
     "security:audit": "node scripts/security-audit.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "package": "node scripts/package-release.mjs",
-    "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs"
+    "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs && node scripts/verify-release.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
