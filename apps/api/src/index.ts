@@ -202,6 +202,13 @@ function safeEq(a: string, b: string): boolean {
   return timingSafeEqual(ba, bb);
 }
 
+function executionMode(): "development" | "test" | "production" {
+  const raw = (process.env["EVEX_MODE"] ?? "").trim().toLowerCase();
+  if (raw === "production" || raw === "prod") return "production";
+  if (raw === "test" || raw === "testing" || raw === "ci") return "test";
+  return "development";
+}
+
 function localAuth(req: Request): Ctx | null {
   const master = process.env["EVEX_AUTH_TOKEN"] ?? "";
   const raw = String(req.headers["authorization"] ?? "");
@@ -212,9 +219,44 @@ function localAuth(req: Request): Ctx | null {
     return null;
   }
   if (!master) {
-    // Security package absent + no master token: scoped dev operator, fail closed.
+    // Security package absent + no master token: scoped dev operator ONLY
+    // in development mode. Test/production fail closed (401 downstream).
+    if (executionMode() !== "development") return null;
     return { tenant: "default", user: "dev-anon", session: "dev", role: "operator", capabilities: [...FALLBACK_OPERATOR_CAPS], scopes: ["dev"] };
   }
+  if (token && safeEq(token, master)) {
+    return { tenant: "default", user: "master", session: "master", role: "admin", capabilities: ["*"], scopes: ["*"] };
+  }
+  return null;
+}
+
+/** Verify a WebSocket upgrade request: bearer token via Authorization
+ *  header or ?token= query (the WS path performs the same auth as HTTP —
+ *  an HTTP 401 never becomes a WS hello). */
+function upgradeAuth(req: { headers: Record<string, string | string[] | undefined>; url?: string }): Ctx | null {
+  const fromQuery = (() => {
+    try {
+      const u = new URL(req.url ?? "/", "http://ws");
+      const t = u.searchParams.get("token") ?? u.searchParams.get("access_token") ?? "";
+      return t.trim();
+    } catch {
+      return "";
+    }
+  })();
+  const headers = { ...(req.headers as Record<string, string | string[] | undefined>) };
+  if (fromQuery && !headers["authorization"]) headers["authorization"] = `Bearer ${fromQuery}`;
+  if (sec) {
+    const ctx = sec.authFromHeaders(headers);
+    if (ctx) return ctx as unknown as Ctx;
+    return null;
+  }
+  const master = process.env["EVEX_AUTH_TOKEN"] ?? "";
+  if (!master) {
+    if (executionMode() !== "development") return null;
+    return { tenant: "default", user: "dev-anon", session: "dev", role: "operator", capabilities: [...FALLBACK_OPERATOR_CAPS], scopes: ["dev"] };
+  }
+  const raw = String(headers["authorization"] ?? "");
+  const token = raw.replace(/^Bearer\s+/i, "").trim();
   if (token && safeEq(token, master)) {
     return { tenant: "default", user: "master", session: "master", role: "admin", capabilities: ["*"], scopes: ["*"] };
   }
@@ -2522,6 +2564,37 @@ export async function startApi(port?: number): Promise<Server> {
   } else {
     log("info", "persistence: file-primary (EVEX_REQUIRE_SERVICES unset)");
   }
+  // Production boot gate (fail closed): EVEX_MODE=production refuses to
+  // serve unless the full production posture evaluates production-safe
+  // (strong token, services reachable, quotas, safe backend, TLS sense).
+  // No silent dev fallback, no known default credentials, ever.
+  if (executionMode() === "production") {
+    if (!sec) {
+      throw new Error("production startup refused: security package unavailable (no fail-open dev auth)");
+    }
+    const statuses = await probeServices();
+    const required = (process.env["EVEX_REQUIRE_SERVICES"] ?? "")
+      .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+      .map((s) => (s === "minio" || s === "s3" || s === "garage" ? "object" : s));
+    const maxSessions = process.env["EVEX_MAX_SESSIONS"] !== undefined ? Number(process.env["EVEX_MAX_SESSIONS"]) : undefined;
+    const verdict = sec.evaluateProduction({
+      authToken: process.env["EVEX_AUTH_TOKEN"] ?? "",
+      corsOrigins: process.env["EVEX_CORS_ORIGINS"] ?? "",
+      requireServices: required,
+      serviceStatus: statuses,
+      maxSessions: Number.isFinite(maxSessions) ? maxSessions : undefined,
+      vmBackend: process.env["VM_BACKEND"] ?? "auto",
+      publicUrl: process.env["EVEX_PUBLIC_URL"] ?? "",
+      objectEndpoint: process.env["OBJECT_ENDPOINT"] ?? "",
+    });
+    for (const f of verdict.findings) {
+      log(f.status === "fail" ? "error" : "info", `production gate: ${f.name}=${f.status}`, { detail: f.detail });
+    }
+    if (verdict.verdict !== "production-safe") {
+      throw new Error("production startup refused: configuration is development-only (see production gate findings above)");
+    }
+    log("info", "production gate passed: production-safe posture");
+  }
   const app = buildApp();
   const srv = createServer(app);
   srv.headersTimeout = 60_000;
@@ -2534,6 +2607,11 @@ export async function startApi(port?: number): Promise<Server> {
   srv.on("upgrade", (req, socket, head) => {
     const url = String(req.url ?? "");
     if (url === "/v1/stream" || url.startsWith("/v1/stream?")) {
+      const ctx = upgradeAuth(req as unknown as { headers: Record<string, string | string[] | undefined>; url?: string });
+      if (!ctx) {
+        try { socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         ws.send(JSON.stringify({ kind: "hello", at: nowIso(), hint: "connect to /v1/stream/:sessionId" }));
       });
@@ -2544,14 +2622,30 @@ export async function startApi(port?: number): Promise<Server> {
       try { socket.destroy(); } catch { /* ignore */ }
       return;
     }
+    // Session streams require the same auth as HTTP + ownership of the
+    // session. Unknown sessions fail closed before the upgrade completes.
+    const ctx = upgradeAuth(req as unknown as { headers: Record<string, string | string[] | undefined>; url?: string });
+    if (!ctx) {
+      try { socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
+    const sessionId = m[1] as string;
+    const s = sessions.get(sessionId);
+    if (!s) {
+      try { socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
+    if (s.owner && s.owner !== `${ctx.tenant}:${ctx.user}` && ctx.role !== "admin" && !(ctx.capabilities.includes("*"))) {
+      try { socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const sessionId = m[1] as string;
       let set = streams.get(sessionId);
       if (!set) { set = new Set(); streams.set(sessionId, set); }
       set.add(ws);
       ws.send(JSON.stringify({ kind: "hello", sessionId, at: nowIso() }));
-      const s = sessions.get(sessionId);
-      if (s) ws.send(JSON.stringify(syntheticFrame(sessionId, s.seq)));
+      const cur0 = sessions.get(sessionId);
+      if (cur0) ws.send(JSON.stringify(syntheticFrame(sessionId, cur0.seq)));
       const timer = setInterval(() => {
         try {
           const cur = sessions.get(sessionId);

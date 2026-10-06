@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync, accessSync, constants as fsConstants } from "node:fs";
 import { join, resolve } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { createConnection } from "node:net";
 import { totalmem } from "node:os";
 
@@ -335,10 +336,15 @@ async function main(): Promise<number> {
         mkdirSync(join(dir, "images"), { recursive: true });
         const envPath = join(dir, ".env");
         if (!existsSync(envPath)) {
-          let tpl = "PORT=8080\nEVEX_AUTH_TOKEN=change-me\nDATA_DIR=./data\n";
+          // Generated credentials, never weak placeholders: a fresh random
+          // bearer token is minted per init. Production still requires
+          // explicit review (see doctor --production).
+          const fresh = randomBytes(32).toString("hex");
+          let tpl = `PORT=8080\nEVEX_AUTH_TOKEN=${fresh}\nDATA_DIR=./data\n`;
           try {
-            tpl = readFileSync(join(ROOT, ".env.example"), "utf8");
-          } catch { /* keep default template */ }
+            const example = readFileSync(join(ROOT, ".env.example"), "utf8");
+            tpl = example.replace(/^EVEX_AUTH_TOKEN=.*$/m, `EVEX_AUTH_TOKEN=${fresh}`);
+          } catch { /* keep generated template */ }
           writeFileSync(envPath, tpl, "utf8");
         }
         out(`initialized at ${dir}`);

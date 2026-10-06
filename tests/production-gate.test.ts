@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { evaluateProduction } from "../packages/security/src/index.js";
+import { evaluateProduction, authFromHeaders, executionMode } from "../packages/security/src/index.js";
+import { startApi } from "../apps/api/src/index.js";
 
 const reachable = (detail = "ok"): { reachable: boolean; detail: string } => ({ reachable: true, detail });
 const down = (detail = "refused"): { reachable: boolean; detail: string } => ({ reachable: false, detail });
@@ -72,5 +73,67 @@ describe("production configuration gate", () => {
       maxSessions: 8, publicUrl: "http://localhost:8080",
     });
     assert.ok(r.findings.some((f) => f.name === "tls" && f.status === "pass"));
+  });
+});
+
+describe("execution modes fail closed", () => {
+  it("parses EVEX_MODE explicitly (no silent production)", () => {
+    const prev = process.env["EVEX_MODE"];
+    try {
+      delete process.env["EVEX_MODE"];
+      assert.equal(executionMode(), "development");
+      process.env["EVEX_MODE"] = "production";
+      assert.equal(executionMode(), "production");
+      process.env["EVEX_MODE"] = "prod";
+      assert.equal(executionMode(), "production");
+      process.env["EVEX_MODE"] = "test";
+      assert.equal(executionMode(), "test");
+      process.env["EVEX_MODE"] = "ci";
+      assert.equal(executionMode(), "test");
+      process.env["EVEX_MODE"] = "weird";
+      assert.equal(executionMode(), "development");
+    } finally {
+      if (prev === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prev;
+    }
+  });
+
+  it("dev-anon fallback exists only in development", () => {
+    const prevMode = process.env["EVEX_MODE"];
+    const prevToken = process.env["EVEX_AUTH_TOKEN"];
+    try {
+      delete process.env["EVEX_AUTH_TOKEN"];
+      delete process.env["EVEX_MODE"];
+      const dev = authFromHeaders({});
+      assert.ok(dev !== null && dev.user === "dev-anon", "development keeps zero-config local dev");
+      process.env["EVEX_MODE"] = "test";
+      assert.equal(authFromHeaders({}), null, "test mode must not mint dev-anon");
+      process.env["EVEX_MODE"] = "production";
+      assert.equal(authFromHeaders({}), null, "production must fail closed with no token");
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+      if (prevToken === undefined) delete process.env["EVEX_AUTH_TOKEN"];
+      else process.env["EVEX_AUTH_TOKEN"] = prevToken;
+    }
+  });
+
+  it("startApi refuses production boot with weak config", async () => {
+    const prevMode = process.env["EVEX_MODE"];
+    const prevToken = process.env["EVEX_AUTH_TOKEN"];
+    const prevBackend = process.env["VM_BACKEND"];
+    try {
+      process.env["EVEX_MODE"] = "production";
+      delete process.env["EVEX_AUTH_TOKEN"];
+      process.env["VM_BACKEND"] = "dev-framebuffer";
+      await assert.rejects(startApi(0), /production startup refused/);
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+      if (prevToken === undefined) delete process.env["EVEX_AUTH_TOKEN"];
+      else process.env["EVEX_AUTH_TOKEN"] = prevToken;
+      if (prevBackend === undefined) delete process.env["VM_BACKEND"];
+      else process.env["VM_BACKEND"] = prevBackend;
+    }
   });
 });

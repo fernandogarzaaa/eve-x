@@ -12,7 +12,7 @@ export MSYS_NO_PATHCONV=1
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME="${GARAGE_RUNTIME_DIR:-$HERE/.runtime-qual}"
 BUCKET="${GARAGE_BUCKET:-evex}"
-IMAGE="${GARAGE_IMAGE:-dxflrs/garage:v2.0.0}"
+IMAGE="${GARAGE_IMAGE:-dxflrs/garage:v2.0.0@sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9}"
 
 if [ "${1:-}" = "--clean" ]; then
   docker rm -f evex-garage 2>/dev/null || true

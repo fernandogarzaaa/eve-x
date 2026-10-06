@@ -240,6 +240,20 @@ function tenantOf(): string {
   return process.env["EVEX_TENANT"] ?? "default";
 }
 
+// ── Explicit execution modes ─────────────────────────────────────────────
+// development (default): local ergonomics, dev-anon fallback allowed.
+// test: hermetic suites; no dev-anon fallback (tests mint tokens).
+// production: fail closed — no dev-anon fallback, weak/missing secrets
+// refuse startup (see evaluateProduction + the API boot gate).
+export type ExecutionMode = "development" | "test" | "production";
+
+export function executionMode(): ExecutionMode {
+  const raw = (process.env["EVEX_MODE"] ?? "").trim().toLowerCase();
+  if (raw === "production" || raw === "prod") return "production";
+  if (raw === "test" || raw === "testing" || raw === "ci") return "test";
+  return "development";
+}
+
 export function verifyToken(raw: string): AuthContext | null {
   const token = (raw ?? "").trim().replace(/^Bearer\s+/i, "");
   if (!token) return null;
@@ -277,6 +291,10 @@ export function extractBearer(headers: Record<string, string | string[] | undefi
 export function authFromHeaders(headers: Record<string, string | string[] | undefined>): AuthContext | null {
   const raw = extractBearer(headers);
   if (!raw) {
+    // Fail closed outside development: with no presented token there is no
+    // authenticated context. The development fallback exists ONLY so local
+    // dev works with zero config; test/production must mint tokens.
+    if (executionMode() !== "development") return null;
     // Dev mode: no token configured and none presented → read-only system context is NOT granted.
     // If EVEX_AUTH_TOKEN is unset, allow a scoped operator context so local dev works.
     if (!masterToken()) {
@@ -395,12 +413,13 @@ export interface ProductionInput {
 }
 
 const WEAK_TOKENS = new Set(["", "change-me", "changeme", "test", "dev", "password", "evex", "secret"]);
+const PLACEHOLDER_RE = /replace[_-]?me|change[_-]?me|example|placeholder|x{4,}/i;
 
 export function evaluateProduction(input: ProductionInput): { verdict: "production-safe" | "development-only"; findings: ProductionFinding[] } {
   const findings: ProductionFinding[] = [];
   const t = (input.authToken ?? "").trim();
-  if (!t || WEAK_TOKENS.has(t.toLowerCase())) {
-    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset or a well-known value (dev auth)" });
+  if (!t || WEAK_TOKENS.has(t.toLowerCase()) || PLACEHOLDER_RE.test(t)) {
+    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset, a well-known value, or an unreplaced placeholder (dev auth)" });
   } else if (t.length < 32) {
     findings.push({ name: "auth", status: "fail", detail: `EVEX_AUTH_TOKEN too short (${t.length} chars; require >= 32)` });
   } else {
