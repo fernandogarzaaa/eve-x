@@ -71,17 +71,57 @@ def redact_obj(obj: object) -> tuple[object, int]:
     return obj, 0
 
 
+def norm_text(s: object) -> str:
+    import string as _string
+    t = str(s or "").lower()
+    t = t.translate(str.maketrans({c: " " for c in _string.punctuation}))
+    return " ".join(t.split())
+
+
 def fingerprint(step: dict) -> str:
+    """Identity of a training example. Binds the NORMALIZED goal + action
+    core to the VISUAL STATE (frame ids + step digest when present): two
+    examples with materially different screens never dedupe together, while
+    near-identical phrasing over the same frame does. Pure goal+action
+    dedupe is forbidden (it merges distinct visual states)."""
     goal = str(step.get("goal", ""))
     sel = step.get("selected_action") or step.get("actual_action") or {}
     if isinstance(sel, dict):
-        core = {"t": sel.get("type"), "x": sel.get("text"),
+        tgt = sel.get("target") if isinstance(sel.get("target"), dict) else {}
+        core = {"t": sel.get("type"), "x": norm_text(sel.get("text")),
                 "to": sel.get("to"), "from": sel.get("from"),
-                "keys": sel.get("keys"), "delta": sel.get("delta")}
+                "keys": sel.get("keys"), "delta": sel.get("delta"),
+                "region": tgt.get("regionId"), "label": norm_text(tgt.get("label"))}
     else:
         core = {"t": str(sel)}
-    norm = json.dumps({"g": goal.strip().lower(), "a": core}, sort_keys=True)
+    visual = {"before": step.get("screen_before"), "after": step.get("screen_after"),
+              "png": step.get("png_sha256") or step.get("png_sha")}
+    norm = json.dumps({"g": norm_text(goal), "a": core, "v": visual}, sort_keys=True)
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def label_block(step: dict) -> dict:
+    """Provenance of the training label: what the supervision is, where it
+    came from, and whether independent verification backs it."""
+    ver = step.get("verification")
+    verified = ver.get("passed") is True if isinstance(ver, dict) else None
+    g = step.get("grounding")
+    grounded = g.get("verified") is True if isinstance(g, dict) else None
+    judgments = step.get("human_judgment") or step.get("human_intervention")
+    return {
+        "source": "demonstration-action",
+        "validation_status": ("verified" if verified else
+                              "human-judged" if judgments else
+                              "unvalidated"),
+        "frame_before": step.get("screen_before"),
+        "frame_after": step.get("screen_after"),
+        "frame_digest": step.get("digest"),
+        "grounding_verified": grounded,
+        "task_id": step.get("task_id"),
+        "session_id": step.get("session_id"),
+        "environment": step.get("environment_version"),
+        "model": step.get("model_version"),
+    }
 
 
 def iter_steps(path: str):
@@ -159,6 +199,7 @@ def main(argv: list | None = None) -> int:
         assert isinstance(clean, dict)
         clean["_fingerprint"] = fp
         clean["_redactions"] = n
+        clean["_label"] = label_block(step)
         kept.append(clean)
 
     # Provenance-preserving split: group by task_id so one task never lands in
@@ -203,6 +244,12 @@ def main(argv: list | None = None) -> int:
         manifest["splits"][name] = {"rows": len(rows_sorted),
                                     "tasks": len({str(r.get('task_id')) for r in rows_sorted}),
                                     "sha256": h.hexdigest(), "file": f"{name}.jsonl"}
+    with open(os.path.join(args.out, "digest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    dataset_digest = hashlib.sha256(json.dumps(
+        {k: v["sha256"] for k, v in sorted(manifest["splits"].items())},
+        sort_keys=True).encode("utf-8")).hexdigest()
+    manifest["dataset_digest"] = dataset_digest
     with open(os.path.join(args.out, "digest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"done read={stats['read']} kept={len(kept)} "
