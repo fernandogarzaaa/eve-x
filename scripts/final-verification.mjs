@@ -19,7 +19,9 @@ const sh = (cmd) => {
   catch { return ""; }
 };
 const run = (cmd, args, timeoutMs) => {
-  const r = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", timeout: timeoutMs });
+  // Windows resolves npm only as npm.cmd (no shell lookup for bare "npm").
+  const bin = process.platform === "win32" && cmd === "npm" ? "npm.cmd" : cmd;
+  const r = spawnSync(bin, args, { cwd: ROOT, encoding: "utf8", timeout: timeoutMs });
   return { status: r.status ?? -1, out: String(r.stdout ?? "") + String(r.stderr ?? "") };
 };
 const shaFile = (p) => {
