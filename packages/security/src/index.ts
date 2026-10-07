@@ -413,13 +413,15 @@ export interface ProductionInput {
 }
 
 const WEAK_TOKENS = new Set(["", "change-me", "changeme", "test", "dev", "password", "evex", "secret"]);
-const PLACEHOLDER_RE = /replace[_-]?me|change[_-]?me|example|placeholder|x{4,}/i;
+// Unreplaced template tokens (e.g. from a copied .env.example) must fail:
+// a long template-looking value is not a credential.
+const TEMPLATE_TOKEN_RE = /replace[_-]?me|change[_-]?me|example|template|xxxx/i;
 
 export function evaluateProduction(input: ProductionInput): { verdict: "production-safe" | "development-only"; findings: ProductionFinding[] } {
   const findings: ProductionFinding[] = [];
   const t = (input.authToken ?? "").trim();
-  if (!t || WEAK_TOKENS.has(t.toLowerCase()) || PLACEHOLDER_RE.test(t)) {
-    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset, a well-known value, or an unreplaced placeholder (dev auth)" });
+  if (!t || WEAK_TOKENS.has(t.toLowerCase()) || TEMPLATE_TOKEN_RE.test(t)) {
+    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset, a well-known value, or an unreplaced template token (dev auth)" });
   } else if (t.length < 32) {
     findings.push({ name: "auth", status: "fail", detail: `EVEX_AUTH_TOKEN too short (${t.length} chars; require >= 32)` });
   } else {

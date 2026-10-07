@@ -336,7 +336,7 @@ async function main(): Promise<number> {
         mkdirSync(join(dir, "images"), { recursive: true });
         const envPath = join(dir, ".env");
         if (!existsSync(envPath)) {
-          // Generated credentials, never weak placeholders: a fresh random
+          // Generated credentials, never weak stand-ins: a fresh random
           // bearer token is minted per init. Production still requires
           // explicit review (see doctor --production).
           const fresh = randomBytes(32).toString("hex");

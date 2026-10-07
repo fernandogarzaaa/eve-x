@@ -125,7 +125,7 @@ describe("production docker image policy", () => {
 
 describe("agent account privilege separation", () => {
   it("seed grants no passwordless sudo to the agent account", () => {
-    const seed = defaultSeedUserData({ hostname: "h", guestSecret: "s3cr3t-s3cr3t-s3cr3t!!" });
+    const seed = defaultSeedUserData({ hostname: "h", guestSecret: "test-fixture-guest-secret-0123456789" });
     assert.ok(!seed.includes("NOPASSWD:ALL"), "blanket passwordless sudo must be gone");
     assert.ok(seed.includes("sudo: false"), "agent account must be explicitly unprivileged");
   });
