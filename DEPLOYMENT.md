@@ -3,19 +3,24 @@
 ## Local compose (reproducible)
 
 ```bash
-cp .env.example .env   # set EVEX_AUTH_TOKEN + POSTGRES_PASSWORD
+cp .env.example .env   # then SET EVEX_AUTH_TOKEN (>=32 random chars) + POSTGRES_PASSWORD
 docker compose -f infra/deployment/docker-compose.yml up --build
 ```
+
+Secrets are REQUIRED, never defaulted: compose refuses to start without
+`EVEX_AUTH_TOKEN` and `POSTGRES_PASSWORD` (`${VAR:?...}` guards); the
+example file carries `REPLACE_ME_...` markers that the production gate
+rejects; `eve-x init` mints a fresh random token per project.
 
 Services, ports, and volumes below mirror
 `infra/deployment/docker-compose.yml` exactly (project name `eve-x`):
 
 | Service | Image / build | Host ports | Volumes / notes |
 |---|---|---|---|
-| `postgres` | `postgres:16-alpine` | none published | `pgdata:/var/lib/postgresql/data`; healthy via `pg_isready -U evex` |
-| `redis` | `redis:7-alpine` (`--appendonly yes`) | none published | `redisdata:/data`; healthy via `redis-cli ping` |
-| `garage` | `dxflrs/garage:v2.0.0` pinned by digest (see release manifest), `server -c /etc/garage.toml` | none published | `garagedata-meta`, `garagedata-data`; config rendered at deploy time from `infra/deployment/object-storage/garage.toml.template` (secrets never committed). The qualified S3-compatible backend per ADR-14; MinIO is a merely supported alternative, not the qualified backend |
-| `inference` | `infra/docker/Dockerfile.inference`, `python ml/inference/server.py --host 0.0.0.0 --port 8090 --cpu` | `${INFERENCE_PORT:-8090}:8090` | healthy via `GET /health` |
+| `postgres` | `postgres:16-alpine@sha256:7218…` (digest-pinned; `verify-release` cross-checks) | none published | `pgdata:/var/lib/postgresql/data`; healthy via `pg_isready -U evex` |
+| `redis` | `redis:7-alpine@sha256:858f…` (digest-pinned; `verify-release` cross-checks) | none published | `redisdata:/data`; healthy via `redis-cli ping` |
+| `garage` | `dxflrs/garage:v2.0.0@sha256:15b4…` (digest-pinned; `verify-release` cross-checks), `server -c /etc/garage.toml` | none published | `garagedata-meta`, `garagedata-data`; config rendered at deploy time from `infra/deployment/object-storage/garage.toml.template` (secrets never committed). The qualified S3-compatible backend per ADR-14; MinIO is a merely supported alternative, not the qualified backend |
+| `inference` | `infra/docker/Dockerfile.inference`, `python ml/inference/server.py --host 0.0.0.0 --port 8090 --cpu --allow-heuristic` | none published (internal-only plane; the API reaches it over the compose network) | healthy via `GET /health`; readiness via `GET /ready` (503 until verified weights load or the explicit heuristic flag applies). Set `EVEX_INFERENCE_TOKEN` to require bearer auth on `/infer` + `/model-info`. Production with real models mounts `--weights` + `--weights-sha256` (+ `--arch` / manifest) and drops `--allow-heuristic`. |
 | `api` | `infra/docker/Dockerfile.api`, `PORT=8080`, `DATA_DIR=/data` | `${API_PORT:-8080}:8080` | `evexdata:/data`; depends on postgres+redis healthy, garage started |
 | `worker` | `infra/docker/Dockerfile.worker`, `node dist/apps/worker/src/index.js` | none published | `evexdata:/data`; depends on api+redis healthy |
 | `mcp` | `infra/docker/Dockerfile.mcp`, `node dist/apps/mcp/src/index.js` | `${MCP_PORT:-8081}:8091` (container serves `MCP_PORT=8091`) | depends on api healthy; serves StreamableHTTP at `/mcp` |

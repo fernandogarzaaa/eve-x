@@ -9,19 +9,19 @@ name: eve-x
 services:
   inference:
     build: !reset null
-    image: evex-inference:${EVEX_IMAGE_TAG:-1.0.3}
+    image: evex-inference:${EVEX_IMAGE_TAG:-1.1.0}
   api:
     build: !reset null
-    image: evex-api:${EVEX_IMAGE_TAG:-1.0.3}
+    image: evex-api:${EVEX_IMAGE_TAG:-1.1.0}
   worker:
     build: !reset null
-    image: evex-worker:${EVEX_IMAGE_TAG:-1.0.3}
+    image: evex-worker:${EVEX_IMAGE_TAG:-1.1.0}
   mcp:
     build: !reset null
-    image: evex-mcp:${EVEX_IMAGE_TAG:-1.0.3}
+    image: evex-mcp:${EVEX_IMAGE_TAG:-1.1.0}
   console:
     build: !reset null
-    image: evex-console:${EVEX_IMAGE_TAG:-1.0.3}
+    image: evex-console:${EVEX_IMAGE_TAG:-1.1.0}
 
 volumes:
   garagedata-meta:

@@ -1,6 +1,12 @@
 # MCP (Model Context Protocol Surface)
 
-Version: `mcp/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`).
+Tool-surface version: `mcp/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`).
+This names OUR tool contract, not the wire protocol: the wire protocol is
+whatever the pinned SDK negotiates (currently SDK 1.31.x — latest
+2025-11-25, compatible back to 2024-11-05). No "v2" SDK line exists upstream
+(registry latest is 1.32.x, which requires zod v4; that migration is tracked
+separately) — version claims always follow negotiation, never a hardcoded
+contract. Unknown client versions fall back to a supported version.
 
 ## Tools
 
@@ -21,11 +27,11 @@ Version: `mcp/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`).
 | `eve_human_release` | sessionId | `POST /v1/human/release` |
 | `eve_task_start` | goal (≤2000), persona, seed | `POST /v1/tasks/start` |
 | `eve_task_status` | taskId | `GET /v1/tasks/:id/status` |
-| `eve_task_validate` | taskId | `POST /v1/tasks/:id/validate` |
+| `eve_task_validate` | taskId, evidence bundle | `POST /v1/tasks/:id/validate` (evidence-required; verdicts PASS/FAILED/INCONCLUSIVE/INVALID_EVIDENCE) |
 | `eve_trace_get` | sessionId | `GET /v1/trace/:sessionId` |
 | `eve_replay` | sessionId, seed | `POST /v1/replay/:sessionId` |
 | `eve_report` | sessionId | `GET /v1/report/:sessionId` |
-| `eve_benchmark` | name, size | `POST /v1/benchmarks` |
+| `eve_benchmark` | name, size, agent?, testOnly? | `POST /v1/benchmarks` (real execution; mock requires testOnly) |
 | `eve_model_status` | (none) | `GET /v1/models/status` |
 
 All inputs are strict zod schemas in `TOOL_SCHEMAS`; unknown fields, wrong
@@ -47,6 +53,8 @@ exactly one definition.
   `EVEX_MCP_TOKEN ?? EVEX_AUTH_TOKEN` whenever either is set (401
   otherwise). When neither is set the endpoint stays open for single-user
   local use and stamps `x-evex-dev: 1` on responses.
+- `/mcp` has a per-caller fixed-window rate limit (`EVEX_MCP_RATE_LIMIT`,
+  default 600/min; 429 + Retry-After; `/health` never limited).
 - The CALLER's bearer is forwarded to the control plane on every tool call;
   only when the caller sent none is `EVEX_AUTH_TOKEN` used as a fallback.
   Token values are never logged.

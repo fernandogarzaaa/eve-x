@@ -42,7 +42,8 @@ internet at large, reviewer endpoint devices (covered by operator policy).
    reach training. Trace exports are capability-gated.
 
 4. **Malicious skill (rogue SKILL.md / tool wiring).**
-   `packages/skills` verifies manifest validity, entrypoint presence, and
+   `packages/skills` verifies manifest validity (name format + match with
+   directory), entrypoint frontmatter (name/description agreement), and
    tool documentation before install; platform paths are user-scoped, and
    skills inherit only the installing caller's capabilities.
 
@@ -55,13 +56,19 @@ internet at large, reviewer endpoint devices (covered by operator policy).
 6. **Benchmark gaming (overfit to test split).**
    Genesis evaluates integrity (held-out grounding, lineage) separately from
    performance (`tests/genesis.test.ts`); production promotion demands both,
-   with a human approval token — there is no automatic path.
+   with a human approval token — there is no automatic path. Platform
+   benchmarks execute real sessions (no inline synthetic agent exists);
+   mock evidence is refused in production runs and stamped in harness runs;
+   inconclusive/invalid are counted, never coerced into success.
 
 7. **Inference DoS / GPU failure cascade.**
    The inference service enforces a bounded queue (429 when full) and
-   per-request timeouts (504 on expiry); model-load failures flip it to
-   degraded heuristic mode while `/health` stays green and `/ready` reports
-   unready, so the control plane sheds load instead of crashing.
+   per-request timeouts (504 on expiry). Model-load failures leave it NOT
+   READY (`/ready` 503, `/infer` 503 `model-not-loaded`) while `/health`
+   stays green, so the control plane sheds load with explicit 502s and
+   inconclusive verdicts instead of crashing — never silent heuristic
+   output labeled as model output. Bearer auth on `/infer` + `/model-info`
+   when configured; internal-only topology (no published port).
 
 8. **Token theft / replay.**
    Bearer tokens travel only over loopback or TLS-terminated ingress
@@ -75,6 +82,14 @@ internet at large, reviewer endpoint devices (covered by operator policy).
    Actions bind `expectedFrameId`; the runtime and the API both reject
    mismatches with 409 + current frame (live-verified), so a model can never
    act on a screen it has not just seen.
+
+10. **Evidence forgery (fake success, tampered traces).**
+   Trace steps carry server-stamped SHA-256 chains; replay verifies
+   sequence + chain and flags legacy digests; task validation derives
+   verdicts only from server-resolved evidence (PASS needs independent
+   confirmation); the worker cannot write verification or success. The
+   adversarial suite (`tests/adversarial-evidence.test.ts`) covers
+   mutation/reorder/deletion/duplication/stale-replay/idempotency-abuse.
 
 ## Residual risks
 
