@@ -435,6 +435,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, _snapshot_identity())
         elif self.path == "/metrics":
+            # Model identity rides the metric labels: require the bearer
+            # whenever auth is configured. /health and /ready stay open
+            # (liveness/readiness probes for orchestrators carry no identity).
+            if not check_bearer(self):
+                record_error()
+                self._send(401, {"error": "unauthorized"})
+                return
             m = snapshot_metrics()
             ident = _snapshot_identity()
             lines = ["# HELP evex_infer_requests_total Total infer requests",
@@ -572,13 +579,20 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--allow-heuristic", action="store_true",
                     help="Explicitly serve the heuristic-v1 dev/test policy (always degraded=true)")
     ap.add_argument("--require-token", default=None,
-                    help="Bearer token for /infer + /model-info (or EVEX_INFERENCE_TOKEN)")
+                    help="Bearer token for /infer + /model-info + /metrics (or EVEX_INFERENCE_TOKEN)")
+    ap.add_argument("--allow-unauthenticated", action="store_true",
+                    help="Permit --host 0.0.0.0 with no bearer token (explicitly insecure; refuses otherwise)")
     ap.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA present")
     ap.add_argument("--queue-size", type=int, default=32)
     args = ap.parse_args(argv)
     global _infer_queue, _require_token
     _infer_queue = queue.Queue(maxsize=max(1, args.queue_size))
     _require_token = (args.require_token or os.environ.get("EVEX_INFERENCE_TOKEN") or "").strip()
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not _require_token and not args.allow_unauthenticated:
+        print(f"refusing: --host {args.host} exposes the plane without a bearer token "
+              "(set --require-token/EVEX_INFERENCE_TOKEN or pass --allow-unauthenticated explicitly)",
+              flush=True)
+        return 2
     try_load_model(args.weights, args.cpu,
                     expected_sha256=args.weights_sha256,
                     expected_bytes=args.weights_bytes,

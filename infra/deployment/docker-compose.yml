@@ -57,10 +57,11 @@ services:
     # Internal-only plane: no published port. The API reaches it over the
     # compose network (INFERENCE_URL=http://inference:8090); outside callers
     # go through the authenticated API (/suggest), never :8090 directly.
-    # Set EVEX_INFERENCE_TOKEN to require bearer auth on /infer + /model-info.
+    # The plane refuses to bind 0.0.0.0 without a bearer token: set
+    # EVEX_INFERENCE_TOKEN (required, forwarded by the API on /suggest).
     environment:
       INFERENCE_PORT: 8090
-      EVEX_INFERENCE_TOKEN: ${EVEX_INFERENCE_TOKEN:-}
+      EVEX_INFERENCE_TOKEN: ${EVEX_INFERENCE_TOKEN:?EVEX_INFERENCE_TOKEN is required}
     command: ["python", "ml/inference/server.py", "--host", "0.0.0.0", "--port", "8090", "--cpu", "--allow-heuristic"]
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health').status==200 else 1)\""]
@@ -86,6 +87,7 @@ services:
       REDIS_URL: redis://redis:6379
       OBJECT_ENDPOINT: http://garage:3900
       INFERENCE_URL: http://inference:8090
+      EVEX_INFERENCE_TOKEN: ${EVEX_INFERENCE_TOKEN:?EVEX_INFERENCE_TOKEN is required}
       EVEX_AUTH_TOKEN: ${EVEX_AUTH_TOKEN:?EVEX_AUTH_TOKEN is required (min 32 chars)}
       DATA_DIR: /data
     ports:

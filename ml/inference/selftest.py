@@ -317,9 +317,35 @@ def main():
     check("correct bearer -> 200", code == 200, f"{code}")
     code, _ = get(port, "/model-info")
     check("/model-info without bearer -> 401", code == 401, f"{code}")
+    code, _ = get(port, "/metrics")
+    check("/metrics without bearer -> 401 (identity in labels)", code == 401, f"{code}")
+    import urllib.request as _urlreq
+
+    def get_metrics_text(token=None):
+        _req = _urlreq.Request(f"http://127.0.0.1:{port}/metrics")
+        if token:
+            _req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with _urlreq.urlopen(_req, timeout=10) as _r:
+                return _r.status, _r.read().decode()
+        except urllib.error.HTTPError as _e:
+            return _e.code, _e.read().decode()
+
+    _code, _text = get_metrics_text(token="test-token-123")
+    check("/metrics with bearer -> 200", _code == 200, f"{_code}")
+    check("/metrics carries model identity labels", 'model_id="heuristic-v1"' in _text, _text[:160])
+    code, _ = get(port, "/ready")
+    check("/ready open despite auth (orchestrator probe)", code == 200, f"{code}")
     code, _ = get(port, "/health")
     check("/health open despite auth", code == 200, f"{code}")
     srv.shutdown()
+
+    # 14. binding 0.0.0.0 without a token refuses unless explicitly allowed
+    reset_state()
+    with S._state_lock:
+        S._require_token = ""
+    rc = S.main(["--host", "0.0.0.0", "--port", "18099"])
+    check("0.0.0.0 without token refuses (exit 2)", rc == 2, f"rc={rc}")
 
     for f in (p, q):
         try:
