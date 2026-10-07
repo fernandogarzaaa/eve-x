@@ -179,6 +179,11 @@ def verify_artifact(path: str, expected_sha256: str | None,
     if not os.path.isfile(path):
         raise RuntimeError(f"weights file not found: {path}")
     exp_sha = (expected_sha256 or manifest.get("sha256") or "").strip().lower()
+    if not exp_sha:
+        # No pin, no trust: a digest computed from the file itself attests
+        # nothing about provenance. weights_verified must bind the artifact
+        # to an independently expected value, or any file becomes "verified".
+        raise RuntimeError("weights sha256 pin required (--weights-sha256 or manifest.sha256); refusing unpinned artifact")
     exp_bytes = expected_bytes
     if exp_bytes is None and manifest.get("bytes") is not None:
         exp_bytes = int(manifest["bytes"])

@@ -185,12 +185,20 @@ def main():
     S.try_load_model(p, True, expected_sha256=digest, expected_bytes=size + 1)
     check("size mismatch -> not ready", S._snapshot_identity()["ready"] is False)
 
-    # 4. unknown container -> not ready
+    # 4. unknown container -> not ready (pinned, so the format gate is
+    # genuinely what refuses — not the pin requirement)
     reset_state()
-    q, _, _ = make_weights("bogus")
-    S.try_load_model(q, True)
+    q, qdigest, _ = make_weights("bogus")
+    S.try_load_model(q, True, expected_sha256=qdigest)
     ident = S._snapshot_identity()
     check("unknown format refused", ident["ready"] is False and "format" in ident["detail"].lower(),
+          ident["detail"])
+
+    # 4b. unpinned artifact -> not ready even when the file is well-formed
+    reset_state()
+    S.try_load_model(p, True)
+    ident = S._snapshot_identity()
+    check("unpinned weights refused", ident["ready"] is False and "pin required" in ident["detail"],
           ident["detail"])
 
     # 5. torch.load raising -> not ready

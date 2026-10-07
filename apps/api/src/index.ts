@@ -867,7 +867,10 @@ export async function fetchInference(percept: {
 }
 
 /** Best-effort model identity for benchmark provenance. Null when the plane
- *  is unreachable — recorded as null with reason, never invented. */
+ *  is unreachable — recorded as null with reason, never invented. When
+ *  EVEX_EXPECTED_MODEL_SHA256 pins the deployed artifact, a plane whose
+ *  reported digest differs (or is absent) is treated as unknown: an
+ *  unproven identity must not flow into benchmark provenance. */
 export async function fetchModelInfo(): Promise<InferenceModelInfo | null> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -877,6 +880,15 @@ export async function fetchModelInfo(): Promise<InferenceModelInfo | null> {
     if (!r.ok) return null;
     const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
     if (!j || typeof j["model_id"] !== "string") return null;
+    const expected = (process.env["EVEX_EXPECTED_MODEL_SHA256"] ?? "").trim().toLowerCase();
+    const reported = typeof j["model_sha256"] === "string" ? (j["model_sha256"] as string).toLowerCase() : "";
+    if (expected && reported !== expected) {
+      log("warn", "inference model pin mismatch; identity treated as unknown", {
+        expected: expected.slice(0, 16), reported: reported.slice(0, 16) || "absent",
+      });
+      bump("inference_failed");
+      return null;
+    }
     return {
       model_id: j["model_id"] as string,
       model_version: typeof j["model_version"] === "string" ? (j["model_version"] as string) : undefined,

@@ -43,6 +43,19 @@ before(async () => {
   process.env["EVEX_MAX_MEM_MB_PER_TENANT"] = "524288";
   // Stub inference plane: behavior scripted per test.
   inferSrv = createServer((req, res) => {
+    if (req.url === "/ready" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ready: true, degraded: false, detail: "stub" }));
+      return;
+    }
+    if (req.url === "/model-info" && req.method === "GET") {      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        model_id: "stub-weights-1", model_version: "7",
+        model_sha256: "ab".repeat(32), architecture: "stub-arch",
+        device: "cpu", degraded: false,
+      }));
+      return;
+    }
     if (req.url !== "/infer" || req.method !== "POST") {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end("{}");
@@ -171,5 +184,21 @@ describe("inference suggest", () => {
     await api("POST", `/v1/computer/${sid}/suggest`);
     const after = await api("GET", `/v1/trace/${sid}`);
     assert.deepEqual((after.json["steps"] as unknown[]).length, (before.json["steps"] as unknown[]).length);
+  });
+
+  it("model pin mismatch treats plane identity as unknown", async () => {
+    const prev = process.env["EVEX_EXPECTED_MODEL_SHA256"];
+    try {
+      process.env["EVEX_EXPECTED_MODEL_SHA256"] = "ff".repeat(32);
+      const r = await api("GET", "/v1/models/status");
+      assert.equal(r.status, 200);
+      assert.equal(r.json["modelIdentity"], null, "mismatched pin must not flow into provenance");
+      process.env["EVEX_EXPECTED_MODEL_SHA256"] = "ab".repeat(32);
+      const r2 = await api("GET", "/v1/models/status");
+      assert.equal((r2.json["modelIdentity"] as Record<string, unknown> | null)?.["model_id"], "stub-weights-1");
+    } finally {
+      if (prev === undefined) delete process.env["EVEX_EXPECTED_MODEL_SHA256"];
+      else process.env["EVEX_EXPECTED_MODEL_SHA256"] = prev;
+    }
   });
 });
