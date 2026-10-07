@@ -19,8 +19,9 @@ const sh = (cmd) => {
   catch { return ""; }
 };
 const run = (cmd, args, timeoutMs) => {
-  // Windows spawns .cmd shims only through a shell; POSIX execs directly.
-  const shell = process.platform === "win32";
+  // npm is a shell shim on Windows (.cmd needs a shell); node/direct
+  // binaries exec without one (shell would break spaced install paths).
+  const shell = process.platform === "win32" && cmd === "npm";
   const r = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", timeout: timeoutMs, shell });
   return { status: r.status ?? -1, out: String(r.stdout ?? "") + String(r.stderr ?? "") };
 };
