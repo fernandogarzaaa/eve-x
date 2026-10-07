@@ -1,10 +1,10 @@
 {
   "product": "eve-x",
   "version": "1.1.0",
-  "commit": "5f2c9b08246a6f727057cc2e6d06ae38c60f0d01",
-  "tree": "ab1d44da0706132aff42988a56990f7c0e366cb9",
+  "commit": "755b2c20995a6dd27b70d647317af3506d54b40b",
+  "tree": "d32cf968624d0749399b35cc8488c8a78ae3ac72",
   "dirty": false,
-  "generatedAt": "2026-10-07T00:41:32.541Z",
+  "generatedAt": "2026-10-07T00:44:09.896Z",
   "toolchain": {
     "node": "v26.7.0",
     "npm": "11.19.0",
