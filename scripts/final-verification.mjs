@@ -19,9 +19,9 @@ const sh = (cmd) => {
   catch { return ""; }
 };
 const run = (cmd, args, timeoutMs) => {
-  // Windows resolves npm only as npm.cmd (no shell lookup for bare "npm").
-  const bin = process.platform === "win32" && cmd === "npm" ? "npm.cmd" : cmd;
-  const r = spawnSync(bin, args, { cwd: ROOT, encoding: "utf8", timeout: timeoutMs });
+  // Windows spawns .cmd shims only through a shell; POSIX execs directly.
+  const shell = process.platform === "win32";
+  const r = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", timeout: timeoutMs, shell });
   return { status: r.status ?? -1, out: String(r.stdout ?? "") + String(r.stderr ?? "") };
 };
 const shaFile = (p) => {
