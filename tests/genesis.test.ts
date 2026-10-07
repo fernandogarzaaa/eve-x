@@ -124,6 +124,12 @@ describe("genesis separates integrity from performance", () => {
       writeFileSync(wpath, Buffer.alloc(64, 1));
       const tampered = mk(wpath, "1".repeat(64), 64);
       assert.throws(() => reg.promote(tampered, "staging", gate, "eve-ground-v1"), /mismatch/);
+      // Remote URIs can never be verified by this process: refused even
+      // with a recorded digest and passing benchmark scores.
+      const remote = mk("https://evil.example/w.bin", "2".repeat(64), 64);
+      assert.throws(() => reg.promote(remote, "staging", gate, "eve-ground-v1"), /remote weights URI/);
+      const s3remote = mk("s3://bucket/w.bin", "3".repeat(64), 64);
+      assert.throws(() => reg.promote(s3remote, "staging", gate, "eve-ground-v1"), /remote weights URI/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

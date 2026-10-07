@@ -180,4 +180,53 @@ describe("execution modes fail closed", () => {
       else process.env["VM_BACKEND"] = prevBackend;
     }
   });
+
+  it("linux boot script never defaults secrets (refuses without env)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const { execFileSync } = await import("node:child_process");
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const script = join(root, "infra", "qualification", "start-linux-api.sh");
+    const src = readFileSync(script, "utf8");
+    assert.ok(!src.includes("qual-canonical-token"), "no canonical fallback token may remain");
+    assert.ok(!src.includes("evex:evex-qual"), "no weak default DB credentials may remain");
+    assert.ok(src.includes("refusing: EVEX_AUTH_TOKEN"), "must refuse without a token");
+    // Execute with scrubbed secret env where bash exists: refusal must come
+    // before ANY side effect (exit 1, no defaults used). /root/.evex-qual-token
+    // does not exist in CI, so the refusal branch is deterministic.
+    let hasBash = true;
+    try {
+      execFileSync("bash", ["--version"], { stdio: "pipe" });
+    } catch {
+      hasBash = false;
+    }
+    if (!hasBash) {
+      assert.ok(true, "classified: no bash on this host; static assertions above carry the gate");
+      return;
+    }
+    const cleanEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined && k !== "EVEX_AUTH_TOKEN" && k !== "DATABASE_URL") cleanEnv[k] = v;
+    }
+    let refused = false;
+    let out = "";
+    try {
+      execFileSync("bash", [script], { stdio: "pipe", env: cleanEnv, timeout: 30000 });
+    } catch (err) {
+      refused = true;
+      const e = err as { stdout?: Buffer; stderr?: Buffer };
+      out = String(e.stdout ?? "") + String(e.stderr ?? "");
+    }
+    assert.equal(refused, true, "boot script without secret env must refuse");
+    assert.match(out, /refusing: EVEX_AUTH_TOKEN/);
+    // With dummy secrets + selftest hook: env validation passes and the
+    // script exits before any side effect — proving refusal is env-driven.
+    const ok = execFileSync("bash", [script], {
+      stdio: "pipe",
+      env: { ...cleanEnv, EVEX_AUTH_TOKEN: "test-token-0123456789abcdef", DATABASE_URL: "postgres://u:p@h/db", EVEX_BOOT_SELFTEST: "1" },
+      timeout: 30000,
+    });
+    assert.match(String(ok), /selftest-ok/);
+  });
 });
