@@ -55,11 +55,27 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
   const m = JSON.parse(readSoft("release-manifest.json"));
   const head = sh("git rev-parse HEAD");
   const tree = sh('git rev-parse "HEAD^{tree}"');
-  const dirty = sh("git status --porcelain").length > 0;
+  // Standard release shape: code commit, then a metadata commit touching
+  // ONLY the regenerated files. Accept manifest.commit == HEAD, or the
+  // parent when HEAD is exactly such a metadata commit — anything else is
+  // a manifest describing somebody else's tree.
+  const GENERATABLE = new Set(["release-manifest.json", "RELEASE_PROVENANCE.json"]);
+  let commitOk = m.commit === head;
+  if (!commitOk) {
+    const parent = sh("git rev-parse HEAD~1");
+    const diffNames = sh("git diff-tree --no-commit-id --name-only -r HEAD")
+      .split("\n").map((l) => l.trim()).filter(Boolean);
+    if (m.commit === parent && diffNames.length > 0 && diffNames.every((f) => GENERATABLE.has(f))) {
+      commitOk = true;
+    }
+  }
+  const dirtyFiles = sh("git status --porcelain").split("\n").map((l) => l.trim()).filter(Boolean)
+    .map((l) => l.replace(/^([AMDRCU?!]{1,2})\s+/, "").replace(/"/g, ""));
+  const foreignDirty = dirtyFiles.filter((f) => !GENERATABLE.has(f));
   check("manifest.version == package.json", m.version === version, `manifest=${m.version}`);
-  check("manifest.commit == HEAD", m.commit === head, `manifest=${String(m.commit).slice(0, 12)} head=${head.slice(0, 12)}`);
-  check("manifest.tree == HEAD^{tree}", m.tree === tree, "tree drift");
-  check("release tree is clean", m.dirty === false && dirty === false, "dirty release must never ship");
+  check("manifest.commit describes HEAD (or its release-metadata commit)", commitOk, `manifest=${String(m.commit).slice(0, 12)} head=${head.slice(0, 12)}`);
+  check("manifest.tree matches its commit's tree", m.tree === sh(`git rev-parse "${m.commit}^{tree}"`), "tree drift: manifest tree does not match its own commit");
+  check("only regenerated release files are dirty", foreignDirty.length === 0, `unreleased changes: ${foreignDirty.slice(0, 5).join(", ")}`);
   check("manifest mcp server matches", String(m.mcp?.server ?? "") === `eve-x ${version}`, `got ${m.mcp?.server}`);
   const shared = readSoft("packages/mcp-shared/src/index.ts").match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1];
   check("manifest toolSurface == MCP_TOOL_VERSION", m.mcp?.toolSurface === shared, `manifest=${m.mcp?.toolSurface} src=${shared}`);
@@ -78,7 +94,15 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
   } else {
     check("manifest guest explicitly unmanifested (no stale digest)", /UNMANIFESTED/.test(String(g.status ?? "")), "stale or missing guest digest with no marker");
   }
-  for (const [name, digest] of Object.entries(m.containers?.releaseImages ?? {})) {
+  // Release images: an empty map is honest ONLY with an imagesStatus note
+  // (source release, images not rebuilt). Non-empty entries must be
+  // version-matched sha256 digests — never carried-forward stale digests.
+  const relImgs = m.containers?.releaseImages ?? {};
+  const relKeys = Object.keys(relImgs);
+  if (relKeys.length === 0) {
+    check("empty releaseImages carries an imagesStatus note", typeof m.containers?.imagesStatus === "string" && m.containers.imagesStatus.length > 0, "omission without explanation");
+  }
+  for (const [name, digest] of Object.entries(relImgs)) {
     check(`release image ${name} carries version`, String(name).includes(version), `got ${name}`);
     check(`release image ${name} digest is sha256`, /^sha256:[0-9a-f]{64}$/i.test(String(digest)), `got ${digest}`);
   }

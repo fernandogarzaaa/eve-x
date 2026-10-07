@@ -13,6 +13,11 @@ const sh = (cmd) => {
   catch { return ""; }
 };
 const shaFile = (p) => createHash("sha256").update(readFileSync(join(ROOT, p))).digest("hex");
+// Release outputs are not source: dirty means foreign (non-regenerable)
+// changes only — the same GENERATABLE set verify-release enforces.
+const GENERATABLE = ["release-manifest.json", "RELEASE_PROVENANCE.json"];
+const sourceDirty = sh("git status --porcelain").split("\n").map((l) => l.trim()).filter(Boolean)
+  .some((l) => !GENERATABLE.some((g) => l.endsWith(g)));
 
 // MCP tool inventory straight from source (no stale definitions).
 const mcpSrc = readFileSync(join(ROOT, "apps", "mcp", "src", "index.ts"), "utf8");
@@ -38,7 +43,7 @@ const manifest = {
   version: JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version,
   commit: sh("git rev-parse HEAD"),
   tree: sh('git rev-parse "HEAD^{tree}"'),
-  dirty: sh("git status --porcelain").length > 0,
+  dirty: sourceDirty,
   generatedAt: new Date().toISOString(),
   toolchain: { node: sh("node --version"), npm: sh("npm --version"), python: sh("python --version") },
   lockfiles: { "package-lock.json": shaFile("package-lock.json") },
@@ -50,13 +55,12 @@ const manifest = {
       "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
       "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
     },
-    releaseImages: {
-      "evex-api:1.0.3": "sha256:35753c00eb818b6d6cee03a9244551189226c930218accafcfe3896905b68b0c",
-      "evex-worker:1.0.3": "sha256:7589fde9f8ae777581903e1cd0c32e88226823446a3b14ec4cbaaf922bc38d20",
-      "evex-mcp:1.0.3": "sha256:5377a2bf5ac666bc15a941d91c3f6581a4437fcbd9ac8db70effc44e21059b38",
-      "evex-console:1.0.3": "sha256:9fff8625742096ebdca9ee60e6289e90f86c927f18b69c51155dc13301ff535c",
-      "evex-inference:1.0.3": "sha256:6467745333ac25ce9f053650b6374ca3c25bf22b70801065221a3fbb7409cad2",
-    },
+    releaseImages: {},
+    // No stale digests are ever carried forward: image digests describe
+    // BUILT artifacts. This source release did not rebuild containers, so
+    // the map stays empty (verified, not omitted) until images are built
+    // and their digests measured into it.
+    imagesStatus: "not-built for this source release (rebuild container images to populate digests; never copy digests across versions)",
   },
   guest: guestManifest ?? {
     image: "eve-desktop-autologin.qcow2",

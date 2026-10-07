@@ -13,6 +13,10 @@ const sh = (cmd) => {
 };
 const shaFile = (p) => createHash("sha256").update(readFileSync(join(ROOT, p))).digest("hex");
 const shaOpt = (p) => (existsSync(join(ROOT, p)) ? shaFile(p) : null);
+// Release outputs are not source (same GENERATABLE set as the manifest).
+const GENERATABLE = ["release-manifest.json", "RELEASE_PROVENANCE.json"];
+const sourceDirty = sh("git status --porcelain").split("\n").map((l) => l.trim()).filter(Boolean)
+  .some((l) => !GENERATABLE.some((g) => l.endsWith(g)));
 
 const prov = {
   product: "eve-x",
@@ -20,7 +24,7 @@ const prov = {
   source: {
     commit: sh("git rev-parse HEAD"),
     tree: sh('git rev-parse "HEAD^{tree}"'),
-    dirty: sh("git status --porcelain").length > 0,
+    dirty: sourceDirty,
     tag: sh("git describe --tags --exact-match") || null,
   },
   generatedAt: new Date().toISOString(),

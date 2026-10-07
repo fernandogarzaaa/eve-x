@@ -28,8 +28,12 @@ const commit = sh("git rev-parse HEAD") || "unknown";
 // NOTE: the revision is double-quoted: cmd.exe treats ^ as an escape and
 // would otherwise turn HEAD^{tree} into HEAD{tree}.
 const tree = sh('git rev-parse "HEAD^{tree}"') || "unknown";
+// Release outputs are not source: uncommitted regenerations of the manifest
+// / provenance never make a build "dirty". Anything else dirty fails closed.
+const GENERATABLE = ["release-manifest.json", "RELEASE_PROVENANCE.json"];
 const status = sh("git status --porcelain");
-const dirty = status.length > 0;
+const dirty = status.split("\n").map((l) => l.trim()).filter(Boolean)
+  .some((l) => !GENERATABLE.some((g) => l.endsWith(g)));
 const sourceDigest = createHash("sha256").update(`commit:${commit}\ntree:${tree}\nstatus:\n${status}`).digest("hex");
 
 if (dirty && process.env["EVEX_ALLOW_DIRTY_BUILD"] !== "1") {

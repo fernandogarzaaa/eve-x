@@ -1,10 +1,10 @@
 {
   "product": "eve-x",
-  "version": "1.0.3",
-  "commit": "5d8deb321e8a50c6fb4a5812fc0ffc940678d706",
-  "tree": "3ded38ad19877b9153e97413a373a76b22000541",
-  "dirty": true,
-  "generatedAt": "2026-10-05T05:23:17.956Z",
+  "version": "1.1.0",
+  "commit": "945a8d1b835ce45309f5b42d42e6805ff710eb75",
+  "tree": "f469f56b5df602754fc0f2fa1e287ce58215505f",
+  "dirty": false,
+  "generatedAt": "2026-10-07T00:37:36.445Z",
   "toolchain": {
     "node": "v26.7.0",
     "npm": "11.19.0",
@@ -30,20 +30,21 @@
     }
   },
   "guest": {
-    "image": "eve-desktop-xorg.qcow2",
-    "imageSha256": "38afb22b948e61c11fa044204a2cf2372bbb1ba80fb94075dcac9d45ae5b4249",
-    "baseImage": "eve-desktop-noble.qcow2",
-    "baseSha256": "e19b77ba669ef5e813213a145a99efeeb3d4f58a0fc220dad2f9b4891679273b",
+    "image": "eve-desktop-autologin.qcow2",
+    "imageSha256": null,
+    "status": "UNMANIFESTED: no bake manifest published in-tree (images/guest-manifest.json missing) — production boots the sealed base per EVEX_BASE_IMAGE_SHA256, not this file",
     "sealedReadonly": true,
     "reproducibility": "logical (sealed base digest + bake manifest); not claimed bit-for-bit"
   },
   "model": {
+    "runtime": "ModelRuntime (verify-then-load; explicit heuristic fallback only)",
     "registry": "filesystem-first (DATA_DIR/models), gated promotion, sha256 checkpoints",
-    "smokePath": "stdlib-only (no torch required)"
+    "smokePath": "stdlib-only selftest (ml/inference/selftest.py; torch paths via stub injection)"
   },
   "mcp": {
-    "server": "eve-x 1.0.0",
+    "server": "eve-x 1.1.0",
     "toolSurface": "mcp/1",
+    "sdk": "1.31.0",
     "tools": [
       "eve_session_create",
       "eve_session_status",
