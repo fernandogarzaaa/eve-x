@@ -6,18 +6,22 @@ import { HumanJudgment, type HumanJudgment as HumanJudgmentType } from "../../pr
 // Task validation must never trust agent-emitted verdicts. A verdict is
 // derived ONLY from server-resolved evidence:
 //
-//   * the session trace (sequence + SHA-256 chain must verify — tampered,
-//     reordered, gapped, or duplicated evidence is INVALID_EVIDENCE);
-//   * caller-nominated step ids, resolved server-side (unknown ids are
-//     INVALID_EVIDENCE, never ignored);
-//   * oracle assertions evaluated deterministically against the cited steps;
-//   * supporting human judgments (reasonable + targetCorrect) on cited steps.
+// * the session trace (sequence + SHA-256 chain must verify — tampered,
+//   reordered, gapped, or duplicated evidence is INVALID_EVIDENCE);
+// * caller-nominated step ids, resolved server-side (unknown ids are
+//   INVALID_EVIDENCE, never ignored);
+// * oracle assertions evaluated deterministically against the cited steps
+//   (failures → FAILED; note that verification-passed attests EXECUTION
+//   only and can never confirm a verdict by itself);
+// * supporting human judgments (reasonable + targetCorrect) on cited steps,
+//   or server-verified grounding of the acted point.
 //
 // PASS additionally requires independent confirmation: either a supporting
-// human judgment, or a server-written verification-passed /
-// grounding-verified assertion. Agent-written outcome strings alone can
-// only ever yield INCONCLUSIVE — uncertainty is never collapsed into
-// success. Every result names the exact evidence that caused it.
+// human judgment, or a server-verified grounding assertion (the acted point
+// demonstrably inside a region of the exact observed frame). Execution
+// verification and agent-written outcome strings alone can only ever yield
+// INCONCLUSIVE — uncertainty is never collapsed into success. Every result
+// names the exact evidence that caused it.
 
 export const ValidationVerdictSchema = z.enum(["PASS", "FAILED", "INCONCLUSIVE", "INVALID_EVIDENCE"]);
 export type ValidationVerdict = z.infer<typeof ValidationVerdictSchema>;
@@ -168,11 +172,17 @@ export function validateEvidence(input: {
       checkedAt,
     });
   }
-  // 5. No failures — but PASS needs independent confirmation. Agent-written
-  // outcome strings and bare signal matches are not confirmation.
+  // 5. No failures — but PASS needs independent confirmation tied to the
+  // GOAL, not to execution. verification-passed attests only that an
+  // actuation ran and a post-frame was captured (stamped on every act,
+  // including wait/observe) — it is deliberately NOT confirmation, or any
+  // acted step would launder itself into a verdict. Likewise
+  // signal-present/outcome-is match agent-written text. Confirmation is:
+  // a supporting human judgment, or server-verified grounding (the acted
+  // point demonstrably inside a region of the exact observed frame).
   const supporting = citedJudgments.filter((j) => j.reasonable && j.targetCorrect);
   const independent = assertionResults.filter(
-    (r) => r.pass && (r.kind === "verification-passed" || r.kind === "grounding-verified"),
+    (r) => r.pass && r.kind === "grounding-verified",
   );
   if (supporting.length > 0 || independent.length > 0) {
     const causes = [
@@ -192,7 +202,7 @@ export function validateEvidence(input: {
     verdict: "INCONCLUSIVE" as const, taskId, sessionId: ev.sessionId,
     stepIds: ev.stepIds, assertionResults,
     judgmentIds: [],
-    causedBy: ["no failing assertions, but no independent confirmation (supporting human judgment or server-written verification/grounding) — refusing to infer success"],
+    causedBy: ["no failing assertions, but no independent confirmation (supporting human judgment or server-verified grounding) — refusing to infer success"],
     checkedAt,
   });
 }

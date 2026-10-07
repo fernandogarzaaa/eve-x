@@ -119,12 +119,16 @@ describe("validateEvidence (unit)", () => {
     assert.deepEqual(r.judgmentIds, ["j1"]);
   });
 
-  it("PASS with server-written verification (no human needed)", () => {
+  it("execution verification alone is INCONCLUSIVE (never laundered to PASS)", () => {
+    // Regression (evidence laundering): realAct stamps verification.passed
+    // on EVERY act including wait/observe, and outcome:"acted" is
+    // agent-visible text. Neither — alone or together — may confirm a
+    // verdict, or one acted step would mint its own PASS.
     const r = validateEvidence({
       taskId: "t1",
       evidence: ev({
         sessionId: "s", stepIds: ["a"],
-        assertions: [{ kind: "verification-passed" }],
+        assertions: [{ kind: "verification-passed" }, { kind: "outcome-is", outcome: "acted" }],
       }),
       resolvedSteps: [resolved("a", 0, { verification: { passed: true } })].map((s) => ({
         ...s, verification: { passed: true },
@@ -133,7 +137,25 @@ describe("validateEvidence (unit)", () => {
       judgments: [],
       traceChained: true,
     });
+    assert.equal(r.verdict, "INCONCLUSIVE");
+  });
+
+  it("PASS with server-verified grounding (decision tied to observation)", () => {
+    const r = validateEvidence({
+      taskId: "t1",
+      evidence: ev({
+        sessionId: "s", stepIds: ["a"],
+        assertions: [{ kind: "grounding-verified" }, { kind: "outcome-is", outcome: "acted" }],
+      }),
+      resolvedSteps: [resolved("a", 0, { grounding: { verified: true } })].map((s) => ({
+        ...s, grounding: { verified: true },
+      })),
+      replay: OK_REPLAY,
+      judgments: [],
+      traceChained: true,
+    });
     assert.equal(r.verdict, "PASS");
+    assert.ok(r.causedBy.some((c) => c.includes("server-verified grounding") || c.includes("grounding")));
   });
 
   it("a non-supporting judgment cannot confirm PASS", () => {
