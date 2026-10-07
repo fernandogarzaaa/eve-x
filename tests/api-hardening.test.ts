@@ -298,7 +298,14 @@ describe("api hardening", () => {
     assert.ok(counts.sessions >= 1, `expected hydrated sessions, got ${JSON.stringify(counts)}`);
     const got = await api("GET", `/v1/sessions/${sess}`, MASTER);
     assert.equal(got.status, 200);
-    assert.equal(got.json.status, "RUNNING");
+    // Recovery honesty: in-flight RUNNING is demoted to PAUSED on restart —
+    // execution is never resurrected without proof. Explicit resume re-arms.
+    assert.equal(got.json.status, "PAUSED");
+    const badResume = await api("POST", `/v1/sessions/${sess}/resume`, MASTER, {});
+    assert.equal(badResume.status, 200);
+    assert.equal(badResume.json.status, "RUNNING");
+    const resumeAgain = await api("POST", `/v1/sessions/${sess}/resume`, MASTER, {});
+    assert.equal(resumeAgain.status, 409);
     // Dedupe state also survives: the earlier judgment is still a duplicate.
     const dup = await api("POST", "/v1/judgments", MASTER, {
       stepId, sessionId: sess, reviewer: "r-restart",

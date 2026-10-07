@@ -435,6 +435,7 @@ function markSessionVmLost(s: SessionRec, reason: string): void {
   s.updatedAt = nowIso();
   persistSession(s);
   closeRuntime(s.id);
+  bump("vm_lost");
   s.seq += 1;
   appendStep(s.id, {
     session_id: s.id, task_id: s.taskId, step_id: uid("step"), seq: s.seq,
@@ -891,29 +892,57 @@ export async function fetchModelInfo(): Promise<InferenceModelInfo | null> {
 }
 
 /** Best-effort restart recovery: load persisted sessions/tasks/vms into memory. */
-export function hydrateFromDisk(): { sessions: number; tasks: number; vms: number } {
-  const out = { sessions: 0, tasks: 0, vms: 0 };
+export function hydrateFromDisk(): { sessions: number; tasks: number; vms: number; demoted?: number } {
+  const out: { sessions: number; tasks: number; vms: number; demoted?: number } = { sessions: 0, tasks: 0, vms: 0 };
   if (!stor) return out;
   try {
     for (const d of stor.store.list("sessions", 500)) {
       const id = String(d["id"] ?? "");
       if (!id || sessions.has(id)) continue;
-      const status = String(d["status"] ?? "STOPPED");
+      // Recovery honesty: a session that was RUNNING when the process died
+      // is NOT resurrected as RUNNING — its VM, runtime, and lease state
+      // are unproven after a restart. It demotes to PAUSED with an explicit
+      // reason and requires POST /v1/sessions/:id/resume to continue.
+      // Nothing auto-executes on boot, ever.
+      let status = String(d["status"] ?? "STOPPED");
+      let paused = d["paused"] === true;
+      let demoted = 0;
+      if (status === "RUNNING") {
+        status = "PAUSED";
+        paused = true;
+        demoted = 1;
+      }
       const sm = new StateMachine<string>(status, SESSION_SM);
-      sessions.set(id, {
+      const rec: SessionRec = {
         id, taskId: String(d["taskId"] ?? d["task_id"] ?? ""),
         goal: String(d["goal"] ?? ""), vmId: String(d["vmId"] ?? ""),
         status, seq: Number(d["seq"] ?? 0) || 0,
-        paused: d["paused"] === true, humanControl: d["humanControl"] === true,
-        createdAt: String(d["createdAt"] ?? nowIso()), updatedAt: String(d["updatedAt"] ?? nowIso()),
+        paused, humanControl: d["humanControl"] === true,
+        createdAt: String(d["createdAt"] ?? nowIso()), updatedAt: nowIso(),
         sm, owner: typeof d["owner"] === "string" ? String(d["owner"]) : "",
         lastFrame: typeof d["lastFrame"] === "string" ? String(d["lastFrame"]) : undefined,
         modeEnforced: d["modeEnforced"] === true,
         modeRetryAt: typeof d["modeRetryAt"] === "number" ? d["modeRetryAt"] : undefined,
         vmLossReason: typeof d["vmLossReason"] === "string" ? String(d["vmLossReason"]) : undefined,
-      });
+      };
+      sessions.set(id, rec);
+      if (demoted === 1) {
+        try {
+          stor.store.put("sessions", {
+            id, goal: rec.goal, vmId: rec.vmId, status: rec.status, taskId: rec.taskId,
+            seq: rec.seq, paused: rec.paused, humanControl: rec.humanControl,
+            lastFrame: rec.lastFrame, owner: rec.owner,
+            createdAt: rec.createdAt, updatedAt: rec.updatedAt,
+            recoveryNote: "demoted RUNNING->PAUSED on restart (unproven state; resume explicitly)",
+          });
+        } catch { /* best effort */ }
+        try {
+          writeControlFlag(id, rec.humanControl, true);
+        } catch { /* best effort */ }
+      }
       if (!traces.has(id)) traces.set(id, []);
       out.sessions += 1;
+      out.demoted = (out.demoted ?? 0) + demoted;
     }
     for (const d of stor.store.list("tasks", 500)) {
       const id = String(d["id"] ?? "");
@@ -980,7 +1009,7 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
     // hydration is best-effort
   }
   if (out.sessions + out.tasks + out.vms > 0) {
-    log("info", "hydrated persisted docs", { ...out, note: "in-flight RUNNING stays RUNNING" });
+    log("info", "hydrated persisted docs", { ...out, note: "in-flight RUNNING demoted to PAUSED (resume explicitly; nothing auto-runs)" });
   }
   return out;
 }
@@ -1096,7 +1125,7 @@ function appendStep(sessionId: string, step: Record<string, unknown>): void {
   try {
     stor?.store.appendTrace(sessionId, stamped);
   } catch {
-    // ignore
+    bump("trace_write_failed");
   }
   broadcast(sessionId, { kind: "step", sessionId, step: stamped });
 }
@@ -1297,6 +1326,29 @@ function corsOrigins(): string[] {
     .split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+// ── observability counters (in-memory; reset on restart, documented) ──
+// verbs: _failed/_rejected count deterministic failure behavior, never
+// hidden. Correlation: every counter event carries requestId in the
+// structured log line emitted at the same site.
+const metricsCounters: Record<string, number> = {
+  actuation_failed: 0, stale_rejected: 0, unsupported_action: 0,
+  human_takeover: 0, human_release: 0, benchmark_runs: 0, benchmark_failures: 0,
+  inference_failed: 0, vm_lost: 0, vm_provision_failed: 0, trace_write_failed: 0,
+  validation_pass: 0, validation_failed: 0, validation_inconclusive: 0, validation_invalid: 0,
+};
+function bump(name: string): void {
+  metricsCounters[name] = (metricsCounters[name] ?? 0) + 1;
+}
+
+export function metricsSnapshot(): { gauges: Record<string, number>; counters: Record<string, number> } {
+  let wsConnections = 0;
+  for (const set of streams.values()) wsConnections += set.size;
+  return {
+    gauges: { sessions_active: sessions.size, vms_active: vms.size, queue_depth: 0, ws_connections: wsConnections },
+    counters: { ...metricsCounters },
+  };
+}
+
 export function buildApp(): express.Express {
   const app = express();
   // Request IDs first: every response carries x-request-id; 500s echo it.
@@ -1346,9 +1398,19 @@ export function buildApp(): express.Express {
     });
   });
   app.get("/metrics", (_req: Request, res: Response) => {
-    res.type("text/plain").send(
-      `# HELP evex_sessions Total sessions\n# TYPE evex_sessions gauge\nevex_sessions ${sessions.size}\n# HELP evex_vms Total VMs\n# TYPE evex_vms gauge\nevex_vms ${vms.size}\n`,
-    );
+    const snap = metricsSnapshot();
+    const lines = [
+      "# HELP evex_sessions Total sessions",
+      "# TYPE evex_sessions gauge",
+      `evex_sessions ${sessions.size}`,
+      "# HELP evex_vms Total VMs",
+      "# TYPE evex_vms gauge",
+      `evex_vms ${vms.size}`,
+    ];
+    for (const [k, v] of Object.entries(snap.counters)) {
+      lines.push(`# HELP evex_${k} Total ${k.replace(/_/g, " ")}`, `# TYPE evex_${k} counter`, `evex_${k} ${v}`);
+    }
+    res.type("text/plain").send(lines.join("\n") + "\n");
   });
 
   const v1 = express.Router();
@@ -1376,6 +1438,7 @@ export function buildApp(): express.Express {
       try {
         provisioned = await provisionDriverVm(owner, spec as Record<string, unknown>);
       } catch (err) {
+        bump("vm_provision_failed");
         res.status(500).json({ error: "vm_provision_failed", message: err instanceof Error ? err.message : String(err) });
         return;
       }
@@ -1436,6 +1499,31 @@ export function buildApp(): express.Express {
     broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status });
     res.json({ id: s.id, status: s.status });
   });
+  // Explicit resume after pause OR restart-demotion. Resuming re-arms the
+  // session for workers; it never backfills execution. Only PAUSED sessions
+  // resume (FAILED/STOPPED/DONE are terminal; RUNNING needs no resume).
+  v1.post("/sessions/:id/resume", requireCap("computer:act"), (req: Request, res: Response) => {
+    const s = sessions.get(req.params["id"] as string);
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
+    if (s.status !== "PAUSED") {
+      res.status(409).json({ error: "illegal_transition", message: `only PAUSED sessions resume (status ${s.status})` });
+      return;
+    }
+    try {
+      s.sm.transition("RUNNING", "explicit resume");
+    } catch (err) {
+      res.status(409).json({ error: "illegal_transition", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    s.paused = false; s.status = "RUNNING"; s.updatedAt = nowIso();
+    persistSession(s);
+    try {
+      writeControlFlag(s.id, s.humanControl, false);
+    } catch { /* best effort */ }
+    broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status });
+    res.json({ id: s.id, status: s.status });
+  });
   v1.post("/sessions/:id/step", requireCap("computer:act"), (req: Request, res: Response) => {
     const s = sessions.get(req.params["id"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
@@ -1465,6 +1553,7 @@ export function buildApp(): express.Express {
     try {
       provisioned = await provisionDriverVm(owner, body as Record<string, unknown>);
     } catch (err) {
+      bump("vm_provision_failed");
       res.status(500).json({ error: "vm_provision_failed", message: err instanceof Error ? err.message : String(err) });
       return;
     }
@@ -1631,6 +1720,7 @@ export function buildApp(): express.Express {
     if (denyIfNotOwner(v, req, res)) return;
     const drv = driverOf(v);
     if (!drv || drv.backend === "dev-framebuffer") {
+      bump("unsupported_action");
       res.status(501).json({ error: "unsupported_action", message: `${op} requires a driver-backed VM` });
       return;
     }
@@ -1843,6 +1933,7 @@ export function buildApp(): express.Express {
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
+      bump("inference_failed");
       res.status(502).json({ error: "inference_unavailable", detail: reason.slice(0, 200) });
     }
   });
@@ -1878,6 +1969,7 @@ export function buildApp(): express.Express {
     const realPath = Boolean(drv && drv.backend !== "dev-framebuffer");
     const current = realPath ? (s.lastFrame ?? `f-${s.seq}`) : `f-${s.seq}`;
     if (body.frameId !== undefined && body.frameId !== current) {
+      bump("stale_rejected");
       res.status(409).json({ error: "stale_perception", current });
       return;
     }
@@ -1905,9 +1997,11 @@ export function buildApp(): express.Express {
           return;
         }
         if (err instanceof EveError && (err.code === "STALE_PERCEPTION" || err.code === "UNSUPPORTED")) {
+          bump(err.code === "STALE_PERCEPTION" ? "stale_rejected" : "unsupported_action");
           res.status(err.code === "STALE_PERCEPTION" ? 409 : 501).json({ error: err.code === "STALE_PERCEPTION" ? "stale_perception" : "unsupported_action", message: err.message });
           return;
         }
+        bump("actuation_failed");
         res.status(502).json({ error: "actuation_failed", message: err instanceof Error ? err.message : String(err) });
       }
       return;
@@ -1950,6 +2044,7 @@ export function buildApp(): express.Express {
     s.humanControl = true; s.updatedAt = nowIso();
     persistSession(s);
     writeControlFlag(sessionId, true, s.paused);
+    bump("human_takeover");
     broadcast(sessionId, { kind: "takeover", sessionId });
     res.json({ sessionId, humanControl: true });
   });
@@ -1962,6 +2057,7 @@ export function buildApp(): express.Express {
     s.humanControl = false; s.updatedAt = nowIso();
     persistSession(s);
     writeControlFlag(sessionId, false, s.paused);
+    bump("human_release");
     broadcast(sessionId, { kind: "release", sessionId });
     res.json({ sessionId, humanControl: false });
   });
@@ -2030,35 +2126,40 @@ export function buildApp(): express.Express {
     });
     t.result = result;
     if (result.verdict === "PASS" || result.verdict === "FAILED") t.status = "DONE";
+    bump(result.verdict === "PASS" ? "validation_pass" : result.verdict === "FAILED" ? "validation_failed" : result.verdict === "INCONCLUSIVE" ? "validation_inconclusive" : "validation_invalid");
     persistTask(t);
     res.json({ task: { id: t.id, status: t.status }, validation: result });
   });
 
   // ── trace / replay / report ──
+  // Owner enforcement is unconditional: an unknown session fails closed
+  // (404) even when file-backed steps exist — legacy/unowned records never
+  // become a cross-tenant read path (including post-restart, when memory
+  // may lag the files).
   v1.get("/trace/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
-    if (s && denyIfNotOwner(s, req, res)) return;
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
     const steps = mergedTraceSteps(id, 2000);
-    if (steps.length === 0 && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
     res.json({ sessionId: id, steps });
   });
   v1.post("/replay/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
-    if (s && denyIfNotOwner(s, req, res)) return;
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
     // Merge worker/file-appended steps missing from memory (dedupe by step_id).
     const steps = mergedTraceSteps(id);
-    if (steps.length === 0 && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
     const { replayed, verdict, issues } = verifyReplay(steps);
     res.json({ sessionId: id, replayed, verdict, issues });
   });
   v1.get("/report/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
-    if (s && denyIfNotOwner(s, req, res)) return;
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
     const steps = mergedTraceSteps(id);
-    if (!s && steps.length === 0) { res.status(404).json({ error: "not_found" }); return; }
     res.json({
       sessionId: id, goal: s?.goal ?? "", status: s?.status ?? "UNKNOWN",
       steps: steps.length, success: (s?.status ?? "") !== "FAILED",
@@ -2487,11 +2588,13 @@ export function buildApp(): express.Express {
       });
       const full: Record<string, unknown> = { id, name: body.name, seed: body.seed, owner, ...record };
       benchmarks.set(id, full);
+      bump("benchmark_runs");
       try {
         stor?.store.put("benchmarks", { id, name: body.name, status: "DONE", at: nowIso(), taskCount: selected.length, owner });
       } catch { /* ignore */ }
       res.status(201).json(full);
     } catch (err) {
+      bump("benchmark_failures");
       log("error", "benchmark run failed", { requestId, msg: err instanceof Error ? err.message : String(err) });
       res.status(500).json({ error: "internal", requestId });
     }
@@ -2637,6 +2740,17 @@ export async function startApi(port?: number): Promise<Server> {
     }
     if (s.owner && s.owner !== `${ctx.tenant}:${ctx.user}` && ctx.role !== "admin" && !(ctx.capabilities.includes("*"))) {
       try { socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
+    // Resource bound: per-session and global WS caps fail predictably (429)
+    // instead of accumulating unbounded sockets (flood discipline).
+    const maxPerSession = Number(process.env["EVEX_MAX_WS_PER_SESSION"] ?? 32);
+    const maxTotal = Number(process.env["EVEX_MAX_WS_CONNECTIONS"] ?? 1024);
+    let totalWs = 0;
+    for (const set of streams.values()) totalWs += set.size;
+    const sessionWs = streams.get(sessionId)?.size ?? 0;
+    if (sessionWs >= maxPerSession || totalWs >= maxTotal) {
+      try { socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 5\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {

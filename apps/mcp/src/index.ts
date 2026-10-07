@@ -1,4 +1,4 @@
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Server as HttpServer } from "node:http";
@@ -426,6 +426,28 @@ function checkMcpAuth(req: Request, res: Response): boolean {
 export async function startHttp(port?: number): Promise<HttpServer> {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
+  // Flood discipline: fixed-window per-caller rate limit on /mcp (the
+  // control plane has its own per-tenant limiter; this one protects the MCP
+  // front door). 429s carry Retry-After; /health is never limited.
+  const mcpBuckets = new Map<string, { count: number; resetAt: number }>();
+  const mcpLimit = (): number => {
+    const n = Number(process.env["EVEX_MCP_RATE_LIMIT"] ?? 600);
+    return Number.isFinite(n) && n > 0 ? Math.min(100000, Math.floor(n)) : 600;
+  };
+  const mcpRateLimit = (req: Request, res: Response, next: NextFunction): void => {
+    const caller = String(req.headers.authorization ?? req.socket.remoteAddress ?? "anon");
+    const nowMs = Date.now();
+    let b = mcpBuckets.get(caller);
+    if (!b || nowMs >= b.resetAt) b = { count: 0, resetAt: nowMs + 60_000 };
+    b.count += 1;
+    mcpBuckets.set(caller, b);
+    if (b.count > mcpLimit()) {
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((b.resetAt - nowMs) / 1000))));
+      res.status(429).json({ jsonrpc: "2.0", error: { code: -32000, message: "rate_limited" }, id: null });
+      return;
+    }
+    next();
+  };
   app.get("/health", (_req: Request, res: Response) => res.json({ ok: true, service: "evex-mcp", at: new Date().toISOString() }));
   // Persistent StreamableHTTP sessions: one server+transport per MCP session id.
   // A fresh server per request can never complete initialize → tools/list, so
@@ -477,10 +499,10 @@ export async function startHttp(port?: number): Promise<HttpServer> {
       }
     });
   };
-  app.post("/mcp", (req: Request, res: Response) => {
+  app.post("/mcp", mcpRateLimit, (req: Request, res: Response) => {
     void handleMcp(req, res);
   });
-  app.get("/mcp", (req: Request, res: Response) => {
+  app.get("/mcp", mcpRateLimit, (req: Request, res: Response) => {
     void handleMcp(req, res);
   });
   app.delete("/mcp", (req: Request, res: Response) => {
