@@ -14,7 +14,10 @@ is mandatory in production — its absence refuses startup, never dev auth.
 - Every `/v1` route requires `Authorization: Bearer <EVEX_AUTH_TOKEN>`
   (only `GET /health`, `/ready`, `/version`, `/metrics` are public probes).
 - WebSocket upgrades carry the same auth (header or `?token=`); unknown
-  sessions 404, cross-tenant 403, floods 429.
+  sessions 404, cross-tenant 403, floods 429. The `?token=` query form
+  exists because browser WebSocket clients cannot set headers — it is not
+  preferred, and the server never logs request URLs (honesty-gate
+  enforced), so tokens do not land in access logs.
 - The MCP surface reuses the same token: `ControlPlaneClient` always sends
   the Bearer header and `createClientFromEnv` refuses to construct a client
   when `EVEX_AUTH_TOKEN` is unset. `/mcp` additionally requires

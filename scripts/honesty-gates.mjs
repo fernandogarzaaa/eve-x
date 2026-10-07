@@ -107,6 +107,11 @@ for (const f of prodTs) {
     if (/\blog\s*\(/.test(line) && /req\.headers|headers\[.authorization|EVEX_AUTH_TOKEN\]/.test(line)) {
       fail("no-secret-logging", `${f}:${i + 1}`, line.trim().slice(0, 100));
     }
+    // Upgrade/request URLs may carry ?token= (browser WebSocket has no
+    // header option); they must never reach a log line unredacted.
+    if (/\blog\s*\(/.test(line) && /req\.url/.test(line)) {
+      fail("no-url-logging", `${f}:${i + 1}`, line.trim().slice(0, 100));
+    }
   });
 }
 
@@ -122,6 +127,13 @@ for (const f of prodTs) {
   for (const need of ["SYNTHETIC_BACKEND_REFUSED", "SYNTHETIC_BACKEND_REJECTED"]) {
     if (!w.includes(need)) fail("worker-refusal", "apps/worker/src/index.ts", `missing ${need}`);
   }
+}
+
+// 13. No live-HTML sinks for server/model-controlled text in the console.
+{
+  const src = read(join(ROOT, "apps", "console", "static", "app.js"));
+  if (/\.innerHTML\s*\+=/.test(src)) fail("no-console-html-sink", "apps/console/static/app.js", "innerHTML append with interpolated text (XSS)");
+  if (/\.innerHTML\s*=\s*`/.test(src)) fail("no-console-html-sink", "apps/console/static/app.js", "innerHTML template assignment (XSS)");
 }
 
 if (failures > 0) {

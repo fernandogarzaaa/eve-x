@@ -31,6 +31,52 @@ export function verifyHmac(
   return timingSafeEqual(a, b);
 }
 
+// ── Replay resistance ──────────────────────────────────────────────────
+// A valid (ts, sig) pair is a bearer for its exact request inside the skew
+// window: without single-use tracking, a captured /exec could be replayed
+// for duplicate (possibly destructive) execution. The server records every
+// accepted signature until it expires and rejects reuse. Bounded LRU-ish
+// eviction keeps memory flat; entries outlive the skew window so late
+// replays still hit the cache (and early ones hit the timestamp check).
+
+export interface ReplayCache {
+  /** Returns true when fresh (and records the signature); false on replay. */
+  checkFresh(sig: string, nowMs?: number): boolean;
+  size(): number;
+}
+
+export function createReplayCache(maxSkewMs = 60000, maxEntries = 4096): ReplayCache {
+  const seen = new Map<string, number>();
+  const ttl = Math.max(maxSkewMs * 2, 60000);
+  return {
+    checkFresh(sig: string, nowMs?: number): boolean {
+      const now = nowMs ?? Date.now();
+      if (seen.has(sig)) return false;
+      if (seen.size >= maxEntries) {
+        // Purge expired first; if still full, drop the oldest quarter.
+        for (const [k, exp] of seen) {
+          if (exp <= now) seen.delete(k);
+          if (seen.size < maxEntries) break;
+        }
+        if (seen.size >= maxEntries) {
+          const drop = Math.ceil(maxEntries / 4);
+          const keys = seen.keys();
+          for (let i = 0; i < drop; i += 1) {
+            const k = keys.next();
+            if (k.done) break;
+            seen.delete(k.value);
+          }
+        }
+      }
+      seen.set(sig, now + ttl);
+      return true;
+    },
+    size(): number {
+      return seen.size;
+    },
+  };
+}
+
 // ── Guest agent (runs INSIDE the vm) ─────────────────────────────────────────
 
 export const GuestAgentOptions = z.object({
@@ -316,6 +362,9 @@ export async function createGuestAgent(optsInput: unknown): Promise<GuestAgent> 
   let clipboard = "";
   const beats: Array<{ vmId: string; at: string }> = [];
   const allow = new Set(opts.execAllowlist);
+  // Single-use signatures: a captured request cannot be replayed inside
+  // the skew window (non-idempotent /exec especially).
+  const replay = createReplayCache();
 
   const sendEveError = (res: ServerResponse, err: unknown): void => {
     const code = err instanceof EveError ? err.code : "";
@@ -346,6 +395,10 @@ export async function createGuestAgent(optsInput: unknown): Promise<GuestAgent> 
         if (typeof ts !== "string" || typeof sig !== "string" ||
           !verifyHmac(opts.secret, method, path, rawBody, ts, sig)) {
           sendJson(res, 401, { ok: false, error: "bad signature or stale timestamp" });
+          return;
+        }
+        if (!replay.checkFresh(sig)) {
+          sendJson(res, 401, { ok: false, error: "replayed request (signature already used)" });
           return;
         }
       }
@@ -521,10 +574,13 @@ export class HostGuestChannel {
   }
 
   private async signedFetch(method: string, path: string, bodyText = ""): Promise<Response> {
-    const ts = String(Date.now());
-    const sig = hmacSign(this.opts.secret, method, path, bodyText, ts);
+    // Fresh signature per attempt: the server treats signatures as
+    // single-use (replay cache), so a retry must be a NEW request, never a
+    // byte replay of the previous envelope.
     let lastErr: unknown = null;
     for (let attempt = 0; attempt <= this.opts.retries; attempt++) {
+      const ts = String(Date.now());
+      const sig = hmacSign(this.opts.secret, method, path, bodyText, ts);
       try {
         const res = await fetch(`${this.opts.baseUrl}${path}`, {
           method,
@@ -569,10 +625,11 @@ export class HostGuestChannel {
   }
 
   async screenshot(): Promise<Buffer> {
-    const ts = String(Date.now());
-    const sig = hmacSign(this.opts.secret, "GET", "/screenshot", "", ts);
     let lastErr: unknown = null;
     for (let attempt = 0; attempt <= this.opts.retries; attempt++) {
+      // Fresh signature per attempt (single-use server cache — see above).
+      const ts = String(Date.now());
+      const sig = hmacSign(this.opts.secret, "GET", "/screenshot", "", ts);
       try {
         const res = await fetch(`${this.opts.baseUrl}/screenshot`, {
           headers: { "x-eve-ts": ts, "x-eve-sig": sig },

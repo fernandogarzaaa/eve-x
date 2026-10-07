@@ -7,6 +7,8 @@ import { join, dirname, basename } from "node:path";
 import {
   createGuestAgent,
   HostGuestChannel,
+  hmacSign,
+  createReplayCache,
   resolveExecutable,
   lexicalInsideRoot,
   canonicalInsideRoot,
@@ -196,5 +198,45 @@ describe("executable identity (not basename)", () => {
       resolveExecutable(process.execPath, new Set(["definitely-not-it"]), [dirname(process.execPath)]),
       "NOT_ALLOWLISTED",
     );
+  });
+});
+
+describe("HMAC replay resistance", () => {
+  it("a captured request cannot be replayed inside the window", async () => {
+    const url = (agent as GuestAgent).url;
+    const body = JSON.stringify({ argv: [process.execPath, "--version"] });
+    const ts = String(Date.now());
+    const sig = hmacSign(SECRET, "POST", "/exec", body, ts);
+    const headers = { "content-type": "application/json", "x-eve-ts": ts, "x-eve-sig": sig };
+    const first = await fetch(`${url}/exec`, { method: "POST", headers, body });
+    assert.equal(first.status, 200);
+    await first.text();
+    // Byte-identical replay: same ts, same sig, same body.
+    const replay = await fetch(`${url}/exec`, { method: "POST", headers, body });
+    assert.equal(replay.status, 401);
+    assert.match(await replay.text(), /replayed request/);
+  });
+
+  it("tampered body with a fresh signature fails closed (no replay bypass)", async () => {
+    const url = (agent as GuestAgent).url;
+    const ts = String(Date.now());
+    const sig = hmacSign(SECRET, "POST", "/exec", JSON.stringify({ argv: ["nope"] }), ts);
+    const res = await fetch(`${url}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-eve-ts": ts, "x-eve-sig": sig },
+      body: JSON.stringify({ argv: [process.execPath, "--version"] }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it("createReplayCache bounds memory and expires entries", () => {
+    const cache = createReplayCache(1000, 8);
+    for (let i = 0; i < 20; i += 1) {
+      assert.equal(cache.checkFresh(`sig-${i}`, 1000000), true);
+    }
+    assert.ok(cache.size() <= 8, `cache must stay bounded, got ${cache.size()}`);
+    assert.equal(cache.checkFresh("sig-0", 1000000), true, "evicted entries may be seen again (bounded cache)");
+    assert.equal(cache.checkFresh("sig-fresh", 1000000), true);
+    assert.equal(cache.checkFresh("sig-fresh", 1000000), false, "immediate reuse is a replay");
   });
 });
