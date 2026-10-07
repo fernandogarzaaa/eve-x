@@ -88,7 +88,7 @@ const SCENARIOS = [
     return { verdict: a.status === 400 || a.status === 501 ? "executed" : "failed", note: `unknown type -> ${a.status}` };
   }},
   { id: "E", goal: "spreadsheet edit: scroll the sheet view", run: async (c) => {
-    const a = await act(c.sid, { type: "scroll", confidence: 0.5 });
+    const a = await act(c.sid, { type: "scroll", x: 640, y: 400, confidence: 0.5 });
     return { verdict: [200, 501].includes(a.status) ? "executed" : "failed", note: `scroll -> ${a.status}` };
   }},
   { id: "F", goal: "terminal operation: pwd", run: async (c) => {

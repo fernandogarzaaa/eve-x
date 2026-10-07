@@ -1484,6 +1484,12 @@ export function buildApp(): express.Express {
     const s = sessions.get(req.params["id"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
+    try {
+      s.sm.transition("STOPPED", "session stop");
+    } catch (err) {
+      res.status(409).json({ error: "illegal_transition", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
     s.status = "STOPPED";
     s.updatedAt = nowIso();
     persistSession(s);
@@ -1495,6 +1501,12 @@ export function buildApp(): express.Express {
     const s = sessions.get(req.params["id"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
+    try {
+      s.sm.transition("PAUSED", "session pause");
+    } catch (err) {
+      res.status(409).json({ error: "illegal_transition", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
     s.paused = true; s.status = "PAUSED"; s.updatedAt = nowIso();
     persistSession(s);
     broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status });
@@ -2005,6 +2017,17 @@ export function buildApp(): express.Express {
         bump("actuation_failed");
         res.status(502).json({ error: "actuation_failed", message: err instanceof Error ? err.message : String(err) });
       }
+      return;
+    }
+    // Dev backend honesty: the same shape validation the real path enforces.
+    // A pointer act without coordinates (or a text act without text) is a
+    // malformed action — 400 with no trajectory advance, on every backend.
+    if ((action.type === "click" || action.type === "double_click" || action.type === "move" || action.type === "drag" || action.type === "scroll") && !action.from) {
+      res.status(400).json({ error: "bad_request", message: `${action.type} requires x/y coordinates` });
+      return;
+    }
+    if ((action.type === "type" || action.type === "terminal" || action.type === "tool") && (action.text ?? "") === "") {
+      res.status(400).json({ error: "bad_request", message: `${action.type} requires text` });
       return;
     }
     s.seq += 1;
