@@ -1150,9 +1150,10 @@ function mergedTraceSteps(sessionId: string, limit = 100000): Array<Record<strin
   const extra = file.filter((st) => !memIds.has(String(st["step_id"] ?? st["seq"])));
   if (extra.length === 0) return mem;
   // Extras are pre-restart file history missing from this process's memory,
-  // so they come FIRST; the merged stream is ordered by seq so replay's
-  // physical-order check sees the true append order, not a restart artifact.
-  return [...extra, ...mem].sort((a, b) => Number(a["seq"] ?? 0) - Number(b["seq"] ?? 0));
+  // so they come FIRST (their seqs predate the in-memory tail). No sorting:
+  // file order IS append order, and sorting would mask a reordered
+  // (tampered) log from the replay physical-order check.
+  return [...extra, ...mem];
 }
 
 function syntheticFrame(sessionId: string, seq: number): Record<string, unknown> {

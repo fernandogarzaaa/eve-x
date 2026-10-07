@@ -17,6 +17,16 @@ const check = (name, cond, detail = "") => {
   else failures.push(`${name}${detail ? ` :: ${detail}` : ""}`);
 };
 const read = (p) => readFileSync(join(ROOT, p), "utf8");
+// Missing expected files are refusal (drift), never a crash: a release
+// that cannot be fully verified is an unverifiable release.
+const readSoft = (p) => {
+  try {
+    return read(p);
+  } catch {
+    failures.push(`${p} missing (release cannot be verified without it)`);
+    return "";
+  }
+};
 const sh = (cmd) => {
   try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return ""; }
@@ -26,18 +36,23 @@ const pkg = JSON.parse(read("package.json"));
 const version = pkg.version;
 
 // 1. version agreement across every surface
-const cliVersion = read("apps/cli/src/index.ts").match(/const VERSION = "([^"]+)"/)?.[1];
+const cliVersion = readSoft("apps/cli/src/index.ts").match(/const VERSION = "([^"]+)"/)?.[1];
 check("cli VERSION == package.json", cliVersion === version, `cli=${cliVersion} pkg=${version}`);
-const mcpVersion = read("apps/mcp/src/index.ts").match(/new\s+McpServer\(\{\s*name:\s*"eve-x",\s*version:\s*"([^"]+)"/)?.[1];
+const mcpVersion = readSoft("apps/mcp/src/index.ts").match(/new\s+McpServer\(\{\s*name:\s*"eve-x",\s*version:\s*"([^"]+)"/)?.[1];
 check("mcp server version == package.json", mcpVersion === version, `mcp=${mcpVersion} pkg=${version}`);
-const openapiVersion = JSON.parse(read("apps/api/openapi.json")).info.version;
+let openapiVersion = null;
+try {
+  openapiVersion = JSON.parse(readSoft("apps/api/openapi.json")).info.version;
+} catch {
+  failures.push("apps/api/openapi.json unreadable (release cannot be verified without it)");
+}
 check("openapi version == package.json", openapiVersion === version, `openapi=${openapiVersion} pkg=${version}`);
 
 // 2. release-manifest.json describes THIS source
 if (!existsSync(join(ROOT, "release-manifest.json"))) {
   failures.push("release-manifest.json missing (run npm run release on a clean tree)");
 } else {
-  const m = JSON.parse(read("release-manifest.json"));
+  const m = JSON.parse(readSoft("release-manifest.json"));
   const head = sh("git rev-parse HEAD");
   const tree = sh('git rev-parse "HEAD^{tree}"');
   const dirty = sh("git status --porcelain").length > 0;
@@ -46,15 +61,15 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
   check("manifest.tree == HEAD^{tree}", m.tree === tree, "tree drift");
   check("release tree is clean", m.dirty === false && dirty === false, "dirty release must never ship");
   check("manifest mcp server matches", String(m.mcp?.server ?? "") === `eve-x ${version}`, `got ${m.mcp?.server}`);
-  const shared = read("packages/mcp-shared/src/index.ts").match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1];
+  const shared = readSoft("packages/mcp-shared/src/index.ts").match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1];
   check("manifest toolSurface == MCP_TOOL_VERSION", m.mcp?.toolSurface === shared, `manifest=${m.mcp?.toolSurface} src=${shared}`);
   try {
-    const installedSdk = JSON.parse(read("node_modules/@modelcontextprotocol/sdk/package.json")).version;
+    const installedSdk = JSON.parse(readSoft("node_modules/@modelcontextprotocol/sdk/package.json")).version;
     check("manifest mcp.sdk == installed SDK", m.mcp?.sdk === installedSdk, `manifest=${m.mcp?.sdk} installed=${installedSdk}`);
   } catch {
     check("manifest mcp.sdk == installed SDK", m.mcp?.sdk === "unknown", "SDK not installed; manifest must say unknown");
   }
-  const mcpSrc = read("apps/mcp/src/index.ts");
+  const mcpSrc = readSoft("apps/mcp/src/index.ts");
   const counted = [...mcpSrc.matchAll(/registerTool\("([^"]+)"/g)].map((x) => x[1]);
   check("manifest toolCount matches source", m.mcp?.toolCount === counted.length, `manifest=${m.mcp?.toolCount} src=${counted.length}`);
   const g = m.guest ?? {};
@@ -73,16 +88,16 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
 if (!existsSync(join(ROOT, "RELEASE_PROVENANCE.json"))) {
   failures.push("RELEASE_PROVENANCE.json missing (run npm run release on a clean tree)");
 } else {
-  const p = JSON.parse(read("RELEASE_PROVENANCE.json"));
+  const p = JSON.parse(readSoft("RELEASE_PROVENANCE.json"));
   check("provenance.version == package.json", p.version === version, `prov=${p.version}`);
   check("provenance.commit == HEAD", p.source?.commit === sh("git rev-parse HEAD"), "commit drift");
 }
 
 // 4. deployment references match the release
-const rel = read("infra/deployment/docker-compose.release.yml");
+const rel = readSoft("infra/deployment/docker-compose.release.yml");
 const tagDefault = rel.match(/EVEX_IMAGE_TAG:-(.*?)}/)?.[1];
 check("compose.release EVEX_IMAGE_TAG default == package.json", tagDefault === version, `got ${tagDefault}`);
-const compose = read("infra/deployment/docker-compose.yml");
+const compose = readSoft("infra/deployment/docker-compose.yml");
 for (const img of ["postgres:16-alpine", "redis:7-alpine", "dxflrs/garage:v2.0.0"]) {
   const line = compose.split("\n").find((l) => l.includes(img));
   check(`compose pins ${img} by digest`, !!line && line.includes("@sha256:"), `got ${(line ?? "").trim()}`);
