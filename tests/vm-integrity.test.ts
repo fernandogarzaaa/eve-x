@@ -123,6 +123,49 @@ describe("production docker image policy", () => {
   });
 });
 
+describe("production backend refusal", () => {
+  it("selectDriver refuses dev backends in production", async () => {
+    const prevMode = process.env["EVEX_MODE"];
+    const prevBackend = process.env["VM_BACKEND"];
+    try {
+      process.env["EVEX_MODE"] = "production";
+      const { selectDriver } = await import("../packages/vm/src/index.js");
+      for (const backend of ["dev", "dev-framebuffer"]) {
+        process.env["VM_BACKEND"] = backend;
+        await assertThrowsCode(() => selectDriver({}), "DEV_BACKEND_REFUSED");
+      }
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+      if (prevBackend === undefined) delete process.env["VM_BACKEND"];
+      else process.env["VM_BACKEND"] = prevBackend;
+    }
+  });
+
+  it("VmManager.create refuses network:full in production without explicit allow", async () => {
+    const prevMode = process.env["EVEX_MODE"];
+    const prevAllow = process.env["EVEX_ALLOW_FULL_NETWORK"];
+    try {
+      const { VmManager, DevFramebufferDriver } = await import("../packages/vm/src/index.js");
+      process.env["EVEX_MODE"] = "production";
+      delete process.env["EVEX_ALLOW_FULL_NETWORK"];
+      const mgr = new VmManager(new DevFramebufferDriver(), [], {});
+      await assertThrowsCode(
+        () => mgr.create("t", { image: "ubuntu-desktop-v1", network: "full" } as never),
+        "FORBIDDEN_NETWORK",
+      );
+      process.env["EVEX_ALLOW_FULL_NETWORK"] = "1";
+      const rec = await mgr.create("t", { image: "ubuntu-desktop-v1", network: "full" } as never);
+      assert.ok(rec.vmId.length > 0);
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+      if (prevAllow === undefined) delete process.env["EVEX_ALLOW_FULL_NETWORK"];
+      else process.env["EVEX_ALLOW_FULL_NETWORK"] = prevAllow;
+    }
+  });
+});
+
 describe("agent account privilege separation", () => {
   it("seed grants no passwordless sudo to the agent account", () => {
     const seed = defaultSeedUserData({ hostname: "h", guestSecret: "test-fixture-guest-secret-0123456789" });

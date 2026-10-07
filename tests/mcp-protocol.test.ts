@@ -159,4 +159,21 @@ describe("mcp http auth gating", () => {
       delete process.env["EVEX_MCP_TOKEN"];
     }
   });
+
+  it("dev-open fallback exists only in development mode", async () => {
+    delete process.env["EVEX_MCP_TOKEN"];
+    delete process.env["EVEX_AUTH_TOKEN"];
+    const prevMode = process.env["EVEX_MODE"];
+    try {
+      process.env["EVEX_MODE"] = "production";
+      const denied = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+      assert.equal(denied.status, 401);
+      process.env["EVEX_MODE"] = "test";
+      const deniedTest = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+      assert.equal(deniedTest.status, 401);
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+    }
+  });
 });

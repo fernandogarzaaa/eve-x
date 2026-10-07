@@ -400,14 +400,27 @@ function expectedMcpToken(): string {
   return process.env["EVEX_MCP_TOKEN"] ?? process.env["EVEX_AUTH_TOKEN"] ?? "";
 }
 
+/** Execution mode: the dev-open fallback below exists ONLY in development. */
+function mcpExecutionMode(): "development" | "test" | "production" {
+  const raw = (process.env["EVEX_MODE"] ?? "").trim().toLowerCase();
+  if (raw === "production" || raw === "prod") return "production";
+  if (raw === "test" || raw === "testing" || raw === "ci") return "test";
+  return "development";
+}
+
 /**
  * Gate the /mcp endpoint. Returns false after writing 401 when a token is
- * configured and the caller did not present it. Open endpoints stay
+ * configured and the caller did not present it — or when no token is
+ * configured outside development mode (fail closed). Open endpoints stay
  * unauthenticated: /health is always public.
  */
 function checkMcpAuth(req: Request, res: Response): boolean {
   const expected = expectedMcpToken();
   if (!expected) {
+    if (mcpExecutionMode() !== "development") {
+      res.status(401).json({ error: "unauthorized", message: "MCP bearer token required outside development mode" });
+      return false;
+    }
     // Single-user dev scope: no shared secret configured. Allow local use,
     // but stamp every response so callers know auth is off.
     res.setHeader("x-evex-dev", "1");

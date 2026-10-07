@@ -1866,6 +1866,14 @@ export function buildApp(): express.Express {
       }
       return;
     }
+    // Production never serves synthetic perception: a dev-backend session
+    // reaching this point in production means the boot gate was bypassed —
+    // refuse loudly instead of manufacturing evidence.
+    if (executionMode() === "production") {
+      bump("unsupported_action");
+      res.status(503).json({ error: "synthetic_backend_refused", message: "dev-framebuffer perception is refused in production" });
+      return;
+    }
     const percept = {
       frameId: `f-${s.seq}`, width: 1920, height: 1080, pngBase64: "",
       // Corners [x0, y0, x1, y1] like every other producer in the system.
@@ -1915,6 +1923,12 @@ export function buildApp(): express.Express {
       } else {
         // Dev backend: synthetic percept (empty pixels). Product inference
         // servers reject empty png_base64; that 400 surfaces as 502 below.
+        // In production the dev branch is refused outright (see observe).
+        if (executionMode() === "production") {
+          bump("unsupported_action");
+          res.status(503).json({ error: "synthetic_backend_refused", message: "dev-framebuffer suggest is refused in production" });
+          return;
+        }
         percept = {
           frameId: `f-${s.seq}`, width: 1920, height: 1080, pngBase64: "",
           regions: [{ regionId: "r-taskbar", bbox: [0, 1040, 1919, 1079], label: "taskbar", confidence: 0.99 }],
@@ -2017,6 +2031,12 @@ export function buildApp(): express.Express {
         bump("actuation_failed");
         res.status(502).json({ error: "actuation_failed", message: err instanceof Error ? err.message : String(err) });
       }
+      return;
+    }
+    // Production never advances synthetic trajectories (see observe above).
+    if (executionMode() === "production") {
+      bump("unsupported_action");
+      res.status(503).json({ error: "synthetic_backend_refused", message: "dev-framebuffer actuation is refused in production" });
       return;
     }
     // Dev backend honesty: the same shape validation the real path enforces.
@@ -2713,6 +2733,8 @@ export async function startApi(port?: number): Promise<Server> {
       vmBackend: process.env["VM_BACKEND"] ?? "auto",
       publicUrl: process.env["EVEX_PUBLIC_URL"] ?? "",
       objectEndpoint: process.env["OBJECT_ENDPOINT"] ?? "",
+      mode: "production",
+      filePrimaryAck: (process.env["EVEX_FILE_PRIMARY_ACK"] ?? "") === "1",
     });
     for (const f of verdict.findings) {
       log(f.status === "fail" ? "error" : "info", `production gate: ${f.name}=${f.status}`, { detail: f.detail });

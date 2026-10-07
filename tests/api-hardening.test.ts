@@ -229,6 +229,25 @@ describe("api hardening", () => {
     assert.equal(taskCross.status, 403);
   });
 
+  it("production mode refuses synthetic dev-backend perception/actuation", async () => {
+    const sess = await createSession(MASTER, "prod dev refusal");
+    const prevMode = process.env["EVEX_MODE"];
+    try {
+      process.env["EVEX_MODE"] = "production";
+      const o = await api("GET", `/v1/computer/${sess}/observe`, MASTER);
+      assert.equal(o.status, 503);
+      assert.equal(o.json.error, "synthetic_backend_refused");
+      const a = await api("POST", `/v1/computer/${sess}/act`, MASTER, { type: "wait", ms: 5, confidence: 0.5 });
+      assert.equal(a.status, 503);
+      assert.equal(a.json.error, "synthetic_backend_refused");
+      // No trajectory advance on refusal.
+      const tr = await api("GET", `/v1/trace/${sess}`, MASTER);
+      assert.equal((tr.json.steps as unknown[]).length, 1, "only the session-create step may exist");
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+    }
+  });
   it("judgment duplicates on (stepId, reviewer) return 409", async () => {
     // Judgments bind to real, owned steps: unknown steps fail closed (404).
     const sess = await createSession(MASTER, "judgment dedupe case");

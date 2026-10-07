@@ -410,6 +410,16 @@ export interface ProductionInput {
   vmBackend?: string;
   publicUrl?: string;
   objectEndpoint?: string;
+  /** Execution mode under evaluation. Only "production" applies the
+   *  fail-closed rules below; development/test keep advisory warns so
+   *  existing unit expectations and local ergonomics are unchanged. */
+  mode?: ExecutionMode;
+  /** Explicit operator acknowledgment of file-primary durability
+   *  (DATA_DIR on durable storage with backups). The filesystem IS the
+   *  designed system of record — this flag records that the operator
+   *  knows postgres/redis add no durability here, instead of letting an
+   *  empty requireServices silently imply a service-backed deployment. */
+  filePrimaryAck?: boolean;
 }
 
 const WEAK_TOKENS = new Set(["", "change-me", "changeme", "test", "dev", "password", "evex", "secret"]);
@@ -438,7 +448,11 @@ export function evaluateProduction(input: ProductionInput): { verdict: "producti
     findings.push({ name: "cors", status: "pass", detail: `allowlist: ${origins.join(",")}` });
   }
   if (input.requireServices.length === 0) {
-    findings.push({ name: "services", status: "warn", detail: "EVEX_REQUIRE_SERVICES unset: silent file fallback possible (development-only posture)" });
+    if (input.mode === "production" && input.filePrimaryAck !== true) {
+      findings.push({ name: "services", status: "fail", detail: "EVEX_REQUIRE_SERVICES unset in production without EVEX_FILE_PRIMARY_ACK=1: declare required services, or explicitly acknowledge file-primary durability (DATA_DIR on durable storage with backups)" });
+    } else {
+      findings.push({ name: "services", status: "warn", detail: "EVEX_REQUIRE_SERVICES unset: silent file fallback possible (development-only posture)" });
+    }
   }
   for (const svc of input.requireServices) {
     const st = input.serviceStatus[svc];
@@ -458,8 +472,14 @@ export function evaluateProduction(input: ProductionInput): { verdict: "producti
     findings.push({ name: "quotas", status: "pass", detail: `max sessions ${input.maxSessions}` });
   }
   const backend = (input.vmBackend ?? "auto").toLowerCase();
-  if (backend.startsWith("dev")) {
-    findings.push({ name: "vm-backend", status: "warn", detail: `VM_BACKEND=${backend} is development-only (no isolation)` });
+  if (backend === "auto" && input.mode === "production") {
+    findings.push({ name: "vm-backend", status: "fail", detail: "VM_BACKEND=auto in production: pin qemu or docker explicitly (auto may silently select the synthetic dev backend)" });
+  } else if (backend.startsWith("dev")) {
+    if (input.mode === "production") {
+      findings.push({ name: "vm-backend", status: "fail", detail: `VM_BACKEND=${backend} in production: no isolation, synthetic evidence` });
+    } else {
+      findings.push({ name: "vm-backend", status: "warn", detail: `VM_BACKEND=${backend} is development-only (no isolation)` });
+    }
   } else {
     findings.push({ name: "vm-backend", status: "pass", detail: `VM_BACKEND=${backend}` });
   }

@@ -2133,9 +2133,13 @@ export async function selectDriver(opts: QemuDriverOpts & DockerDriverOpts = {})
   const qemu = new QemuDriver(opts);
   const docker = new DockerDesktopDriver(opts);
   const dev = new DevFramebufferDriver();
+  const production = vmExecutionMode() === "production";
   if (env === "qemu") return { driver: qemu, backend: "qemu", note: "VM_BACKEND=qemu (explicit)" };
   if (env === "docker") return { driver: docker, backend: "docker", note: "VM_BACKEND=docker (explicit)" };
   if (env === "dev" || env === "dev-framebuffer" || env === "devfb") {
+    if (production) {
+      throw new EveError("DEV_BACKEND_REFUSED", `VM_BACKEND=${env} is refused in production: no isolation, synthetic evidence`);
+    }
     return { driver: dev, backend: dev.backend, note: `VM_BACKEND=${env} (explicit): ${dev.note}` };
   }
   if (await hasBinary("qemu-system-x86_64")) {
@@ -2146,6 +2150,9 @@ export async function selectDriver(opts: QemuDriverOpts & DockerDriverOpts = {})
       const info = await runCmd("docker", ["info"], 10000);
       if (info.code === 0) return { driver: docker, backend: "docker", note: "auto: docker daemon reachable" };
     } catch { /* fall through */ }
+  }
+  if (production) {
+    throw new EveError("DEV_BACKEND_REFUSED", "auto selection found no hypervisor; dev-framebuffer is refused in production");
   }
   return { driver: dev, backend: dev.backend, note: `auto: no hypervisor found; ${dev.note}` };
 }
@@ -2309,6 +2316,12 @@ export class VmManager {
     // (concurrent callers serialize on the event loop between these awaits).
     const spec = VmSpec.parse(specInput);
     this.checkQuotas(owner, spec);
+    // Production egress discipline: unrestricted bridge/NAT egress ("full")
+    // is refused unless the operator explicitly allows it. The proxy-layer
+    // allowlist assumption must not be silently bypassed by a spec flag.
+    if (spec.network === "full" && vmExecutionMode() === "production" && process.env["EVEX_ALLOW_FULL_NETWORK"] !== "1") {
+      throw new EveError("FORBIDDEN_NETWORK", 'network:"full" is refused in production without EVEX_ALLOW_FULL_NETWORK=1');
+    }
     const rec = await this.primary.create(spec, owner, driverOpts);
     this.registry.set(rec.vmId, { owner, backend: this.primary.backend, spec: rec.spec });
     this.leases.set(rec.vmId, { owner, expiresAtMs: Date.now() + ttl, ttlMs: ttl });

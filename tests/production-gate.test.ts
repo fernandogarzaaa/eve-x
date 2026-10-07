@@ -74,6 +74,50 @@ describe("production configuration gate", () => {
     });
     assert.ok(r.findings.some((f) => f.name === "tls" && f.status === "pass"));
   });
+
+  it("production mode refuses auto/dev backends", () => {
+    for (const backend of ["auto", "dev", "dev-framebuffer"]) {
+      const r = evaluateProduction({
+        authToken: "a-very-long-production-token-0123456789",
+        corsOrigins: "https://a.example.com",
+        requireServices: ["object"],
+        serviceStatus: { object: { reachable: true, detail: "ok" } },
+        maxSessions: 8, vmBackend: backend, mode: "production",
+        filePrimaryAck: true,
+      });
+      assert.equal(r.verdict, "development-only", `backend ${backend} must fail in production`);
+      assert.ok(r.findings.some((f) => f.name === "vm-backend" && f.status === "fail"));
+    }
+    const pinned = evaluateProduction({
+      authToken: "a-very-long-production-token-0123456789",
+      corsOrigins: "https://a.example.com",
+      requireServices: ["object"],
+      serviceStatus: { object: { reachable: true, detail: "ok" } },
+      maxSessions: 8, vmBackend: "qemu", mode: "production",
+      filePrimaryAck: true, publicUrl: "https://evex.example.com",
+    });
+    assert.equal(pinned.verdict, "production-safe");
+  });
+
+  it("production mode requires services or explicit file-primary ack", () => {
+    const base = {
+      authToken: "a-very-long-production-token-0123456789",
+      corsOrigins: "https://a.example.com",
+      requireServices: [] as string[],
+      serviceStatus: {},
+      maxSessions: 8, vmBackend: "qemu",
+      publicUrl: "https://evex.example.com",
+    };
+    const unacked = evaluateProduction({ ...base, mode: "production" });
+    assert.equal(unacked.verdict, "development-only");
+    assert.ok(unacked.findings.some((f) => f.name === "services" && f.status === "fail"));
+    const acked = evaluateProduction({ ...base, mode: "production", filePrimaryAck: true });
+    assert.equal(acked.verdict, "production-safe");
+    // Non-production keeps the advisory warn (existing ergonomics unchanged).
+    const dev = evaluateProduction({ ...base });
+    assert.equal(dev.verdict, "production-safe");
+    assert.ok(dev.findings.some((f) => f.name === "services" && f.status === "warn"));
+  });
 });
 
 describe("execution modes fail closed", () => {
