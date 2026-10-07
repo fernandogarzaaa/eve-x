@@ -114,7 +114,19 @@ if (!existsSync(join(ROOT, "RELEASE_PROVENANCE.json"))) {
 } else {
   const p = JSON.parse(readSoft("RELEASE_PROVENANCE.json"));
   check("provenance.version == package.json", p.version === version, `prov=${p.version}`);
-  check("provenance.commit == HEAD", p.source?.commit === sh("git rev-parse HEAD"), "commit drift");
+  // Same release-metadata-commit accommodation as the manifest: the
+  // provenance is generated before the metadata commit lands.
+  let provOk = p.source?.commit === sh("git rev-parse HEAD");
+  if (!provOk) {
+    const parent = sh("git rev-parse HEAD~1");
+    const diffNames = sh("git diff-tree --no-commit-id --name-only -r HEAD")
+      .split("\n").map((l) => l.trim()).filter(Boolean);
+    const GENERATABLE2 = new Set(["release-manifest.json", "RELEASE_PROVENANCE.json"]);
+    if (p.source?.commit === parent && diffNames.length > 0 && diffNames.every((f) => GENERATABLE2.has(f))) {
+      provOk = true;
+    }
+  }
+  check("provenance.commit describes HEAD (or its release-metadata commit)", provOk, "commit drift");
 }
 
 // 4. deployment references match the release
