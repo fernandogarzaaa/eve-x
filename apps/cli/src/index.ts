@@ -151,7 +151,7 @@ async function doctor(): Promise<number> {
   for (const p of [8080, 8091, 3000]) {
     const free = await portFree(p);
     checks.push({
-      name: `port :${p}`, ok: true, detail: free ? "free" : "in use",
+      name: `port :${p}`, ok: free, detail: free ? "free" : "in use",
       fix: free ? "" : `Port ${p} busy — set PORT/MCP_PORT/CONSOLE_PORT or stop the holder`,
     });
   }
@@ -168,9 +168,9 @@ async function doctor(): Promise<number> {
   const imgDir = resolve(process.env["EVEX_IMAGES"] ?? "./images");
   const hasImg = existsSync(imgDir) && existsSync(join(imgDir, "ubuntu-desktop-v1.qcow2"));
   checks.push({
-    name: "images", ok: true,
-    detail: hasImg ? `base image present (${imgDir})` : `base image not staged (${imgDir}/ubuntu-desktop-v1.qcow2) — VMs boot from synthetic backend until staged`,
-    fix: "",
+    name: "images", ok: hasImg,
+    detail: hasImg ? `base image present (${imgDir})` : `no base image staged (${imgDir}/ubuntu-desktop-v1.qcow2) — real guests cannot boot; only the synthetic backend serves`,
+    fix: hasImg ? "" : "Stage a sealed base image (infra/vm-images/build.sh) or set EVEX_IMAGES",
   });
 
   let fail = 0;
@@ -292,6 +292,8 @@ async function doctorProduction(): Promise<number> {
     vmBackend: process.env["VM_BACKEND"],
     publicUrl: process.env["EVEX_PUBLIC_URL"],
     objectEndpoint: objUrl,
+    mode: "production",
+    filePrimaryAck: (process.env["EVEX_FILE_PRIMARY_ACK"] ?? "") === "1",
   });
   for (const f of findings) {
     out(`[${f.status.toUpperCase()}] ${f.name}: ${f.detail}`);

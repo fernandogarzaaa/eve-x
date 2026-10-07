@@ -77,10 +77,13 @@ for (const f of prodTs) {
   if (/sha1hex\s*\(/.test(read(f))) fail("no-toy-digest", f, "use sha256hex");
 }
 
-// 7. No mutable production image tags (qual-desktop is the labeled exception).
-for (const f of walk(join(ROOT, "infra"))) {
+// 7. No mutable production image tags. A :latest reference is allowed only
+// on a line that also carries an explicit dev-only/TEST-ONLY marker AND in
+// a file that documents the production pin policy (the DEFAULT_DOCKER_IMAGE
+// dev default + requirePinnedDockerImage gate). Anything else fails.
+for (const f of walk(join(ROOT, "infra")).concat(walk(join(ROOT, "packages"))).concat(walk(join(ROOT, "apps")))) {
   const src = read(f);
-  if (/:latest/.test(src) && !/TEST-ONLY|test-only/i.test(src)) fail("no-mutable-tags", f);
+  if (/:latest/.test(src) && !/TEST-ONLY|test-only|dev-only/i.test(src)) fail("no-mutable-tags", f);
 }
 {
   const compose = read(join(ROOT, "infra", "deployment", "docker-compose.yml"));

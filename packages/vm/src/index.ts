@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { appendFileSync as fsAppendFileSync, readFileSync as fsReadFileSync, existsSync as fsExistsSync } from "node:fs";
 import { join, basename, resolve } from "node:path";
@@ -306,7 +306,9 @@ export class QmpConnection {
    */
   async connectQga(sockPath: string, timeoutMs = 15000): Promise<void> {
     await this.connectRaw(sockPath, timeoutMs);
-    const syncId = Math.floor(Math.random() * 1_000_000_000);
+    // Unpredictable sync id (crypto, not Math.random): the id echoes in the
+    // guest-visible channel, and predictable ids weaken the liveness proof.
+    const syncId = randomInt(1_000_000_000);
     let res: QmpResponse;
     try {
       res = await this.commandRaw("guest-sync", { id: syncId });
@@ -1544,7 +1546,7 @@ export function parseGuestExecStatus(res: Record<string, unknown>): { exited: bo
 
 // ── DockerDesktopDriver (real docker CLI: run/start/stop/commit/cp/exec/logs) ─
 
-// Development default only: a mutable :latest tag is NEVER acceptable in
+// Development default only (dev-only): a mutable :latest tag is NEVER acceptable in
 // production (it can move under a pinned release). Production boot requires
 // a digest-pinned reference (image@sha256:<64hex>), enforced by
 // requirePinnedDockerImage() below; EVEX_DOCKER_IMAGE sets the deployment's
