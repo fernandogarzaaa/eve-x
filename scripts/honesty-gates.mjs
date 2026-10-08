@@ -139,6 +139,11 @@ for (const f of prodTs) {
   if (/\.innerHTML\s*=\s*`/.test(src)) fail("no-console-html-sink", "apps/console/static/app.js", "innerHTML template assignment (XSS)");
 }
 
+// 14. No MCP v1 SDK imports after the v2 migration (split packages only).
+for (const f of prodTs) {
+  if (/@modelcontextprotocol\/sdk\//.test(read(f))) fail("no-mcp-v1-imports", f, "migrate to @modelcontextprotocol/server|client|node");
+}
+
 if (failures > 0) {
   console.error(`honesty-gates: ${failures} violation(s) — refusing`);
   process.exit(1);

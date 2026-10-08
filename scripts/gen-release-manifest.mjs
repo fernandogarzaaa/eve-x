@@ -27,11 +27,18 @@ const tools = [...mcpSrc.matchAll(/registerTool\("([^"]+)"/g)].map((m) => m[1]);
 const mcpServerVersion = mcpSrc.match(/new\s+McpServer\(\{\s*name:\s*"eve-x",\s*version:\s*"([^"]+)"/)?.[1] ?? "unknown";
 const sharedSrc = readFileSync(join(ROOT, "packages", "mcp-shared", "src", "index.ts"), "utf8");
 const toolSurface = sharedSrc.match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1] ?? "unknown";
-// SDK line, measured from the installed dependency (never asserted).
-let sdkVersion = "unknown";
-try {
-  sdkVersion = JSON.parse(readFileSync(join(ROOT, "node_modules", "@modelcontextprotocol", "sdk", "package.json"), "utf8")).version;
-} catch { /* uninstalled tree: recorded as unknown */ }
+// SDK lines, measured from the installed dependencies (never asserted).
+// v2 split packages: server + node ship runtime code; client is dev/test.
+function depVersion(name) {
+  try {
+    return JSON.parse(readFileSync(join(ROOT, "node_modules", ...name.split("/"), "package.json"), "utf8")).version;
+  } catch { return "unknown"; }
+}
+const mcpSdks = {
+  server: depVersion("@modelcontextprotocol/server"),
+  node: depVersion("@modelcontextprotocol/node"),
+  client: depVersion("@modelcontextprotocol/client"),
+};
 // Guest base: an in-tree bake manifest when the bake host published one;
 // otherwise an explicit UNMANIFESTED marker (never a stale digest).
 let guestManifest = null;
@@ -102,7 +109,7 @@ const manifest = {
     registry: "filesystem-first (DATA_DIR/models), gated promotion, sha256 checkpoints",
     smokePath: "stdlib-only selftest (ml/inference/selftest.py; torch paths via stub injection)",
   },
-  mcp: { server: `eve-x ${mcpServerVersion}`, toolSurface, sdk: sdkVersion, tools, toolCount: tools.length },
+  mcp: { server: `eve-x ${mcpServerVersion}`, toolSurface, sdks: mcpSdks, tools, toolCount: tools.length },
   // Skills: measured identity per skill dir (name + version + content
   // digest over skill.json + entrypoint). A changed skill without a
   // regenerated manifest is stale by construction — verify-release refuses.

@@ -10,7 +10,7 @@ Four runtime planes cooperate:
                     │   Console   │  operator UI (review, takeover, releases)
                     └──────┬──────┘
                            │  REST /v1 (openapi.json)
-┌──────────┐  MCP mcp/1  ┌─┴──────────┐   traces   ┌───────────┐
+┌──────────┐  MCP evex-tools/1  ┌─┴──────────┐   traces   ┌───────────┐
 │  Agents  │◄───────────►│ Control    │◄──────────►│ Postgres  │
 │ (skills) │             │ Plane API  │            │ + objects │
 └──────────┘             └─┬───┬──┬───┘            └───────────┘
@@ -57,7 +57,7 @@ Four runtime planes cooperate:
 - `protocol` — zod schemas only, no logic. Imported by every other package.
 - `core` — `uid`, `nowIso`, `EveError`, seeded `prng` (mulberry32),
   generic audited `StateMachine`, `VM_TRANSITIONS`.
-- `mcp-shared` — MCP tool input schemas (`TOOL_SCHEMAS`, version `mcp/1`)
+- `mcp-shared` — EVE-X tool input schemas (`TOOL_SCHEMAS`, contract `evex-tools/1`)
   plus `ControlPlaneClient`: fetch wrapper with Bearer auth, per-request
   `AbortController` timeouts, idempotency-key header, typed helpers per route.
 - `skills` — skill installer/verifier: manifest validation, platform-path

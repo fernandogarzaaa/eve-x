@@ -14,7 +14,7 @@ at minimum `skill.json` (manifest) and an entrypoint markdown file (default
   "entrypoint": "SKILL.md",
   "tools": ["computer.observe", "computer.act"],
   "permissions": ["computer:observe", "computer:act"],
-  "mcpVersion": "mcp/1"
+  "mcpVersion": "evex-tools/1"
 }
 ```
 

@@ -40,7 +40,7 @@ stays on the internal compose network (no published port).
                     "successRate": 0.9, "groundingAccuracy": 0.9,
                     "recoveryRate": 0.7, "samples": 50, "digest": "…", "at": "…" } ],
   "config": { "lr": 0.001 },
-  "compat": { "protocolVersion": "1", "mcpVersion": "mcp/1", "minApiVersion": "v1" },
+  "compat": { "protocolVersion": "1", "mcpVersion": "evex-tools/1", "minApiVersion": "v1" },
   "runtime": { "accelerator": "cpu", "minVramMb": 0, "minRamMb": 2048,
                "maxLatencyMs": 15000, "maxQueueDepth": 32 },
   "stage": "experimental"

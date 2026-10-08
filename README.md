@@ -94,7 +94,7 @@ Release story: `CHANGELOG.md` + `release-manifest.json` +
 - **Agent Skills:** install/verify for claude-code, codex, opencode,
   cursor, windsurf; `integrations/` ships `mcp.json` for seven platforms;
   skill scripts drive observe/act/replay. See `AGENT_SKILL.md`.
-- **MCP:** 21 tools over stdio + StreamableHTTP (`mcp/1`). See `MCP.md`.
+- **MCP:** 21 tools over stdio + dual-era StreamableHTTP (`evex-tools/1` tool contract; 2026-07-28 modern + 2025-era legacy). See `MCP.md`.
 - **EVE-CUA:** observe → regions → point→region grounding → verifier →
   act → re-observe, with stale-409s and epoch fencing. See
   `COMPUTER_USE.md`, `MODEL.md`, `TRAINING.md`.

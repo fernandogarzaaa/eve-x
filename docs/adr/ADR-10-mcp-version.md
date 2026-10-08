@@ -1,6 +1,7 @@
 # ADR-10: MCP Tool Versioning (`mcp/1`, Additive Within a Major)
 
-- Status: accepted
+- Status: SUPERSEDED in label only by ADR-15 (the `mcp/1` label is renamed
+  `evex-tools/1`; the additive-within-major rule is unchanged)
 - Date: 2026-05-09
 
 ## Context

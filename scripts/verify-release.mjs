@@ -90,11 +90,13 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
   check("manifest mcp server matches", String(m.mcp?.server ?? "") === `eve-x ${version}`, `got ${m.mcp?.server}`);
   const shared = readSoft("packages/mcp-shared/src/index.ts").match(/MCP_TOOL_VERSION\s*=\s*"([^"]+)"/)?.[1];
   check("manifest toolSurface == MCP_TOOL_VERSION", m.mcp?.toolSurface === shared, `manifest=${m.mcp?.toolSurface} src=${shared}`);
-  try {
-    const installedSdk = JSON.parse(readSoft("node_modules/@modelcontextprotocol/sdk/package.json")).version;
-    check("manifest mcp.sdk == installed SDK", m.mcp?.sdk === installedSdk, `manifest=${m.mcp?.sdk} installed=${installedSdk}`);
-  } catch {
-    check("manifest mcp.sdk == installed SDK", m.mcp?.sdk === "unknown", "SDK not installed; manifest must say unknown");
+  for (const [dep, key] of [["@modelcontextprotocol/server", "server"], ["@modelcontextprotocol/node", "node"], ["@modelcontextprotocol/client", "client"]]) {
+    try {
+      const installed = JSON.parse(readSoft(`node_modules/${dep}/package.json`)).version;
+      check(`manifest mcp.sdks.${key} == installed`, m.mcp?.sdks?.[key] === installed, `manifest=${m.mcp?.sdks?.[key]} installed=${installed}`);
+    } catch {
+      check(`manifest mcp.sdks.${key} == installed`, m.mcp?.sdks?.[key] === "unknown", "SDK not installed; manifest must say unknown");
+    }
   }
   const mcpSrc = readSoft("apps/mcp/src/index.ts");
   const counted = [...mcpSrc.matchAll(/registerTool\("([^"]+)"/g)].map((x) => x[1]);
