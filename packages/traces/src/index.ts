@@ -175,7 +175,7 @@ export class TraceStore {
       } catch {
         throw new EveError("BAD_JSONL", "Trace JSONL contains an unparsable line");
       }
-      const { prevDigest: _p, digest: _d, ...body } = z.record(z.unknown()).parse(parsed) as Record<string, unknown>;
+      const { prevDigest: _p, digest: _d, ...body } = z.record(z.string(), z.unknown()).parse(parsed) as Record<string, unknown>;
       void _p;
       void _d;
       store.append(body);

@@ -17,7 +17,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const VERSION = "9.9.9-attack";
 
 function git(dir: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd: dir, stdio: "pipe", encoding: "utf8", timeout: 60000 }).trim();
+  // Identity via -c flags (not `git config` writes): 3 fewer process
+  // spawns per fixture repo (Windows spawn overhead dominates suite time).
+  const full = ["-c", "user.email=t@t", "-c", "user.name=t@t", "-c", "commit.gpgsign=false", ...args];
+  return execFileSync("git", full, { cwd: dir, stdio: "pipe", encoding: "utf8", timeout: 60000 }).trim();
 }
 
 function runVerifier(dir: string, extraEnv: Record<string, string> = {}): { code: number; out: string } {
@@ -100,9 +103,6 @@ function provenanceFor(dir: string, over: Record<string, unknown> = {}): Record<
 function mkrepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "evex-vattack-"));
   git(dir, "init", "-q");
-  git(dir, "config", "user.email", "t@t");
-  git(dir, "config", "user.name", "t");
-  git(dir, "config", "commit.gpgsign", "false");
   writeTree(dir, baseFiles());
   copyFileSync(join(ROOT, "scripts", "verify-release.mjs"), join(dir, "scripts", "verify-release.mjs"));
   copyFileSync(join(ROOT, "scripts", "git-safe.mjs"), join(dir, "scripts", "git-safe.mjs"));
@@ -378,8 +378,6 @@ describe("verify-release adversarial audit (26 cases)", () => {
     }
     copyFileSync(join(ROOT, "scripts", "verify-release.mjs"), join(shallow, "scripts", "verify-release.mjs"));
     copyFileSync(join(ROOT, "scripts", "git-safe.mjs"), join(shallow, "scripts", "git-safe.mjs"));
-    git(shallow, "config", "user.email", "t@t");
-    git(shallow, "config", "user.name", "t");
     const m = manifestFor(shallow);
     (m.skills as { bound: unknown[] }).bound = [{ name: "alpha", version: "1.0.0", digest: skillDigest(shallow) }];
     writeFileSync(join(shallow, "release-manifest.json"), JSON.stringify(m, null, 2));

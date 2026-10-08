@@ -5,7 +5,7 @@ import { EveError, sha256hex } from "../../core/src/index.js";
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
 
-const TransitionCounts = z.record(z.record(z.record(z.number().int().min(0))));
+const TransitionCounts = z.record(z.string(), z.record(z.string(), z.record(z.string(), z.number().int().min(0))));
 type TransitionCounts = z.infer<typeof TransitionCounts>;
 
 export const PredictResult = z.object({

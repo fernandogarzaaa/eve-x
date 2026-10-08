@@ -172,7 +172,10 @@ export const BenchRunRecordSchema = z.object({
   methodology: z.string(),
   formulas: z.record(z.string(), z.string()),
   metrics: BenchMetricsSchema,
-  perCategory: z.record(BenchCategorySchema, BenchMetricsSchema),
+  // String-keyed (not enum-keyed): only categories present in the run are
+  // recorded. Zod v4 enum-keyed records demand totality, which would force
+  // fabricating metrics for unrun categories — never invent numbers.
+  perCategory: z.record(z.string(), BenchMetricsSchema),
   digest: z.string().length(64),
   ranAt: z.string(),
   taskCount: z.number().int().min(0),
