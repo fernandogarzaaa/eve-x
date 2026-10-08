@@ -1273,8 +1273,15 @@ type ReplayVerdict = "deterministic-replay-ok" | "replay-divergent";
 
 export function verifyReplay(
   steps: Array<Record<string, unknown>>,
+  expectedCount?: number,
 ): { replayed: number; verdict: ReplayVerdict; issues: string[] } {
   const issues: string[] = [];
+  // Truncation is invisible to chain/sequence checks (a prefix replays
+  // cleanly): callers that know the expected length pass it, and any
+  // shortfall is reported instead of silently accepted.
+  if (expectedCount !== undefined && steps.length !== expectedCount) {
+    issues.push(`truncated/partial trace: replayed ${steps.length}, expected ${expectedCount}`);
+  }
   const seen = new Map<number, number>();
   const LITE = ["session_id", "task_id", "step_id", "seq", "timestamp", "actor"];
   steps.forEach((st, idx) => {
@@ -2154,7 +2161,7 @@ export function buildApp(): express.Express {
     if (!s) { res.status(404).json({ error: "not_found", message: "evidence session unknown" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
     const steps = mergedTraceSteps(ev.sessionId);
-    const replay = verifyReplay(steps);
+    const replay = verifyReplay(steps, s.seq + 1);
     const chained = steps.length > 0 && steps.every(
       (st) => /^[0-9a-f]{64}$/.test(String(st["digest"] ?? "")) &&
         (/^[0-9a-f]{64}$/.test(String(st["prevDigest"] ?? "")) || /^[0-9a-f]{64}$/.test(String(st["prev"] ?? ""))),
@@ -2207,7 +2214,7 @@ export function buildApp(): express.Express {
     if (denyIfNotOwner(s, req, res)) return;
     // Merge worker/file-appended steps missing from memory (dedupe by step_id).
     const steps = mergedTraceSteps(id);
-    const { replayed, verdict, issues } = verifyReplay(steps);
+    const { replayed, verdict, issues } = verifyReplay(steps, s.seq + 1);
     res.json({ sessionId: id, replayed, verdict, issues });
   });
   v1.get("/report/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {

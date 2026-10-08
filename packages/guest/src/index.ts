@@ -182,12 +182,23 @@ export interface GuestAgent {
 // TOCTOU note: the walk and the open are not atomic. The O_NOFOLLOW open
 // plus the post-open realpath re-check close the swap-a-symlink-in race
 // for the opened file itself (a swapped-in symlink fails the open; a
-// swapped-in real path outside the root fails the re-check). Content races
+// swapped-in real path outside the root fails the re-check), and the
+// post-open nlink check closes the swap-a-hardlink-in race. Content races
 // on already-jail-resident regular files are outside the jail threat model
-// (the writer is the authenticated control plane).
+// (the writer is the authenticated control plane). Mount-namespace purity
+// (bind mounts, procfs/sysfs/device nodes under the root) is NOT covered
+// by this jail: it guarantees PATH containment — the opened object is
+// inside the boundary — while mount topology stays the operator's
+// responsibility (jail roots live on ordinary tmpfs/disk, never /proc).
 
 export function lexicalInsideRoot(fsRoot: string, p: string): string {
-  const full = normalize(join(fsRoot, p));
+  // NFKC-normalize first: filesystems that normalize Unicode (macOS APFS)
+  // may otherwise resolve a different name than the one we lexically
+  // checked, and compatibility characters (e.g. U+FF0E FULLWIDTH FULL
+  // STOP, which NFKC folds to ".") must not smuggle traversal past the
+  // gate. The normalized form is used for the actual fs operation too,
+  // so check and use cannot disagree.
+  const full = normalize(join(fsRoot, p.normalize("NFKC")));
   const root = normalize(fsRoot + sep);
   if (full !== normalize(fsRoot) && !full.startsWith(root)) {
     throw new EveError("FS_ESCAPE", "Path escapes guest fs root");
@@ -223,6 +234,13 @@ export async function canonicalInsideRoot(fsRoot: string, p: string): Promise<st
     }
     if (st.isSymbolicLink()) {
       throw new EveError("FS_ESCAPE", "Path traverses a symlink — refusing");
+    }
+    // Hardlinks share the target's inode: a hardlink inside the jail to a
+    // file outside reads outside data while passing every symlink check.
+    // The jail root is agent-managed scratch (fresh files are nlink=1), so
+    // multi-link entries are treated as jail-break attempts, not data.
+    if (!st.isDirectory() && st.nlink > 1) {
+      throw new EveError("FS_ESCAPE", "Path has multiple hardlinks — refusing");
     }
     if (!st.isDirectory() && i < parts.length - 1) {
       throw new EveError("FS_ESCAPE", "Path traverses a non-directory — refusing");
@@ -267,6 +285,7 @@ export async function openJailedRead(fsRoot: string, p: string): Promise<{ data:
     await recheckContainment(fsRoot, full);
     const st = await fh.stat();
     if (!st.isFile()) throw new EveError("FS_ESCAPE", "Jailed open target is not a regular file");
+    if (st.nlink > 1) throw new EveError("FS_ESCAPE", "Jailed open target has multiple hardlinks — refusing");
     const data = await fh.readFile();
     return { data, full };
   } finally {
@@ -289,6 +308,8 @@ export async function writeJailedFile(fsRoot: string, p: string, data: Buffer, m
   }
   try {
     await recheckContainment(fsRoot, full);
+    const st = await fh.stat();
+    if (st.nlink > 1) throw new EveError("FS_ESCAPE", "Jailed target has multiple hardlinks — refusing");
     await fh.writeFile(data);
     return { bytes: data.length, full };
   } finally {

@@ -77,6 +77,12 @@ export class TimelinePlayer {
         throw new EveError("BAD_JSONL", "Timeline JSONL contains an unparsable line");
       }
       const parsed = StoredLineSchema.parse(raw) as TraceStepType & { prevDigest?: string; digest?: string };
+      // Session identity first: a merged log is a session split, reported
+      // as such even though its chained digests also break. Digest
+      // verification follows for same-session lines.
+      if (steps.length > 0 && parsed.session_id !== steps[0]?.session_id) {
+        throw new EveError("SESSION_SPLIT", "Timeline mixes session_ids; fork instead of merging");
+      }
       // Stored digests are EVIDENCE, not decoration: when a line carries a
       // chained digest it must verify against the running chain AND the full
       // canonical body. A forged/modified/deleted/duplicated step breaks here.
@@ -96,9 +102,6 @@ export class TimelinePlayer {
       const step = TraceStep.parse(parsed as unknown);
       if (steps.length > 0 && step.seq !== steps.length) {
         throw new EveError("SEQ_GAP", `Timeline seq gap: expected ${steps.length}, got ${step.seq}`);
-      }
-      if (steps.length > 0 && step.session_id !== steps[0]?.session_id) {
-        throw new EveError("SESSION_SPLIT", "Timeline mixes session_ids; fork instead of merging");
       }
       const d = typeof parsed.digest === "string" ? parsed.digest : digestFor(step, prev);
       if (typeof parsed.digest !== "string") prev = d;

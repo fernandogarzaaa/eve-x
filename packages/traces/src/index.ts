@@ -163,7 +163,12 @@ export class TraceStore {
     return rows.join("\n") + "\n";
   }
 
-  /** Load a JSONL stream (produced by exportJsonl) into a fresh store; verifies chain. */
+  /** Load a JSONL stream into a fresh store. Lines carrying chained
+   *  digests are VERIFIED (prev linkage + recomputed digest); only
+   *  digest-less lines (foreign imports) are stamped fresh onto the running
+   *  head. A mutated/spliced chained log throws CHAIN_BROKEN/SEQ_GAP
+   *  instead of being silently re-stamped (re-stamping on load would
+   *  launder tampering). */
   static fromJsonl(sessionIdInput: unknown, taskIdInput: unknown, jsonlInput: unknown): TraceStore {
     const jsonl = z.string().parse(jsonlInput);
     const store = new TraceStore(sessionIdInput, taskIdInput);
@@ -175,13 +180,46 @@ export class TraceStore {
       } catch {
         throw new EveError("BAD_JSONL", "Trace JSONL contains an unparsable line");
       }
-      const { prevDigest: _p, digest: _d, ...body } = z.record(z.string(), z.unknown()).parse(parsed) as Record<string, unknown>;
-      void _p;
-      void _d;
-      store.append(body);
+      const rec = z.record(z.string(), z.unknown()).parse(parsed) as Record<string, unknown>;
+      const prevDigest = rec["prevDigest"];
+      const digest = rec["digest"];
+      if (typeof prevDigest === "string" && typeof digest === "string") {
+        store.appendVerified(rec);
+      } else {
+        const { prevDigest: _p, digest: _d, ...body } = rec;
+        void _p;
+        void _d;
+        store.append(body);
+      }
     }
     store.verifyChain();
     return store;
+  }
+
+  /** Append a pre-chained step after verifying its links against the
+   *  running head (mutation/splice/reorder/deletion all throw). */
+  appendVerified(storedInput: unknown): StoredStep {
+    const stored = StoredStepSchema.parse(storedInput);
+    if (stored.session_id !== this.sessionId) {
+      throw new EveError("SESSION_MISMATCH", `Step session ${stored.session_id} != store ${this.sessionId}`);
+    }
+    const expectedSeq = this.steps.length;
+    if (stored.seq !== expectedSeq) {
+      throw new EveError("SEQ_GAP", `Expected seq ${expectedSeq}, got ${stored.seq} — chained log rejects gaps/reorders`);
+    }
+    const prevDigest = this.steps.length === 0 ? GENESIS_DIGEST : ((this.steps[this.steps.length - 1]?.digest ?? GENESIS_DIGEST) as string);
+    if (stored.prevDigest !== prevDigest) {
+      throw new EveError("CHAIN_BROKEN", `prevDigest mismatch at seq=${stored.seq} — reorder/deletion suspected`);
+    }
+    const { prevDigest: _p, digest: _d, ...body } = stored;
+    void _p;
+    void _d;
+    const recomputed = sha256hex(`${prevDigest}.${canonicalJson(TraceStep.parse(body))}`);
+    if (recomputed !== stored.digest) {
+      throw new EveError("CHAIN_BROKEN", `digest mismatch at seq=${stored.seq} — step was mutated`);
+    }
+    this.steps.push({ ...stored });
+    return { ...stored };
   }
 }
 

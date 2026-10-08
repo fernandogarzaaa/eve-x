@@ -261,8 +261,7 @@ describe("POST /v1/tasks/:id/validate (integration)", () => {
     return String((j.json as Record<string, unknown>)["id"]);
   }
 
-  it("400s without an evidence bundle (calling validate manufactures nothing)", async () => {
-    const { taskId } = await seedTaskWithSteps();
+  it("400s without an evidence bundle (calling validate manufactures nothing)", async () => {    const { taskId } = await seedTaskWithSteps();
     const r = await api("POST", `/v1/tasks/${taskId}/validate`, MASTER, {});
     assert.equal(r.status, 400);
     assert.equal((r.json as Record<string, unknown>)["error"], "evidence_required");
@@ -276,6 +275,18 @@ describe("POST /v1/tasks/:id/validate (integration)", () => {
       evidence: { sessionId, stepIds: ["step-ghost-xyz"] },
     });
     assert.equal((r.json as Record<string, unknown> && (r.json as { validation: { verdict: string } }).validation.verdict), "INVALID_EVIDENCE");
+  });
+
+  it("INVALID_EVIDENCE for cross-session evidence injection", async () => {
+    const a = await seedTaskWithSteps("goal A");
+    const b = await seedTaskWithSteps("goal B");
+    // Session B's real, chained steps cited as session A's evidence: the
+    // resolver only sees A's trace, so they are unknown there — refused,
+    // never borrowed across the session boundary.
+    const r = await api("POST", `/v1/tasks/${a.taskId}/validate`, MASTER, {
+      evidence: { sessionId: a.sessionId, stepIds: b.stepIds },
+    });
+    assert.equal((r.json as { validation: { verdict: string } }).validation.verdict, "INVALID_EVIDENCE");
   });
 
   it("INCONCLUSIVE for passing assertions with no independent confirmation", async () => {

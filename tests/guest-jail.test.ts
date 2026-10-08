@@ -72,6 +72,18 @@ async function assertRejectsCode(promise: Promise<unknown>, code: string): Promi
   assert.fail(`expected rejection with ${code}`);
 }
 
+/** Sync variant: assert a throw carrying an EveError code. */
+function assertThrowsCode(fn: () => unknown, code: string): void {
+  try {
+    fn();
+  } catch (err) {
+    const text = `${String((err as { code?: unknown })?.code ?? "")} ${err instanceof Error ? err.message : String(err)}`;
+    assert.match(text, new RegExp(code), `expected ${code}, got: ${text.slice(0, 300)}`);
+    return;
+  }
+  assert.fail(`expected throw with ${code}`);
+}
+
 describe("lexical + canonical jail", () => {
   it("rejects .. traversal lexically", () => {
     for (const p of ["../escape", "a/../../escape"]) {
@@ -127,6 +139,75 @@ describe("lexical + canonical jail", () => {
     assert.equal(n, Buffer.byteLength("hello-jail"));
     const back = await C().readFile("legit/note.txt");
     assert.equal(back.toString("utf8"), "hello-jail");
+  });
+
+  it("refuses reads through a hardlink pointing outside", async () => {
+    const outside = join(ROOT, "hard-outside.txt");
+    await fs.writeFile(outside, "HARD-SECRET", "utf8");
+    const link = join(fsRoot, "hardlink.txt");
+    try {
+      await fs.link(outside, link);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "EPERM" || code === "EACCES" || code === "EXDEV") {
+        assert.ok(true, "classified: hardlink creation unavailable across these paths");
+        return;
+      }
+      throw err;
+    }
+    await assertRejectsCode(C().readFile("hardlink.txt"), "FS_ESCAPE");
+    await assertRejectsCode(C().writeFile("hardlink.txt", Buffer.from("x")), "FS_ESCAPE");
+    assert.equal(await fs.readFile(outside, "utf8"), "HARD-SECRET");
+  });
+
+  it("normalizes unicode before the lexical check", () => {
+    // U+FF0E FULLWIDTH FULL STOP folds to "." under NFKC: without
+    // normalization this looks like a benign dirname but resolves to "../".
+    assertThrowsCode(() => lexicalInsideRoot(fsRoot, "．．/escape"), "FS_ESCAPE");
+    // A combining mark attached to ".." is NOT traversal — just a odd name
+    // inside the root — and café spellings stay inside.
+    const odd = lexicalInsideRoot(fsRoot, "..\u030a/escape");
+    assert.ok(odd.startsWith(fsRoot));
+    const benign = lexicalInsideRoot(fsRoot, "caf\u00e9/note.txt");
+    assert.ok(benign.endsWith(join("café", "note.txt")) || benign.includes("caf"));
+  });
+
+  it("absolute and dot-heavy paths never escape", async () => {
+    // join() folds absolute segments under the root: the write either lands
+    // inside the jail or fails closed — but nothing may appear outside it.
+    for (const p of ["/etc/absolute.txt", "a/./b/../b/c.txt", "x/../../y.txt"]) {
+      try {
+        await C().writeFile(p, Buffer.from("x"));
+      } catch (err) {
+        assert.match(String((err as { code?: string })?.code ?? err), /FS_ESCAPE|GUEST_ERROR/);
+      }
+    }
+    for (const outside of [join(ROOT, "etc", "absolute.txt"), join(ROOT, "y.txt")]) {
+      let exists = false;
+      try { await fs.stat(outside); exists = true; } catch { exists = false; }
+      assert.equal(exists, false, `${outside} must not exist`);
+    }
+  });
+
+  it("round-trips strange-but-inside names", async () => {
+    const name = "sp ace+uniçode/n.e..sted/file  .txt";
+    await C().writeFile(name, Buffer.from("strange"));
+    assert.equal((await C().readFile(name)).toString("utf8"), "strange");
+  });
+
+  it("a file swapped for a symlink between walk and open is refused", async () => {
+    // Compose the mechanisms directly: validate the real file, swap in a
+    // link to outside, then open fresh — O_NOFOLLOW + re-check must refuse.
+    await C().writeFile("swap-me.txt", Buffer.from("real"));
+    await canonicalInsideRoot(fsRoot, "swap-me.txt");
+    await fs.rm(join(fsRoot, "swap-me.txt"));
+    const outside = join(ROOT, "swap-target.txt");
+    await fs.writeFile(outside, "OUT", "utf8");
+    if (!(await trySymlink(outside, join(fsRoot, "swap-me.txt")))) {
+      assert.ok(true, "classified: symlink creation unavailable on this host");
+      return;
+    }
+    await assertRejectsCode(C().readFile("swap-me.txt"), "FS_ESCAPE");
   });
 });
 
@@ -198,6 +279,24 @@ describe("executable identity (not basename)", () => {
       resolveExecutable(process.execPath, new Set(["definitely-not-it"]), [dirname(process.execPath)]),
       "NOT_ALLOWLISTED",
     );
+  });
+
+  it("shell metacharacters in arguments never execute (no shell)", async () => {
+    const r = await C().exec([process.execPath, "--eval", "process.exit(3); $(touch pwned)"]);
+    // node received a filename-ish argument, not a command: no code ran
+    // through a shell, and no file was created.
+    assert.equal(r.ok, false);
+    let exists = false;
+    try { await fs.stat(join(ROOT, "pwned")); exists = true; } catch { exists = false; }
+    assert.equal(exists, false);
+  });
+
+  it("wrapper scripts with an allowed basename are refused by identity", async () => {
+    const bin = basename(process.execPath);
+    const wrapper = join(ROOT, "evil-wrap", bin);
+    await fs.mkdir(dirname(wrapper), { recursive: true });
+    await fs.writeFile(wrapper, "#!/bin/sh\nexec /bin/echo pwned\n", "utf8");
+    await assertRejectsCode(C().exec([wrapper, "--version"]), "NOT_ALLOWLISTED");
   });
 });
 
