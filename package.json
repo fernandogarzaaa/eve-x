@@ -30,12 +30,14 @@
     "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs && node scripts/verify-release.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/node": "^2.1.1",
+    "@modelcontextprotocol/server": "^2.3.1",
     "express": "^4.19.2",
     "ws": "^8.18.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.0",
     "@types/ws": "^8.5.10",

@@ -28,7 +28,7 @@ export const SkillManifest = z.object({
   entrypoint: z.string().min(1).max(256).default("SKILL.md"),
   tools: z.array(z.string().min(1).max(128)).default([]),
   permissions: z.array(z.string().min(1).max(128)).default([]),
-  mcpVersion: z.string().min(1).default("mcp/1"),
+  mcpVersion: z.string().min(1).default("evex-tools/1"),
 });
 export type SkillManifest = z.infer<typeof SkillManifest>;
 

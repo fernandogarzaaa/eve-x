@@ -159,7 +159,7 @@ export class ModelRegistry {
       config: input.config,
       compat: {
         protocolVersion: "1",
-        mcpVersion: "mcp/1",
+        mcpVersion: "evex-tools/1",
         minApiVersion: "v1",
       },
       runtime: RuntimeReqs.parse(input.runtime ?? {}),

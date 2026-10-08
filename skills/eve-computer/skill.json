@@ -5,5 +5,5 @@
   "entrypoint": "SKILL.md",
   "tools": ["eve_computer_observe", "eve_computer_act", "eve_trace_get", "eve_replay"],
   "permissions": ["computer:observe", "computer:act", "trace:read"],
-  "mcpVersion": "mcp/1"
+  "mcpVersion": "evex-tools/1"
 }

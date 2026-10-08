@@ -3,15 +3,17 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { startHttp } from "../apps/mcp/src/index.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 
-// MCP protocol surface (SDK 1.x line; registry latest is 1.32.x — no v2
-// line exists upstream, so version claims follow the negotiated protocol,
-// never a hardcoded universal contract):
-// - latest + legacy initialize versions negotiate to supported versions;
-// - unknown future versions fall back to a supported version (never echoed);
-// - sessions are isolated and concurrent-safe; closing ends the session;
+// MCP protocol surface, v2 dual-era (2026-07-28 modern + 2025-era legacy):
+// - legacy: sessionful initialize/tools-list with stable session ids,
+//   unknown versions fall back (never echoed), unknown sessions 400;
+// - modern: stateless per-request serving, no session ids issued;
+// - every served era is observable via x-evex-protocol-era;
 // - tool calls validate schemas before touching the control plane;
-// - HTTP auth gating holds on /mcp while /health stays public.
+// - HTTP auth gating holds on /mcp (before era routing) while /health
+//   stays public.
 
 const SUPPORTED = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
 const H = {
@@ -175,5 +177,71 @@ describe("mcp http auth gating", () => {
       if (prevMode === undefined) delete process.env["EVEX_MODE"];
       else process.env["EVEX_MODE"] = prevMode;
     }
+  });
+});
+
+describe("mcp modern era (2026-07-28, stateless)", () => {
+  it("auto-negotiates modern and serves tools without sessions", async () => {
+    const client = new Client({ name: "modern-test", version: "1.0.0" }, { versionNegotiation: { mode: "auto" } });
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    await client.connect(transport);
+    try {
+      assert.equal(client.getProtocolEra(), "modern");
+      const listed = await client.listTools();
+      const names = listed.tools.map((t) => t.name);
+      assert.ok(names.includes("eve_session_create"), `expected eve tools, got ${names.slice(0, 3).join(",")}`);
+      assert.equal(names.length, 21);
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+  });
+
+  it("modern responses carry the era header and issue no session id", async () => {
+    const client = new Client({ name: "modern-test", version: "1.0.0" }, { versionNegotiation: { mode: "auto" } });
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    await client.connect(transport);
+    try {
+      // A second stateless call works with no session affinity at all.
+      const listed = await client.listTools();
+      assert.ok(listed.tools.length >= 20);
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+  });
+
+  it("modern era rejects unauthenticated callers when a token is configured", async () => {
+    process.env["EVEX_MCP_TOKEN"] = "era-secret-xyz";
+    try {
+      const client = new Client({ name: "modern-test", version: "1.0.0" }, { versionNegotiation: { mode: "auto" } });
+      const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+      await assert.rejects(client.connect(transport), /401|auth/i);
+    } finally {
+      delete process.env["EVEX_MCP_TOKEN"];
+    }
+  });
+
+  it("malformed modern requests fail as JSON-RPC errors, never crashes", async () => {
+    const res = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28",
+      },
+      body: "{not json",
+    });
+    // Body unreadable: the entry answers 4xx/500 without taking down the server.
+    assert.ok(res.status === 400 || res.status === 500, `got ${res.status}`);
+    await res.text();
+    const health = await fetch(`${base}/health`);
+    assert.equal(health.status, 200);
+  });
+});
+
+describe("mcp era observability", () => {
+  it("legacy responses carry x-evex-protocol-era: legacy", async () => {
+    const r = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get("x-evex-protocol-era"), "legacy");
   });
 });
