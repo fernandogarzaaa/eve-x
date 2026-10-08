@@ -94,6 +94,42 @@ for (const ref of BASE_REFS) {
     : { digest: null, status: "UNMEASURED: no registry measurement recorded in images/base-digests.json for this ref" };
 }
 const baseRecordSha = existsSync(join(ROOT, "images", "base-digests.json")) ? shaFile("images/base-digests.json") : null;
+
+// Release images: populated ONLY from the build record
+// images/release-images.json, and only for entries whose builtFrom
+// commit/tree equal THIS commit/tree. A record from any other tree is
+// stale by definition and is refused here — digests are re-bound at build
+// time, never carried across commits.
+function releaseImagesSection() {
+  const headCommit = sh("git rev-parse HEAD");
+  const headTree = sh('git rev-parse "HEAD^{tree}"');
+  let record = null;
+  try {
+    record = JSON.parse(readFileSync(join(ROOT, "images", "release-images.json"), "utf8"));
+  } catch { /* no build record: no release images bound */ }
+  const releaseImages = {};
+  let stale = 0;
+  for (const b of record?.built ?? []) {
+    const okShape = typeof b?.name === "string" && /^sha256:[0-9a-f]{64}$/i.test(String(b?.digest ?? ""));
+    if (okShape && b.builtFromCommit === headCommit && b.builtFromTree === headTree) {
+      releaseImages[b.name] = {
+        digest: String(b.digest).toLowerCase(),
+        builtFromCommit: b.builtFromCommit,
+        builtFromTree: b.builtFromTree,
+        builtAt: b.builtAt ?? null,
+        note: b.note ?? null,
+      };
+    } else {
+      stale += 1;
+    }
+  }
+  const imagesStatus = Object.keys(releaseImages).length > 0
+    ? `bound at build time from images/release-images.json (${Object.keys(releaseImages).length} image(s)); stale records refused: ${stale}`
+    : (stale > 0
+      ? `no release images bound: ${stale} record(s) refused as stale (built from a different commit/tree — rebuild, never copy)`
+      : "not-built for this source release (rebuild container images to populate digests; never copy digests across versions)");
+  return { releaseImages, imagesStatus };
+}
 const manifest = {
   product: "eve-x",
   version: JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version,
@@ -108,12 +144,11 @@ const manifest = {
     baseMeasuredFrom: baseRecordSha
       ? { file: "images/base-digests.json", sha256: baseRecordSha, measuredAt: baseRecord?.measuredAt ?? null }
       : { file: "images/base-digests.json", sha256: null, status: "no measurement record in tree" },
-    releaseImages: {},
+    ...releaseImagesSection(),
     // No stale digests are ever carried forward: image digests describe
-    // BUILT artifacts. This source release did not rebuild containers, so
-    // the map stays empty (verified, not omitted) until images are built
-    // and their digests measured into it.
-    imagesStatus: "not-built for this source release (rebuild container images to populate digests; never copy digests across versions)",
+    // BUILT artifacts. Entries whose build binding does not match THIS
+    // commit/tree are refused at generation time (stale record), never
+    // copied into the release.
   },
   guest: guestManifest ?? {
     image: "eve-desktop-autologin.qcow2",
