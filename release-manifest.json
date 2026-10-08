@@ -1,25 +1,50 @@
 {
   "product": "eve-x",
-  "version": "1.1.0",
-  "commit": "9f8c5ef341fa9372e487ea7bc9934f0db18ccf50",
-  "tree": "1faacbaedefbf9f1980877adb1dff0773033b250",
+  "version": "1.1.1",
+  "commit": "bfcc9b06b73785d3cdae5ac959e58155639eda1d",
+  "tree": "c53b5b9b0d98ca29493a6e068cab4771cdbe6f13",
   "dirty": false,
-  "generatedAt": "2026-10-07T00:45:39.518Z",
+  "generatedAt": "2026-10-08T07:11:31.817Z",
   "toolchain": {
     "node": "v26.7.0",
     "npm": "11.19.0",
     "python": "Python 3.11.9"
   },
   "lockfiles": {
-    "package-lock.json": "ad0fd8e0122660c73be0dd84b84e259bdff72f7329db5e132a6f8f2317a78091"
+    "package-lock.json": "26a7c6d04f485b072ef200e3e6dd4b3686c9f7ee2e6becf57708542383132a1d"
   },
   "containers": {
     "baseImages": {
-      "node:20-slim": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
-      "python:3.11-slim": "sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b",
-      "dxflrs/garage:v2.0.0": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
-      "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
-      "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+      "docker.io/library/node:20-slim": {
+        "digest": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/library/python:3.11-slim": {
+        "digest": "sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/library/postgres:16-alpine": {
+        "digest": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/library/redis:7-alpine": {
+        "digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/dxflrs/garage:v2.0.0": {
+        "digest": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      }
+    },
+    "baseMeasuredFrom": {
+      "file": "images/base-digests.json",
+      "sha256": "1160f6531351fe28e6f3859e5d4557778b560cb7f48bd06d58043006fad35ab7",
+      "measuredAt": "2026-10-08T06:47:25.022Z"
     },
     "releaseImages": {},
     "imagesStatus": "not-built for this source release (rebuild container images to populate digests; never copy digests across versions)"
@@ -37,9 +62,13 @@
     "smokePath": "stdlib-only selftest (ml/inference/selftest.py; torch paths via stub injection)"
   },
   "mcp": {
-    "server": "eve-x 1.1.0",
-    "toolSurface": "mcp/1",
-    "sdk": "1.31.0",
+    "server": "eve-x 1.1.1",
+    "toolSurface": "evex-tools/1",
+    "sdks": {
+      "server": "2.3.1",
+      "node": "2.1.1",
+      "client": "2.3.1"
+    },
     "tools": [
       "eve_session_create",
       "eve_session_status",
@@ -82,6 +111,13 @@
       "opencode",
       "cursor",
       "windsurf"
+    ],
+    "bound": [
+      {
+        "name": "eve-computer",
+        "version": "1.0.0",
+        "digest": "c3267328ddd689b24ac582fbbc744b10a1f2440173133164601c631e3c0fde9d"
+      }
     ]
   }
 }

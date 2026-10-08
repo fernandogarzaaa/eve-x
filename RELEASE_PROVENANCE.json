@@ -1,15 +1,15 @@
 {
   "product": "eve-x",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "source": {
-    "commit": "9f8c5ef341fa9372e487ea7bc9934f0db18ccf50",
-    "tree": "1faacbaedefbf9f1980877adb1dff0773033b250",
+    "commit": "bfcc9b06b73785d3cdae5ac959e58155639eda1d",
+    "tree": "c53b5b9b0d98ca29493a6e068cab4771cdbe6f13",
     "dirty": false,
     "tag": null
   },
-  "generatedAt": "2026-10-07T00:45:40.489Z",
+  "generatedAt": "2026-10-08T07:11:32.991Z",
   "dependencies": {
-    "package-lock.json": "ad0fd8e0122660c73be0dd84b84e259bdff72f7329db5e132a6f8f2317a78091",
+    "package-lock.json": "26a7c6d04f485b072ef200e3e6dd4b3686c9f7ee2e6becf57708542383132a1d",
     "node": "v26.7.0",
     "npm": "11.19.0",
     "python": "Python 3.11.9"
@@ -25,11 +25,31 @@
   },
   "containers": {
     "baseDigests": {
-      "node:20-slim": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
-      "python:3.11-slim": "sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b",
-      "dxflrs/garage:v2.0.0": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
-      "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
-      "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+      "docker.io/library/node:20-slim": {
+        "digest": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/library/python:3.11-slim": {
+        "digest": "sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/library/postgres:16-alpine": {
+        "digest": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/library/redis:7-alpine": {
+        "digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      },
+      "docker.io/dxflrs/garage:v2.0.0": {
+        "digest": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
+        "measuredAt": "2026-10-08T06:47:25.022Z",
+        "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general."
+      }
     }
   },
   "guest": {
@@ -40,22 +60,23 @@
     "reproducibility": "logical (sealed base digest + bake manifest); not claimed bit-for-bit"
   },
   "qualification": {
-    "unitTests": "200/200 node:test (41 suites)",
-    "canonicalE2E": "28/28 graphical KVM",
-    "postCanonical": "11/11 genesis/eval/promotion",
-    "concurrency": "5/5 dual-desktop + trace isolation",
-    "escapeProbes": "clean (metadata/QMP/secrets/loopback blocked)",
-    "objectQual": "9/9 Garage S3",
-    "modelRollback": "A→production, B→production, retire B, A sole production",
-    "backupRestore": "Garage byte-identical; DATA_DIR 32→0→32",
-    "securityAudit": "0 findings",
-    "npmAudit": "0 vulnerabilities"
+    "scope": "freshly measured where labeled 2026-10-08; KVM/object/backup lines are 1.0.0 campaign history, not 1.1.1 re-measurement",
+    "unitTests": "382/382 node:test (83 suites) — measured 2026-10-08 via `npm test`",
+    "canonicalE2E": "28/28 graphical KVM (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "postCanonical": "11/11 genesis/eval/promotion (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "concurrency": "5/5 dual-desktop + trace isolation (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "escapeProbes": "clean (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "objectQual": "9/9 Garage S3 (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "modelRollback": "A→production, B→production, retire B, A sole production (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "backupRestore": "Garage byte-identical; DATA_DIR 32→0→32 (carried from 1.0.0 record; not re-measured for 1.1.1)",
+    "securityAudit": "0 findings — measured 2026-10-08 via `npm run security:audit`",
+    "npmAudit": "0 vulnerabilities — measured 2026-10-08 via `npm audit --omit=dev`"
   },
   "evidence": {
     "artifacts/release/baseline.json": "49bf49f7fc8c95bce264a5e08ff7a668960f341fa4d7c099552ec44639c9d960",
     "artifacts/release/garage-backup-restore.json": "b34303a96904c8055ea1ba8b47da408be1654e3ea085f57c72749384c58fb11e",
     "artifacts/release/artifact-integrity.json": "5b5a51c3692609a9446f710e758677ac64b3211e2fc4e053eb43617e60beda72",
-    "release-manifest.json": "f70e1a965196ee4e4d327092a5aa42d2f986a060f319069af25f84069d815a4c",
+    "release-manifest.json": "df7a06d054fd816e38fb4dc02ec88d6c029ab2bdb24c967d1268413f686493e4",
     "PRODUCTION_QUALIFICATION.md": "3de9642dbf5256991cdb9cee7e0cc38ec1a383186194000f050c77139b4b0eb1"
   }
 }
