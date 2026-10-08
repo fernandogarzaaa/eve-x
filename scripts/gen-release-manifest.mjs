@@ -3,10 +3,11 @@
 // release in one place. Re-run at RC freeze; values are measured, not asserted.
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitEnv } from "./git-safe.mjs";
+import { isGeneratablePorcelainLine } from "./release-paths.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const sh = (cmd) => {
@@ -15,10 +16,10 @@ const sh = (cmd) => {
 };
 const shaFile = (p) => createHash("sha256").update(readFileSync(join(ROOT, p))).digest("hex");
 // Release outputs are not source: dirty means foreign (non-regenerable)
-// changes only — the same GENERATABLE set verify-release enforces.
-const GENERATABLE = ["release-manifest.json", "RELEASE_PROVENANCE.json"];
+// changes only — the same GENERATABLE set verify-release enforces, matched
+// by exact repo-relative path (release-paths.mjs), never suffix.
 const sourceDirty = sh("git status --porcelain").split("\n").map((l) => l.trim()).filter(Boolean)
-  .some((l) => !GENERATABLE.some((g) => l.endsWith(g)));
+  .some((l) => !isGeneratablePorcelainLine(l));
 
 // MCP tool inventory straight from source (no stale definitions).
 const mcpSrc = readFileSync(join(ROOT, "apps", "mcp", "src", "index.ts"), "utf8");
@@ -67,6 +68,32 @@ function measureSkills() {
   return out;
 }
 
+// Base-image digests are MEASURED, not asserted: they come from the
+// registry-measurement record images/base-digests.json (method + host +
+// timestamp recorded there). A ref with no record is UNMEASURED (null
+// digest + explicit status) — never a hardcoded constant copied into this
+// script. Dockerfile digest pins are frozen snapshots for reproducible
+// builds, a different claim from live tag resolution, and are NOT
+// presented as measurements here.
+let baseRecord = null;
+try {
+  baseRecord = JSON.parse(readFileSync(join(ROOT, "images", "base-digests.json"), "utf8"));
+} catch { /* no measurement record: every ref UNMEASURED */ }
+const BASE_REFS = [
+  "docker.io/library/node:20-slim",
+  "docker.io/library/python:3.11-slim",
+  "docker.io/library/postgres:16-alpine",
+  "docker.io/library/redis:7-alpine",
+  "docker.io/dxflrs/garage:v2.0.0",
+];
+const baseImages = {};
+for (const ref of BASE_REFS) {
+  const rec = baseRecord?.images?.[ref];
+  baseImages[ref] = (rec && /^sha256:[0-9a-f]{64}$/i.test(rec.digest ?? ""))
+    ? { digest: String(rec.digest).toLowerCase(), measuredAt: baseRecord.measuredAt ?? null, method: baseRecord.method ?? baseRecord.measuredBy ?? null }
+    : { digest: null, status: "UNMEASURED: no registry measurement recorded in images/base-digests.json for this ref" };
+}
+const baseRecordSha = existsSync(join(ROOT, "images", "base-digests.json")) ? shaFile("images/base-digests.json") : null;
 const manifest = {
   product: "eve-x",
   version: JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version,
@@ -77,13 +104,10 @@ const manifest = {
   toolchain: { node: sh("node --version"), npm: sh("npm --version"), python: sh("python --version") },
   lockfiles: { "package-lock.json": shaFile("package-lock.json") },
   containers: {
-    baseImages: {
-      "node:20-slim": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
-      "python:3.11-slim": "sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b",
-      "dxflrs/garage:v2.0.0": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9",
-      "postgres:16-alpine": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
-      "redis:7-alpine": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
-    },
+    baseImages,
+    baseMeasuredFrom: baseRecordSha
+      ? { file: "images/base-digests.json", sha256: baseRecordSha, measuredAt: baseRecord?.measuredAt ?? null }
+      : { file: "images/base-digests.json", sha256: null, status: "no measurement record in tree" },
     releaseImages: {},
     // No stale digests are ever carried forward: image digests describe
     // BUILT artifacts. This source release did not rebuild containers, so

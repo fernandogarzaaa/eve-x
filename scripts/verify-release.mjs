@@ -10,6 +10,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 import { gitEnv } from "./git-safe.mjs";
+import { GENERATABLE, porcelainPath } from "./release-paths.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const failures = [];
@@ -69,8 +70,9 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
   // Standard release shape: code commit, then a metadata commit touching
   // ONLY the regenerated files. Accept manifest.commit == HEAD, or the
   // parent when HEAD is exactly such a metadata commit — anything else is
-  // a manifest describing somebody else's tree.
-  const GENERATABLE = new Set(["release-manifest.json", "RELEASE_PROVENANCE.json"]);
+  // a manifest describing somebody else's tree. Membership is exact
+  // repo-relative equality (release-paths.mjs): a nested
+  // attacker/release-manifest.json never counts as generatable.
   let commitOk = m.commit === head;
   if (!commitOk) {
     const parent = sh("git rev-parse HEAD~1");
@@ -81,7 +83,7 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
     }
   }
   const dirtyFiles = sh("git status --porcelain").split("\n").map((l) => l.trim()).filter(Boolean)
-    .map((l) => l.replace(/^([AMDRCU?!]{1,2})\s+/, "").replace(/"/g, ""));
+    .map((l) => porcelainPath(l));
   const foreignDirty = dirtyFiles.filter((f) => !GENERATABLE.has(f));
   check("manifest.version == package.json", m.version === version, `manifest=${m.version}`);
   check("manifest.commit describes HEAD (or its release-metadata commit)", commitOk, `manifest=${String(m.commit).slice(0, 12)} head=${head.slice(0, 12)}`);
@@ -116,8 +118,69 @@ if (!existsSync(join(ROOT, "release-manifest.json"))) {
     check("empty releaseImages carries an imagesStatus note", typeof m.containers?.imagesStatus === "string" && m.containers.imagesStatus.length > 0, "omission without explanation");
   }
   for (const [name, digest] of Object.entries(relImgs)) {
-    check(`release image ${name} carries version`, String(name).includes(version), `got ${name}`);
-    check(`release image ${name} digest is sha256`, /^sha256:[0-9a-f]{64}$/i.test(String(digest)), `got ${digest}`);
+    // A digest copied from another release is rejected: every release
+    // image must be BOUND to this release (built from this exact commit +
+    // tree). Bare digest strings carry no binding and are refused — rebuild
+    // images for the release, never copy digests across versions.
+    const entry = digest !== null && typeof digest === "object" ? digest : null;
+    check(`release image ${name} is a bound record (not a bare digest)`, entry !== null, `got ${typeof digest}`);
+    if (entry !== null) {
+      check(`release image ${name} carries version`, String(name).includes(version), `got ${name}`);
+      check(`release image ${name} digest is sha256`, /^sha256:[0-9a-f]{64}$/i.test(String(entry.digest ?? "")), `got ${entry.digest}`);
+      check(`release image ${name} built from this commit`, entry.builtFromCommit === m.commit, `builtFrom=${String(entry.builtFromCommit).slice(0, 12)} manifest=${String(m.commit).slice(0, 12)}`);
+      check(`release image ${name} built from this tree`, entry.builtFromTree === m.tree, "tree binding drift: image was built from a different tree");
+    }
+  }
+  // Base-image digests: measured, not asserted. Every digest-shaped value
+  // in the manifest must equal the in-tree registry-measurement record
+  // (images/base-digests.json) for that ref and carry its measurement
+  // provenance; refs with no record are UNMEASURED and refuse release.
+  // Absent record file (attack fixtures) skips — the real tree must carry it.
+  if (!existsSync(join(ROOT, "images", "base-digests.json"))) {
+    ok.push("no base-digest record in tree (fixture checkout; measurement backing unverified)");
+  } else {
+    let record = null;
+    try {
+      record = JSON.parse(readSoft("images/base-digests.json"));
+    } catch {
+      failures.push("images/base-digests.json unreadable (base digests cannot be verified without it)");
+    }
+    if (record !== null) {
+      const canonRef = (r) => String(r).replace(/^docker\.io\//, "").replace(/^library\//, "");
+      const recImgs = record.images ?? {};
+      const recByCanon = new Map(Object.keys(recImgs).map((k) => [canonRef(k), recImgs[k]]));
+      const baseImgs = m.containers?.baseImages ?? {};
+      for (const [ref, entry] of Object.entries(baseImgs)) {
+        const backing = recByCanon.get(canonRef(ref));
+        if (entry !== null && typeof entry === "object" && typeof entry.digest === "string" && entry.digest.length > 0) {
+          check(`base image ${ref} digest matches measurement record`, String(entry.digest).toLowerCase() === String(backing?.digest ?? "").toLowerCase(), `manifest=${entry.digest} record=${backing?.digest ?? "absent"}`);
+          check(`base image ${ref} carries measurement provenance`, typeof entry.measuredAt === "string" && typeof entry.method === "string", "digest without measuredAt/method is an assertion, not a measurement");
+        } else {
+          check(`base image ${ref} measured (no UNMEASURED refs at release)`, false, String(entry?.status ?? "missing digest with no marker"));
+        }
+      }
+      // The record must cover every external base the tree actually builds
+      // from (Dockerfile FROM pins + compose image pins), canonicalized —
+      // a release that ships an unmeasured base is refused.
+      const usedRefs = new Set();
+      try {
+        for (const f of readdirSync(join(ROOT, "infra", "docker")).filter((x) => x.startsWith("Dockerfile"))) {
+          for (const mm of read(`infra/docker/${f}`).matchAll(/^\s*FROM\s+(\S+)/gm)) {
+            const ref = String(mm[1]).split("@")[0] ?? "";
+            if (ref.includes(":") || ref.includes("/")) usedRefs.add(canonRef(ref));
+          }
+        }
+      } catch { /* no docker dir in tree */ }
+      const composePins = readSoft("infra/deployment/docker-compose.yml");
+      for (const mm of composePins.matchAll(/^\s*image:\s*(\S+)/gm)) {
+        const ref = String(mm[1]).split("@")[0] ?? "";
+        if (!ref.includes("evex-") && (ref.includes(":") || ref.includes("/"))) usedRefs.add(canonRef(ref));
+      }
+      for (const ref of [...usedRefs].sort()) {
+        const hit = recByCanon.get(ref);
+        check(`base ${ref} has a registry measurement`, !!hit && /^sha256:[0-9a-f]{64}$/i.test(String(hit.digest ?? "")), hit ? `got ${hit.digest}` : "ref used by tree but absent from images/base-digests.json");
+      }
+    }
   }
 }
 
@@ -134,8 +197,7 @@ if (!existsSync(join(ROOT, "RELEASE_PROVENANCE.json"))) {
     const parent = sh("git rev-parse HEAD~1");
     const diffNames = sh("git diff-tree --no-commit-id --name-only -r HEAD")
       .split("\n").map((l) => l.trim()).filter(Boolean);
-    const GENERATABLE2 = new Set(["release-manifest.json", "RELEASE_PROVENANCE.json"]);
-    if (p.source?.commit === parent && diffNames.length > 0 && diffNames.every((f) => GENERATABLE2.has(f))) {
+    if (p.source?.commit === parent && diffNames.length > 0 && diffNames.every((f) => GENERATABLE.has(f))) {
       provOk = true;
     }
   }
@@ -217,7 +279,12 @@ for (const weak of [":-change-me}", ":-evex}", ":-test}", ":-password}"]) {
           continue;
         }
         const [, digest, rel] = mline;
-        const full = join(ROOT, "artifacts", "release", rel);
+        // Logical paths in the sha file: pkg/* bundles live under
+        // artifacts/release/pkg/; eve-x/* entries are the root-level
+        // release files recorded alongside the bundles.
+        const full = rel.startsWith("pkg/")
+          ? join(ROOT, "artifacts", "release", rel)
+          : join(ROOT, rel.split("/").slice(-1)[0]);
         let actual = null;
         try {
           actual = createHash("sha256").update(readFileSync(full)).digest("hex");
@@ -233,7 +300,7 @@ for (const weak of [":-change-me}", ":-evex}", ":-test}", ":-password}"]) {
 // token is assembled dynamically so this detector's own source stays clean.
 const NUL_TOKEN = ["2>", "nul"].join("");
 const nulRe = new RegExp(`'[^'\\n]*${NUL_TOKEN}[^'\\n]*'|"[^"\\n]*${NUL_TOKEN}[^"\\n]*"`, "i");
-for (const f of ["scripts/gen-release-identity.mjs", "scripts/gen-release-manifest.mjs", "scripts/gen-provenance.mjs", "scripts/release-baseline.mjs", "scripts/package-release.mjs", "scripts/verify-release.mjs"]) {
+for (const f of ["scripts/gen-release-identity.mjs", "scripts/gen-release-manifest.mjs", "scripts/gen-provenance.mjs", "scripts/release-baseline.mjs", "scripts/package-release.mjs", "scripts/verify-release.mjs", "scripts/release-paths.mjs", "scripts/git-safe.mjs"]) {
   if (!existsSync(join(ROOT, f))) continue;
   const src = read(f);
   // Code-shaped patterns (quoted shell commands / env access), so these

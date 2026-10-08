@@ -202,6 +202,7 @@ describe("release fail-closed mechanisms (hermetic)", () => {
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.0.0-test" }));
     copyFileSync(join(ROOT, "scripts", "gen-release-identity.mjs"), join(dir, "scripts", "gen-release-identity.mjs"));
     copyFileSync(join(ROOT, "scripts", "git-safe.mjs"), join(dir, "scripts", "git-safe.mjs"));
+    copyFileSync(join(ROOT, "scripts", "release-paths.mjs"), join(dir, "scripts", "release-paths.mjs"));
     execFileSync("git", ["add", "-A"], { cwd: dir });
     execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
     writeFileSync(join(dir, "dirty.txt"), "uncommitted");
@@ -231,6 +232,7 @@ describe("release fail-closed mechanisms (hermetic)", () => {
     mkdirSync(join(dir, "scripts"), { recursive: true });
     copyFileSync(join(ROOT, "scripts", "verify-release.mjs"), join(dir, "scripts", "verify-release.mjs"));
     copyFileSync(join(ROOT, "scripts", "git-safe.mjs"), join(dir, "scripts", "git-safe.mjs"));
+    copyFileSync(join(ROOT, "scripts", "release-paths.mjs"), join(dir, "scripts", "release-paths.mjs"));
     let refused = false;
     let out = "";
     try {

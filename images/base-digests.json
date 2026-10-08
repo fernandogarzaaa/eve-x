@@ -1,0 +1,23 @@
+{
+  "images": {
+    "docker.io/dxflrs/garage:v2.0.0": {
+      "digest": "sha256:15b40e0dddd2e611aa746ff6f7c3bfe9f22735e4a2cc29e0abd89c268e9b79d9"
+    },
+    "docker.io/library/node:20-slim": {
+      "digest": "sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0"
+    },
+    "docker.io/library/postgres:16-alpine": {
+      "digest": "sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea"
+    },
+    "docker.io/library/python:3.11-slim": {
+      "digest": "sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce"
+    },
+    "docker.io/library/redis:7-alpine": {
+      "digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+    }
+  },
+  "measuredAt": "2026-10-08T06:47:25.022Z",
+  "measuredBy": "docker buildx imagetools inspect (registry resolution, docker 29.8.0)",
+  "method": "Top-level index Digest from `docker buildx imagetools inspect <ref>` against the live registry. Tags are mutable: re-measure at RC freeze; a digest recorded here describes the tag AT THIS TIMESTAMP, never the tag in general.",
+  "product": "eve-x"
+}

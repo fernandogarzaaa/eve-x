@@ -202,7 +202,7 @@ function validatedCall<N extends ToolName>(
 }
 
 export function buildMcpServer(): McpServer {
-  const server = new McpServer({ name: "eve-x", version: "1.1.0" });
+  const server = new McpServer({ name: "eve-x", version: "1.1.1" });
 
   server.registerTool("eve_session_create",
     { description: "Create an EVE-X computer-use session", inputSchema: TOOL_SCHEMAS["eve_session_create"] },

@@ -1,5 +1,36 @@
 # Changelog
 
+## EVE-X 1.1.1 — release-integrity hardening (no architecture changes)
+
+Targeted finalization of the 1.1.0 hardening branch. No product behavior
+changes except where integrity requires refusal:
+
+- Release path logic: generatable-file matching is exact repo-relative
+  equality (`scripts/release-paths.mjs`), never suffix matching — a nested
+  `attacker/release-manifest.json` is foreign, not generatable (P1 fix).
+- Base-image digests are measured into `images/base-digests.json` via live
+  registry resolution (method/host/timestamp recorded); the manifest copies
+  that record with provenance instead of asserting hardcoded constants.
+  This pass caught one real rot: the `python:3.11-slim` tag moved since the
+  old constant was copied (Dockerfile digest pins remain frozen snapshots).
+- Release images must be bound records (`digest` + `builtFromCommit` +
+  `builtFromTree` equal to the release commit/tree); bare digests copied
+  from another release are refused by `verify-release`.
+- Attack suite grows 26 → 32 cases: nested-basename collisions (untracked
+  and smuggled into the metadata commit), cross-release digest reuse
+  (bare and foreign-bound), and unit coverage of the exact-path rule.
+- Case #22 git operations are hermetic (explicit identity via the shared
+  helper) so CI passes without a configured committer.
+- Trace chain: `TraceStore.fromJsonl` verifies chained digests on load
+  (new `appendVerified`) instead of silently re-stamping; `TimelinePlayer`
+  reports `SESSION_SPLIT` before digest mismatch on merged logs;
+  `verifyReplay` takes an expected count so truncation is flagged.
+- Guest jail: NFKC normalization (fullwidth-dot smuggling refused),
+  hardlink-to-outside refusal, swap-symlink containment, no-shell exec
+  proof, wrapper-script identity refusal.
+- Source identity reconciled to 1.1.1 across package, CLI, MCP server,
+  OpenAPI, compose tags, manifest, and provenance.
+
 ## EVE-X 1.1.0 — evidence-integrity rebuild (BREAKING where honesty requires it)
 
 Verification over agent self-report, enforced in code and CI:

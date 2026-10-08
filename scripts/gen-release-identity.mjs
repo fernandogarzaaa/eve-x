@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitEnv } from "./git-safe.mjs";
+import { isGeneratablePorcelainLine } from "./release-paths.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const sh = (cmd) => {
@@ -31,10 +32,11 @@ const commit = sh("git rev-parse HEAD") || "unknown";
 const tree = sh('git rev-parse "HEAD^{tree}"') || "unknown";
 // Release outputs are not source: uncommitted regenerations of the manifest
 // / provenance never make a build "dirty". Anything else dirty fails closed.
-const GENERATABLE = ["release-manifest.json", "RELEASE_PROVENANCE.json"];
+// Generatable matching is exact repo-relative equality (release-paths.mjs):
+// a nested attacker/release-manifest.json is foreign, never generatable.
 const status = sh("git status --porcelain");
 const dirty = status.split("\n").map((l) => l.trim()).filter(Boolean)
-  .some((l) => !GENERATABLE.some((g) => l.endsWith(g)));
+  .some((l) => !isGeneratablePorcelainLine(l));
 const sourceDigest = createHash("sha256").update(`commit:${commit}\ntree:${tree}\nstatus:\n${status}`).digest("hex");
 
 if (dirty && process.env["EVEX_ALLOW_DIRTY_BUILD"] !== "1") {
