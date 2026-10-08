@@ -3,13 +3,14 @@
 // release in one place. Re-run at RC freeze; values are measured, not asserted.
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gitEnv } from "./git-safe.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const sh = (cmd) => {
-  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: gitEnv() }).trim(); }
   catch { return ""; }
 };
 const shaFile = (p) => createHash("sha256").update(readFileSync(join(ROOT, p))).digest("hex");
@@ -37,6 +38,27 @@ let guestManifest = null;
 try {
   guestManifest = JSON.parse(readFileSync(join(ROOT, "images", "guest-manifest.json"), "utf8"));
 } catch { /* no published bake manifest in-tree */ }
+
+function measureSkills() {
+  const out = [];
+  let dirs = [];
+  try {
+    dirs = readdirSync(join(ROOT, "skills")).filter((d) => {
+      try { return statSync(join(ROOT, "skills", d)).isDirectory(); } catch { return false; }
+    }).sort();
+  } catch { return out; }
+  for (const d of dirs) {
+    try {
+      const man = JSON.parse(readFileSync(join(ROOT, "skills", d, "skill.json"), "utf8"));
+      const entry = readFileSync(join(ROOT, "skills", d, man.entrypoint ?? "SKILL.md"));
+      const digest = createHash("sha256")
+        .update(readFileSync(join(ROOT, "skills", d, "skill.json")))
+        .update(entry).digest("hex");
+      out.push({ name: man.name ?? d, version: man.version ?? "unknown", digest });
+    } catch { /* unmeasurable skill dir: omitted (verifier flags drift, not absence) */ }
+  }
+  return out;
+}
 
 const manifest = {
   product: "eve-x",
@@ -81,7 +103,15 @@ const manifest = {
     smokePath: "stdlib-only selftest (ml/inference/selftest.py; torch paths via stub injection)",
   },
   mcp: { server: `eve-x ${mcpServerVersion}`, toolSurface, sdk: sdkVersion, tools, toolCount: tools.length },
-  skills: { contract: "AGENT_SKILL.md", integrations: ["claude-code", "codex", "generic", "hermes", "openclaw", "opencode", "pi"], installerTargets: ["claude-code", "codex", "opencode", "cursor", "windsurf"] },
+  // Skills: measured identity per skill dir (name + version + content
+  // digest over skill.json + entrypoint). A changed skill without a
+  // regenerated manifest is stale by construction — verify-release refuses.
+  skills: {
+    contract: "AGENT_SKILL.md",
+    integrations: ["claude-code", "codex", "generic", "hermes", "openclaw", "opencode", "pi"],
+    installerTargets: ["claude-code", "codex", "opencode", "cursor", "windsurf"],
+    bound: measureSkills(),
+  },
 };
 writeFileSync(join(ROOT, "release-manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 console.log(`release-manifest: v${manifest.version} commit=${manifest.commit.slice(0, 12)} dirty=${manifest.dirty} mcpTools=${tools.length}`);

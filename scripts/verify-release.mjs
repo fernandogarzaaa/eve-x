@@ -4,10 +4,12 @@
 // manifest, provenance, compose references, container pins, guest pins,
 // and the MCP tool surface — and refuses inconsistent releases (exit 1
 // with every drift listed). Used by `npm run release` and CI.
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
+import { gitEnv } from "./git-safe.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const failures = [];
@@ -28,11 +30,20 @@ const readSoft = (p) => {
   }
 };
 const sh = (cmd) => {
-  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  // Hostile-environment hardening lives in git-safe.mjs (GIT_DIR etc.
+  // would redirect revision queries at a different repository).
+  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: gitEnv() }).trim(); }
   catch { return ""; }
 };
 
-const pkg = JSON.parse(read("package.json"));
+const pkg = (() => {
+  try {
+    return JSON.parse(read("package.json"));
+  } catch {
+    console.error("verify-release: package.json missing/unreadable — no identifiable release to verify");
+    process.exit(1);
+  }
+})();
 const version = pkg.version;
 
 // 1. version agreement across every surface
@@ -142,6 +153,80 @@ for (const weak of [":-change-me}", ":-evex}", ":-test}", ":-password}"]) {
   check(`compose has no weak default ${weak}`, !compose.includes(weak), "weak default secret");
 }
 
+// 4b. skills bound to measured identity (name + version + content digest).
+// A changed skill without a regenerated manifest is stale by construction.
+{
+  let manifestDoc = null;
+  try {
+    manifestDoc = JSON.parse(readSoft("release-manifest.json"));
+  } catch {
+    failures.push("release-manifest.json unreadable for skill binding check");
+  }
+  const bound = manifestDoc !== null && Array.isArray(manifestDoc.skills?.bound) ? manifestDoc.skills.bound : null;
+  if (!bound) {
+    failures.push("manifest skills.bound missing (skills unbound to release)");
+  } else {
+    for (const s of bound) {
+      check(`skill ${s.name} has version + digest`, typeof s.version === "string" && /^[0-9a-f]{64}$/i.test(String(s.digest ?? "")), JSON.stringify(s).slice(0, 120));
+    }
+    // Bound skills must still match the tree: re-measure one digest per skill.
+    for (const s of bound) {
+      try {
+        const dir = join(ROOT, "skills", String(s.name));
+        if (!statSync(dir).isDirectory()) {
+          failures.push(`bound skill missing from tree: ${s.name}`);
+          continue;
+        }
+        const man = JSON.parse(readFileSync(join(dir, "skill.json"), "utf8"));
+        const entry = readFileSync(join(dir, man.entrypoint ?? "SKILL.md"));
+        const recomputed = createHash("sha256")
+          .update(readFileSync(join(dir, "skill.json")))
+          .update(entry).digest("hex");
+        check(`skill ${s.name}@${s.version} digest matches tree`, recomputed === String(s.digest).toLowerCase(), "skill changed without manifest regen (stale binding)");
+      } catch {
+        failures.push(`bound skill unreadable: ${s.name}`);
+      }
+    }
+  }
+}
+
+// 4c. exact-match tag on HEAD must equal the package version. Tags are
+// human-applied release markers; a mismatched tag ships the wrong story.
+{
+  const tag = sh("git describe --tags --exact-match");
+  if (tag) {
+    check("HEAD tag == package.json version", tag === version || tag === `v${version}`, `tag=${tag} pkg=${version}`);
+  } else {
+    ok.push("no exact-match tag on HEAD (untagged release commit)");
+  }
+}
+
+// 4d. release archives: every file listed in RELEASE_ARTIFACTS.sha256 must
+// exist with the recorded digest (catches post-archive tampering). Absent
+// bundle dir (source-only checkout) is skipped, not failed.
+{
+  const shaPath = join(ROOT, "artifacts", "release", "pkg", "RELEASE_ARTIFACTS.sha256");
+  if (existsSync(shaPath)) {
+    const lines = readSoft("artifacts/release/pkg/RELEASE_ARTIFACTS.sha256").split("\n").map((l) => l.trim()).filter(Boolean);
+    for (const line of lines) {
+        const mline = line.match(/^([0-9a-f]{64})\s+(.+)$/i);
+        if (!mline) {
+          failures.push(`malformed archive digest line: ${line.slice(0, 80)}`);
+          continue;
+        }
+        const [, digest, rel] = mline;
+        const full = join(ROOT, "artifacts", "release", rel);
+        let actual = null;
+        try {
+          actual = createHash("sha256").update(readFileSync(full)).digest("hex");
+        } catch { /* missing below */ }
+        check(`archive intact: ${rel}`, actual === digest?.toLowerCase(), actual === null ? "file missing after archive" : "digest mismatch (tampered after packaging)");
+      }
+  } else {
+    ok.push("no release bundle dir (source-only checkout; archives unverified)");
+  }
+}
+
 // 5. script hygiene (platform + path bugs that once shipped). The redirect
 // token is assembled dynamically so this detector's own source stays clean.
 const NUL_TOKEN = ["2>", "nul"].join("");
@@ -154,6 +239,10 @@ for (const f of ["scripts/gen-release-identity.mjs", "scripts/gen-release-manife
   check(`${f} has no 2>nul redirect`, !nulRe.test(src), "Windows-only redirect creates ./nul on POSIX");
   check(`${f} has no hardcoded windows root`, !/"[A-Z]:\\\\|'[A-Z]:\\\\/.test(src), "non-portable root");
   check(`${f} has no release-commit override`, !/process\.env\[.EVEX_RELEASE_COMMIT/.test(src), "override lets metadata lie about HEAD");
+  // Every script that shells out to git must scrub hostile env first.
+  if (/execSync\(cmd/.test(src)) {
+    check(`${f} scrubs git env`, src.includes("gitEnv()"), "GIT_DIR-style poisoning of revision queries");
+  }
 }
 
 console.log(`verify-release: ${ok.length} checks passed`);
