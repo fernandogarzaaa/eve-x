@@ -1,11 +1,11 @@
 {
   "built": [
     {
-      "builtAt": "2026-10-08T13:33:47.085Z",
-      "builtFromCommit": "cb8516712312cb4756e7b8c402d674d2d3c36fb4",
-      "builtFromTree": "db36cb6bd75ed4b3d1b121d9ea93717a9595b06d",
-      "digest": "sha256:67a8d5f4af5138547de4cbb836cc553f4c1c1fc6077b91558e27f1bfc87cbd88",
-      "localImageId": "sha256:67a8d5f4af5138547de4cbb836cc553f4c1c1fc6077b91558e27f1bfc87cbd88",
+      "builtAt": "2026-10-08T13:35:33.979Z",
+      "builtFromCommit": "6fe85106013b399f74b3b0e6362d413ee8ef3277",
+      "builtFromTree": "9a790f92f5375fae7d21672b7de0e741fa7a161a",
+      "digest": "sha256:a2e754888ae3a5cde3331bc2c2856248e73f88ad005d2d12e2f8ea41be130838",
+      "localImageId": "sha256:a2e754888ae3a5cde3331bc2c2856248e73f88ad005d2d12e2f8ea41be130838",
       "method": "docker build -f infra/docker/Dockerfile.inference -t evex-inference:1.1.1 . (buildx; base resolved to the pinned digest at build)",
       "name": "evex-inference:1.1.1",
       "note": "Local build content digest (manifest-list). No distribution digest exists until registry push; on push, replace digest with the registry digest and re-bind.",
