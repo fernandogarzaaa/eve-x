@@ -4,7 +4,15 @@
 // A nested path like attacker/release-manifest.json ends with the
 // generatable basename but is NOT the release manifest: suffix matching
 // would launder a foreign file into a "clean tree" verdict (P1).
-export const GENERATABLE = new Set(["release-manifest.json", "RELEASE_PROVENANCE.json"]);
+// images/release-images.json is release-process output too (the build host
+// measures built-image digests into it at release time), so regenerating
+// or re-binding it never dirties the tree — but its CONTENT is still
+// binding-checked (builtFrom must match the release commit/tree).
+export const GENERATABLE = new Set([
+  "release-manifest.json",
+  "RELEASE_PROVENANCE.json",
+  "images/release-images.json",
+]);
 
 /** Extract the repo-relative path a porcelain line refers to. Handles the
  *  XY status prefix, rename/copy arrows (the new side is what the tree

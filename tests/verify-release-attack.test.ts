@@ -491,7 +491,7 @@ describe("verify-release adversarial audit (33 cases)", () => {
     };
     // Root-level generatable files (every porcelain status; lines arrive
     // pre-trimmed exactly as the gen scripts and verifier pass them) pass.
-    for (const line of ["M release-manifest.json", "M RELEASE_PROVENANCE.json", "A  release-manifest.json", "?? RELEASE_PROVENANCE.json", "R  old.json -> release-manifest.json"]) {
+    for (const line of ["M release-manifest.json", "M RELEASE_PROVENANCE.json", "A  release-manifest.json", "?? RELEASE_PROVENANCE.json", "M images/release-images.json", "R  old.json -> release-manifest.json"]) {
       assert.equal(helper.isGeneratablePorcelainLine(line), true, line);
     }
     // Suffix collisions, separators, quotes, and renames AWAY are foreign.
@@ -499,6 +499,8 @@ describe("verify-release adversarial audit (33 cases)", () => {
       "?? attacker/release-manifest.json",
       " M deep/nested/RELEASE_PROVENANCE.json",
       "?? attacker\\release-manifest.json",
+      "?? attacker/images/release-images.json",
+      "?? images/release-images.json.bak",
       '"M release-manifest.json"',
       "A  release-manifest.json.bak",
       "R  release-manifest.json -> moved.json",

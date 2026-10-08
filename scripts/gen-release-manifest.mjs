@@ -124,7 +124,7 @@ function releaseImagesSection() {
     }
   }
   const imagesStatus = Object.keys(releaseImages).length > 0
-    ? `bound at build time from images/release-images.json (${Object.keys(releaseImages).length} image(s)); stale records refused: ${stale}`
+    ? `bound at build time from images/release-images.json (${Object.keys(releaseImages).length} image(s)); stale records refused: ${stale}; services without entries were not rebuilt for this release`
     : (stale > 0
       ? `no release images bound: ${stale} record(s) refused as stale (built from a different commit/tree — rebuild, never copy)`
       : "not-built for this source release (rebuild container images to populate digests; never copy digests across versions)");
