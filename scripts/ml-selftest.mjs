@@ -15,6 +15,8 @@ const targets = [
   join(ROOT, "ml", "inference", "selftest.py"),
   join(ROOT, "ml", "evaluation", "eval_selftest.py"),
   join(ROOT, "ml", "datasets", "build_selftest.py"),
+  join(ROOT, "ml", "datasets", "fingerprints_selftest.py"),
+  join(ROOT, "ml", "training", "lineage_selftest.py"),
 ];
 for (const target of targets) {
   if (!existsSync(target)) {
