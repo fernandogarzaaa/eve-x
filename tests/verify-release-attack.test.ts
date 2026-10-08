@@ -70,7 +70,7 @@ interface ManifestFixture {
   version: string;
   commit: string;
   tree: string;
-  mcp: { server: string; toolSurface: string; sdk: string; tools: string[]; toolCount: number };
+  mcp: { server: string; toolSurface: string; sdks: { server: string; node: string; client: string }; tools: string[]; toolCount: number };
   guest: Record<string, unknown>;
   containers: { releaseImages: Record<string, string>; imagesStatus?: string; baseImages?: Record<string, string> };
   skills: { contract: string; integrations: string[]; installerTargets: string[]; bound: Array<{ name: string; version: string; digest: string }> };

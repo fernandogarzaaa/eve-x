@@ -16,8 +16,15 @@ Scoring rules (scientific integrity over point estimates):
   verification evidence is UNVERIFIED (inconclusive — uncertainty is never
   collapsed into success or silently discarded).
 * TEMPORAL RECOVERY: a failure at step i counts as recovered only with a
-  later success at step j>i AND a recovered:true marker at step k>i
-  (failure -> corrective behavior -> later success, evidentially linked).
+  later verified success AND a recovered:true marker LINKING them
+  (first_fail < marker <= first later success). Floating markers do not
+  link (failure -> corrective behavior -> later success, evidentially linked).
+* TWO SUCCESS RATES, both labeled: success_rate over ALL samples (missing
+  counts as failure — the headline) and scored_success_rate over scored
+  tasks only. Missing tasks can never inflate the headline.
+* INCONCLUSIVE is a UNION of task ids (missing/indeterminate/unverified):
+  one task counts once, never twice. Tasks without a bbox expectation
+  record grounded:null (not True) so per-task averaging cannot inflate.
 * MISSING/INVALID/UNKNOWN: tasks with no predictions are inconclusive
   (missing, reported — not scored as failures); malformed JSONL lines are
   invalid (counted, attributed when a task_id is recoverable); predictions
@@ -170,7 +177,7 @@ def main(argv: list | None = None) -> int:
             hit = best >= args.iou_threshold
             ground_hits += 1 if hit else 0
         elif not isinstance(exp_box, list):
-            hit = True  # no bbox expectation: grounding not applicable, not counted
+            hit = None  # no bbox expectation: grounding not applicable (null, not True — averaging must skip)
         # Verified success: success:true needs verified:true. Contradicted
         # (verified:false) is failure; absent verification is inconclusive.
         succ_flags = [p.get("success") is True for p in ordered]
@@ -189,16 +196,18 @@ def main(argv: list | None = None) -> int:
             unverified_successes += 1
         else:
             ok = False
-        # Temporal recovery: a failure at step i, then a later success at
-        # step j>i, with a recovered:true marker at step k>i linking them.
+        # Temporal recovery: a failure at step i, then a later verified
+        # success, with a recovered:true marker LINKING them (between the
+        # failure and the first later success). A floating marker elsewhere
+        # does not establish recovery.
         fail_steps = [step_no(p) for p in ordered if p.get("success") is False]
         succ_steps = [step_no(p) for p in ordered if p.get("success") is True and p.get("verified") is True]
         rec_steps = [step_no(p) for p in ordered if p.get("recovered") is True]
         if fail_steps:
             recovery_total += 1
             first_fail = min(fail_steps)
-            linked = (any(s > first_fail for s in succ_steps)
-                      and any(r > first_fail for r in rec_steps))
+            later_succ = [s for s in succ_steps if s > first_fail]
+            linked = bool(later_succ) and any(first_fail < r <= min(later_succ) for r in rec_steps)
             recovery_ok += 1 if linked else 0
         status = det_status
         if det_status == "scored" and unverified_here:
@@ -208,7 +217,9 @@ def main(argv: list | None = None) -> int:
                          "predictions": len(preds)})
 
     total = len(tasks)
-    inconclusive = missing + indeterminate + unverified_successes
+    # Union of non-scored task ids: a task that is both indeterminate AND
+    # unverified counts once (no double-counting of uncertainty).
+    inconclusive_tasks = sorted({p["task_id"] for p in per_task if p.get("status") != "scored"})
     artifact = {
         "benchmark": args.benchmark,
         "split": args.split,
@@ -218,13 +229,20 @@ def main(argv: list | None = None) -> int:
             "grounding_accuracy": (ground_hits / ground_total) if ground_total else 0.0,
             "grounding_hits": ground_hits,
             "grounding_total": ground_total,
+            "grounding_basis": "task-decision",
             "indeterminate_grounding": indeterminate,
-            "success_rate": success / scored if scored else 0.0,
+            # Two success rates, both labeled: scored-only (comparable runs)
+            # and over-all-samples (missing counts as failure). The headline
+            # is total_success_rate — scored-only inflates when hard tasks
+            # go missing.
+            "success_rate": success / total if total else 0.0,
+            "scored_success_rate": success / scored if scored else 0.0,
             "successes": success,
             "scored_total": scored,
             "unverified_successes": unverified_successes,
             "contradicted": contradicted,
-            "inconclusive": inconclusive,
+            "inconclusive": len(inconclusive_tasks),
+            "inconclusive_task_ids": inconclusive_tasks,
             "missing_predictions": missing,
             "invalid_lines": invalid_lines,
             "recovery_rate": (recovery_ok / recovery_total) if recovery_total else 0.0,
@@ -250,9 +268,10 @@ def main(argv: list | None = None) -> int:
         json.dump(artifact, f, indent=2)
     m = artifact["metrics"]
     print(f"done benchmark={args.benchmark} split={args.split} n={total} "
-          f"success={m['success_rate']:.3f} grounding={m['grounding_accuracy']:.3f} "
+          f"success_total={m['success_rate']:.3f} success_scored={m['scored_success_rate']:.3f} "
+          f"grounding={m['grounding_accuracy']:.3f} "
           f"recovery={m['recovery_rate']:.3f} missing={missing} "
-          f"inconclusive={inconclusive} invalid={invalid_lines}")
+          f"inconclusive={m['inconclusive']} invalid={invalid_lines}")
     return 0
 
 

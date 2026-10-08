@@ -184,13 +184,19 @@ describe("benchmark records carry verdict counts + CI", () => {
       async () => {
         n += 1;
         const verdict = n === 1 ? "success" : n === 2 ? "inconclusive" : "invalid";
+        // Success verdicts require executed evidence (H1 refine); the other
+        // verdicts honestly carry none.
+        const evidenced = verdict === "success"
+          ? { steps: [step(0)], evidenceDigests: ["d"], actionTotal: 1, actionSuccesses: 1, stepsUsed: 3 }
+          : { steps: [], evidenceDigests: [], actionTotal: 0, actionSuccesses: 0, stepsUsed: 0 };
         return {
           verdict, success: verdict === "success",
-          actionSuccesses: 0, actionTotal: 0, groundedCorrect: 0, groundedTotal: 0,
-          stepsUsed: 0, predictionsCorrect: 0, predictionsTotal: 0,
+          groundedCorrect: 0, groundedTotal: 0,
+          predictionsCorrect: 0, predictionsTotal: 0,
           recovered: 0, recoveryOpportunities: 0, humanAgreements: 0, humanJudged: 0,
-          unsafe: false, takeover: false, latenciesMs: [], steps: [],
-          evidenceDigests: [], agentIdentity: "t", modelIdentity: null,
+          unsafe: false, takeover: false, latenciesMs: [],
+          agentIdentity: "t", modelIdentity: null,
+          ...evidenced,
         };
       },
       { splits: ["test"], runId: "r3" },

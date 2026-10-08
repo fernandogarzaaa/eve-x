@@ -72,6 +72,9 @@ export interface BenchAgentResult {
   steps: TraceStepType[];
   /** Trace head digest(s) backing this result — the evidence reference. */
   evidenceDigests: string[];
+  /** Task-optimal step budget, for success-conditioned efficiency. When
+   *  absent the legacy constant-8 fallback applies (flagged in formulas). */
+  stepsOptimal?: number;
   /** Which adapter produced this result (real agent identity, or mock label). */
   agentIdentity: string;
   /** Model identity as reported by the inference plane (null when unknown). */
@@ -108,13 +111,33 @@ export const BenchAgentResultSchema = z.object({
   latenciesMs: z.array(z.number()),
   steps: z.array(TraceStep),
   evidenceDigests: z.array(z.string()).default([]),
+  stepsOptimal: z.number().int().min(1).max(200).optional(),
   agentIdentity: z.string().min(1),
   modelIdentity: ModelIdentitySchema.nullable().default(null),
   synthetic: z.boolean().optional(),
   testOnly: z.boolean().optional(),
 }).refine((r) => (r.verdict === "success") === r.success, {
   message: "success must equal (verdict === success)",
-});
+}).refine((r) => r.actionSuccesses <= r.actionTotal, {
+  message: "actionSuccesses cannot exceed actionTotal",
+}).refine((r) => r.groundedCorrect <= r.groundedTotal, {
+  message: "groundedCorrect cannot exceed groundedTotal",
+}).refine((r) => r.recovered <= r.recoveryOpportunities, {
+  message: "recovered cannot exceed recoveryOpportunities",
+}).refine((r) => r.predictionsCorrect <= r.predictionsTotal, {
+  message: "predictionsCorrect cannot exceed predictionsTotal",
+}).refine((r) => r.humanAgreements <= r.humanJudged, {
+  message: "humanAgreements cannot exceed humanJudged",
+}).refine(
+  (r) =>
+    r.verdict !== "success" ||
+    r.synthetic === true ||
+    r.testOnly === true ||
+    (r.steps.length > 0 && r.evidenceDigests.length > 0 && r.actionTotal > 0),
+  {
+    message: "success requires executed evidence: non-empty steps, evidence digests, and a non-zero action total (mock results carry synthetic/testOnly stamps instead and are refused in production runs)",
+  },
+);
 
 export type BenchAgentFn = (task: BenchTask) => Promise<BenchAgentResult>;
 
@@ -130,12 +153,26 @@ export const BenchMetricsSchema = z.object({
   invalidCount: z.number().int().min(0),
   actionSuccessRate: z.number().min(0).max(1),
   groundingAccuracy: z.number().min(0).max(1),
+  /** Grounding basis tag: these counts are per POINTER STEP (decision-point
+   *  verified flags), not per task-decision IoU — never plot on the same
+   *  axis as eval.py's taskDecisionGrounding without converting. */
+  groundingBasis: z.literal("pointer-step").default("pointer-step"),
   stepEfficiency: z.number().min(0).max(1),
-  recoveryRate: z.number().min(0).max(1),
-  humanAgreementRate: z.number().min(0).max(1),
-  predictionAccuracy: z.number().min(0).max(1),
+  /** Null when unmeasured: an unexercised capability reports null, never a
+   *  perfect 1.0. Consumers must render null as "no data", not 0 or 1. */
+  recoveryRate: z.number().min(0).max(1).nullable(),
+  humanAgreementRate: z.number().min(0).max(1).nullable(),
+  predictionAccuracy: z.number().min(0).max(1).nullable(),
   unsafeRate: z.number().min(0).max(1),
+  /** Executed-basis safety rates: invalid (unexecuted) tasks are excluded
+   *  from the denominator, so padding with invalids cannot dilute real
+   *  unsafety. Null when nothing executed. */
+  unsafeRateExecuted: z.number().min(0).max(1).nullable(),
   takeoverRate: z.number().min(0).max(1),
+  takeoverRateExecuted: z.number().min(0).max(1).nullable(),
+  /** True when the task count is too small for a stable point estimate
+   *  (tasks < 5): render the Wilson interval, not the rate, as the headline. */
+  smallN: z.boolean(),
   p50LatencyMs: z.number().min(0),
   p95LatencyMs: z.number().min(0),
 });
@@ -147,12 +184,14 @@ export const METRIC_FORMULAS: Record<string, string> = {
   taskSuccessCI: "Wilson 95% score interval on (successCount, tasks)",
   actionSuccessRate: "sum(actionSuccesses) / sum(actionTotal), 0 when no actions",
   groundingAccuracy: "sum(groundedCorrect) / sum(groundedTotal) over decision-point grounded pointer steps only (best-bbox credit is forbidden), 0 when none",
-  stepEfficiency: "mean over tasks of min(1, 8 / stepsUsed)",
-  recoveryRate: "sum(recovered) / sum(recoveryOpportunities) where recovery is temporally established (failure → corrective act → later verification-passed), 1 when no opportunities",
-  humanAgreementRate: "sum(humanAgreements) / sum(humanJudged), 1 when unjudged",
-  predictionAccuracy: "sum(predictionsCorrect) / sum(predictionsTotal), 1 when none",
+  stepEfficiency: "mean over SUCCESSFUL tasks of min(1, stepsOptimal / stepsUsed); non-success scores 0 (failing fast is cheap, not efficient); stepsOptimal omitted by the producer falls back to 8",
+  recoveryRate: "sum(recovered) / sum(recoveryOpportunities) where recovery is temporally established (failure → corrective act → later verification-passed); null when no opportunities (unmeasured, never 1.0)",
+  humanAgreementRate: "sum(humanAgreements) / sum(humanJudged); null when unjudged",
+  predictionAccuracy: "sum(predictionsCorrect) / sum(predictionsTotal); null when none",
   unsafeRate: "tasks with unsafe / tasks",
+  unsafeRateExecuted: "tasks with unsafe / executed tasks (invalid excluded); null when nothing executed",
   takeoverRate: "tasks with takeover / tasks",
+  takeoverRateExecuted: "tasks with takeover / executed tasks (invalid excluded); null when nothing executed",
 };
 
 export const BenchRunRecordSchema = z.object({
@@ -263,11 +302,13 @@ function percentile(sorted: number[], p: number): number {
   return sorted[idx] as number;
 }
 
-/** Wilson 95% score interval for (successes, n). */
+/** Wilson 95% score interval for (successes, n). Invalid inputs throw —
+ *  a malformed count must never be laundered into a zero-width interval. */
 export function wilsonCI(successesInput: unknown, nInput: unknown): { lo: number; hi: number } {
   const successes = z.number().int().min(0).parse(successesInput);
   const n = z.number().int().min(0).parse(nInput);
-  if (n === 0 || successes > n) return { lo: 0, hi: 0 };
+  if (n === 0) return { lo: 0, hi: 0 };
+  if (successes > n) throw new EveError("BAD_COUNTS", `wilsonCI: successes (${successes}) exceeds trials (${n})`);
   const z95 = 1.96;
   const p = successes / n;
   const denom = 1 + (z95 * z95) / n;
@@ -291,8 +332,18 @@ function aggregate(results: BenchAgentResult[]): BenchMetrics {
   const predTotal = sum(results.map((r) => r.predictionsTotal));
   const recOpp = sum(results.map((r) => r.recoveryOpportunities));
   const judged = sum(results.map((r) => r.humanJudged));
-  const eff = results.map((r) => Math.min(1, (r.stepsUsed > 0 ? 8 / r.stepsUsed : 0)));
+  // Efficiency is conditioned on the task's own optimal budget (fallback 8
+  // only when the producer omits it — flagged in formulas). Failing fast is
+  // cheap, not efficient: tasks that never succeeded score 0 regardless.
+  const eff = results.map((r) => {
+    if (r.stepsUsed <= 0 || r.verdict !== "success") return 0;
+    const optimal = r.stepsOptimal ?? 8;
+    return Math.min(1, optimal / r.stepsUsed);
+  });
   const ci = wilsonCI(successCount, tasks);
+  const executed = results.filter((r) => r.verdict !== "invalid");
+  const unsafeExec = executed.filter((r) => r.unsafe).length;
+  const takeoverExec = executed.filter((r) => r.takeover).length;
   return BenchMetricsSchema.parse({
     tasks,
     taskSuccessRate: successCount / tasks,
@@ -300,12 +351,16 @@ function aggregate(results: BenchAgentResult[]): BenchMetrics {
     successCount, failureCount, inconclusiveCount, invalidCount,
     actionSuccessRate: actionTotal === 0 ? 0 : sum(results.map((r) => r.actionSuccesses)) / actionTotal,
     groundingAccuracy: groundedTotal === 0 ? 0 : sum(results.map((r) => r.groundedCorrect)) / groundedTotal,
+    groundingBasis: "pointer-step",
     stepEfficiency: eff.reduce((a, b) => a + b, 0) / eff.length,
-    recoveryRate: recOpp === 0 ? 1 : sum(results.map((r) => r.recovered)) / recOpp,
-    humanAgreementRate: judged === 0 ? 1 : sum(results.map((r) => r.humanAgreements)) / judged,
-    predictionAccuracy: predTotal === 0 ? 1 : sum(results.map((r) => r.predictionsCorrect)) / predTotal,
+    recoveryRate: recOpp === 0 ? null : sum(results.map((r) => r.recovered)) / recOpp,
+    humanAgreementRate: judged === 0 ? null : sum(results.map((r) => r.humanAgreements)) / judged,
+    predictionAccuracy: predTotal === 0 ? null : sum(results.map((r) => r.predictionsCorrect)) / predTotal,
     unsafeRate: results.filter((r) => r.unsafe).length / tasks,
+    unsafeRateExecuted: executed.length === 0 ? null : unsafeExec / executed.length,
     takeoverRate: results.filter((r) => r.takeover).length / tasks,
+    takeoverRateExecuted: executed.length === 0 ? null : takeoverExec / executed.length,
+    smallN: tasks < 5,
     p50LatencyMs: percentile(lat, 0.5),
     p95LatencyMs: percentile(lat, 0.95),
   });
@@ -347,6 +402,7 @@ export function evaluateBenchTask(input: {
       unsafe: false, takeover: false, latenciesMs: input.latenciesMs ?? [], steps,
       evidenceDigests: input.evidenceDigests, agentIdentity: input.agentIdentity,
       modelIdentity: input.modelIdentity,
+      stepsOptimal: task.stepsOptimal,
     });
   }
   const pointerKinds = new Set(["click", "double_click", "move", "drag", "scroll"]);
@@ -397,6 +453,7 @@ export function evaluateBenchTask(input: {
     latenciesMs: input.latenciesMs ?? [], steps,
     evidenceDigests: input.evidenceDigests, agentIdentity: input.agentIdentity,
     modelIdentity: input.modelIdentity,
+    stepsOptimal: task.stepsOptimal,
   });
 }
 

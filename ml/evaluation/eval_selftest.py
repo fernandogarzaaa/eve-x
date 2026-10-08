@@ -141,11 +141,46 @@ def main():
     check("missing is inconclusive, not failure-scored",
           h["metrics"]["missing_predictions"] == 2 and h["metrics"]["scored_total"] == 1,
           json.dumps(h["metrics"]))
+    check("headline rate counts missing as failure",
+          h["metrics"]["success_rate"] == 0.0, json.dumps(h["metrics"]))
     check("invalid lines counted", h["metrics"]["invalid_lines"] == 1,
           json.dumps(h["metrics"]))
     check("unknown ids reported + ignored",
           h["metrics"]["unknown_task_ids_ignored"] == ["ghost"],
           json.dumps(h["metrics"]))
+
+    # 9. dual rates: scored-only never inflates the headline
+    i = run_eval(
+        {"benchmark": "t", "tasks": REG["tasks"] + [
+            {"task_id": "t3", "split": "test", "goal": "x",
+             "expect": {"success": True, "bbox": BOX}}]},
+        [{"task_id": "t1", "step_id": "s0", "bbox": BOX,
+          "success": True, "verified": True, "step": 0}])
+    check("scored rate 1.0 with missing present",
+          i["metrics"]["scored_success_rate"] == 1.0, json.dumps(i["metrics"]))
+    check("headline rate diluted by missing",
+          abs(i["metrics"]["success_rate"] - 1 / 3) < 1e-9, json.dumps(i["metrics"]))
+
+    # 10. union: one task, indeterminate + unverified, counts once
+    j = run_eval(
+        {"benchmark": "t", "tasks": [REG["tasks"][0]]},
+        [{"task_id": "t1", "step_id": "s0", "bbox": BOX, "success": True, "step": 0},
+         {"task_id": "t1", "step_id": "s1", "bbox": BOX, "success": True, "step": 1}])
+    check("inconclusive union counts the task once",
+          j["metrics"]["inconclusive"] == 1, json.dumps(j["metrics"]))
+    check("unverified + indeterminate both visible",
+          j["metrics"]["unverified_successes"] == 1 and j["metrics"]["indeterminate_grounding"] == 1,
+          json.dumps(j["metrics"]))
+
+    # 11. no bbox expectation -> grounded null (not True)
+    k = run_eval(
+        {"benchmark": "t", "tasks": [
+            {"task_id": "t1", "split": "test", "goal": "x", "expect": {"success": True}}]},
+        [{"task_id": "t1", "step_id": "s0", "success": True, "verified": True, "step": 0}])
+    check("no-bbox grounded is null",
+          k["per_task"][0]["grounded"] is None, json.dumps(k["per_task"]))
+    check("no-bbox excluded from grounding denominator",
+          k["metrics"]["grounding_total"] == 0, json.dumps(k["metrics"]))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
