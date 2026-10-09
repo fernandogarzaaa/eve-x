@@ -2127,7 +2127,7 @@ const PersistedEntrySchema = z.object({
 });
 const PersistedFileSchema = z.object({
   version: z.literal(1),
-  entries: z.record(PersistedEntrySchema),
+  entries: z.record(z.string(), PersistedEntrySchema),
 });
 type PersistedEntry = z.infer<typeof PersistedEntrySchema>;
 
