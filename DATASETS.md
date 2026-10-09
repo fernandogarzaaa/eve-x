@@ -16,9 +16,12 @@ and counted — never silently fixed.
 
 ## Stages
 
-1. **Dedup.** Each step is fingerprinted on normalized goal + core action
-   fields (`type`, `text`, `to`/`from`, `keys`, `delta`); repeats are dropped
-   and counted.
+1. **Dedup.** Each step is fingerprinted on the NORMALIZED goal +
+   action core (`type`, normalized text, `to`/`from`, `keys`, `delta`,
+   target region/label) BOUND TO THE VISUAL STATE (frame ids, plus content
+   hash when recorded). Goal+action-only dedupe is forbidden: two examples
+   with materially different screens never merge, while near-identical
+   phrasing over the same frame does. Repeats are dropped and counted.
 2. **Sanitize.** `redact_obj` walks every string and key: API keys, GitHub /
    Slack tokens, bearer credentials, password/secret assignments, AWS key
    assignments, and home-directory user names become `[REDACTED…]` markers.
@@ -28,12 +31,22 @@ and counted — never silently fixed.
 3. **Quality filter.** Drops rows with empty goals, missing sessions, missing
    actions, or unverified grounding without a human override — each with its
    own counter. Short goals (< `--min-goal-chars`) are dropped separately.
-4. **Provenance-preserving split.** Rows group by `task_id`; whole tasks are
+4. **Label provenance.** Every kept row carries `_label`: the supervision
+   source (`demonstration-action`), validation status (verified |
+   human-judged | unvalidated), frame binding, grounding state, task /
+   session / environment / model identity.
+5. **Provenance-preserving split.** Rows group by `task_id`; whole tasks are
    shuffled (seeded) into splits so no task straddles two files. Held-out
    tasks are quarantined: promotion gates consume them and training must
    never read them (`tests/benchmark-split.test.ts`).
-5. **Digest.** `digest.json` records per-split row/task counts, per-file
-   sha256, seed, input path, and the full filter/redaction statistics.
+6. **Digest.** `digest.json` records per-split row/task counts, per-file
+   sha256, the overall `dataset_digest`, seed, input path, and the full
+   filter/redaction statistics.
+
+Known constraint: frame-id binding prevents merging distinct observation
+points, but pixel-level near-duplicate detection needs content hashes —
+recorded in `_label.frame_digest` only when the trace carries frame
+digests (a future trace field, not claimed today).
 
 ## Output layout
 

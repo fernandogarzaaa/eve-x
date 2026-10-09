@@ -1,5 +1,106 @@
 # Changelog
 
+## EVE-X 1.1.1 — release-integrity hardening (no architecture changes)
+
+Targeted finalization of the 1.1.0 hardening branch. No product behavior
+changes except where integrity requires refusal:
+
+- Release path logic: generatable-file matching is exact repo-relative
+  equality (`scripts/release-paths.mjs`), never suffix matching — a nested
+  `attacker/release-manifest.json` is foreign, not generatable (P1 fix).
+- Base-image digests are measured into `images/base-digests.json` via live
+  registry resolution (method/host/timestamp recorded); the manifest copies
+  that record with provenance instead of asserting hardcoded constants.
+  This pass caught one real rot: the `python:3.11-slim` tag moved since the
+  old constant was copied (Dockerfile digest pins remain frozen snapshots).
+- Release images must be bound records (`digest` + `builtFromCommit` +
+  `builtFromTree` equal to the release commit/tree); bare digests copied
+  from another release are refused by `verify-release`.
+- Attack suite grows 26 → 32 cases: nested-basename collisions (untracked
+  and smuggled into the metadata commit), cross-release digest reuse
+  (bare and foreign-bound), and unit coverage of the exact-path rule.
+- Case #22 git operations are hermetic (explicit identity via the shared
+  helper) so CI passes without a configured committer.
+- Trace chain: `TraceStore.fromJsonl` verifies chained digests on load
+  (new `appendVerified`) instead of silently re-stamping; `TimelinePlayer`
+  reports `SESSION_SPLIT` before digest mismatch on merged logs;
+  `verifyReplay` takes an expected count so truncation is flagged.
+- Guest jail: NFKC normalization (fullwidth-dot smuggling refused),
+  hardlink-to-outside refusal, swap-symlink containment, no-shell exec
+  proof, wrapper-script identity refusal.
+- Source identity reconciled to 1.1.1 across package, CLI, MCP server,
+  OpenAPI, compose tags, manifest, and provenance.
+
+## EVE-X 1.1.0 — evidence-integrity rebuild (BREAKING where honesty requires it)
+
+Verification over agent self-report, enforced in code and CI:
+
+- Worker: the synthetic PRNG observe/plan/act loop is deleted. The
+  production worker is a control-plane orchestrator (lease -> fresh real
+  percept -> inference suggest -> server-side act with grounding/safety/
+  stale enforcement -> evidence steps written by the plane). It never
+  writes `verified`/`passed`/synthetic perception; synthetic backends are
+  refused structurally (`SYNTHETIC_BACKEND_REFUSED`) and on the wire.
+- Task validation: `POST /v1/tasks/:id/validate` no longer sets pass on
+  request. An `EvidenceBundle` (session + cited steps + oracle assertions +
+  judgments) is required; verdicts are PASS / FAILED / INCONCLUSIVE /
+  INVALID_EVIDENCE with the exact causing evidence named. Tampered,
+  unknown, or unchained evidence is INVALID_EVIDENCE; uncertainty is never
+  collapsed into success. (Breaking: empty bodies now 400.)
+- Benchmarks: the seeded inline agent is deleted. `POST /v1/benchmarks`
+  executes each task against a real session/VM via the RealAgentAdapter and
+  scores server-written trajectories with the IndependentEvaluator
+  (decision-point grounding, temporal recovery, signal + verification
+  success rule). Mock agents require `agent: mock-test-only` +
+  `testOnly: true` and stamp records synthetic/test_only, which production
+  consumers refuse. Records carry verdict counts, Wilson 95% CIs, agent +
+  model + environment identity, and evidence digests.
+- Inference ModelRuntime: weights are verified (existence, size, sha256,
+  container format, manifest agreement, torch load + parameter census)
+  before `ready=true`; every result carries model_id/version/sha256,
+  architecture, device, action_source, degraded, weights_verified,
+  latency, frame_id. Served actions come from the explicit `heuristic-v1`
+  policy (always degraded=true) until a model-forward path exists;
+  unready planes answer 503, never heuristic-as-model. Bearer auth on
+  `/infer` + `/model-info` when configured; internal-only topology.
+- Trace chain: SHA-256 append-only digests stamped by the control plane on
+  every step (the `sha1hex` toy hash is deleted); replay and the timeline
+  player verify full-content chains; the trace merge preserves file order
+  (reorder tampering stays detectable). Unknown sessions fail closed on
+  trace/replay/report reads.
+- Guest security: canonical fs jail (lexical gate + symlink-refusing walk
+  + O_NOFOLLOW open + post-open containment re-check), canonical
+  executable identity (allowlist + trusted dirs + realpath, no PATH or
+  basename trust), and an unprivileged agent account (`sudo: false` in all
+  seeds; maintenance via the root QGA channel).
+- Fail-closed modes (`EVEX_MODE` development/test/production): no dev-anon
+  auth outside development; `startApi` refuses production boot unless the
+  posture evaluates production-safe; production VM images must be
+  digest-pinned (`EVEX_BASE_IMAGE_SHA256`, `requirePinnedDockerImage`);
+  secrets are required, never defaulted (`change-me`/`evex` defaults
+  removed; `eve-x init` mints a random token).
+- Full SHA-256 base-image pins (size+mtime fast path, re-hash on change,
+  boot refusal on drift, multi-region tamper tests); containers pinned by
+  digest; release scripts rebuilt (no commit override, dirty fails closed,
+  measured manifest, `verify-release` consistency gate, `nul` bug fixed).
+- MCP: SDK 1.31 line pinned (registry latest is 1.32.x which requires zod
+  v4 — no v2 line exists upstream; migration tracked separately);
+  protocol versions negotiated honestly with tests; HTTP auth gating,
+  per-caller rate limit, session isolation tests.
+- Skills: `SKILL.md` frontmatter (name/description) + `skill.json`
+  required and validated (name==directory, tools documented, install +
+  verify round-trip); the canonical skill teaches the full honest loop.
+- Evaluation: eval-v2 scoring (decision-point grounding, verified success,
+  temporal recovery, inconclusive/invalid accounting); datasets bind
+  fingerprints to visual state with label provenance and split digests.
+- Recovery: restart demotes unproven RUNNING to PAUSED (explicit resume);
+  WS streams carry HTTP-equivalent auth + ownership + flood caps;
+  `/metrics` exposes failure/behavior counters.
+- CI enforces honesty statically (`honesty-gates`: no synthetic worker,
+  no hardcoded pass, no model masquerade, no basename authz, no mock
+  benchmarks, no toy digests, no mutable tags, no weak defaults, no
+  secret logging)   plus the ML self-tests (65 checks on real Python).
+
 ## EVE-X 1.0.3
 
 - Advisory inference loop: `POST /v1/computer/:id/suggest` proposes an

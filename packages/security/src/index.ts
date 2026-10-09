@@ -240,6 +240,20 @@ function tenantOf(): string {
   return process.env["EVEX_TENANT"] ?? "default";
 }
 
+// ── Explicit execution modes ─────────────────────────────────────────────
+// development (default): local ergonomics, dev-anon fallback allowed.
+// test: hermetic suites; no dev-anon fallback (tests mint tokens).
+// production: fail closed — no dev-anon fallback, weak/missing secrets
+// refuse startup (see evaluateProduction + the API boot gate).
+export type ExecutionMode = "development" | "test" | "production";
+
+export function executionMode(): ExecutionMode {
+  const raw = (process.env["EVEX_MODE"] ?? "").trim().toLowerCase();
+  if (raw === "production" || raw === "prod") return "production";
+  if (raw === "test" || raw === "testing" || raw === "ci") return "test";
+  return "development";
+}
+
 export function verifyToken(raw: string): AuthContext | null {
   const token = (raw ?? "").trim().replace(/^Bearer\s+/i, "");
   if (!token) return null;
@@ -277,6 +291,10 @@ export function extractBearer(headers: Record<string, string | string[] | undefi
 export function authFromHeaders(headers: Record<string, string | string[] | undefined>): AuthContext | null {
   const raw = extractBearer(headers);
   if (!raw) {
+    // Fail closed outside development: with no presented token there is no
+    // authenticated context. The development fallback exists ONLY so local
+    // dev works with zero config; test/production must mint tokens.
+    if (executionMode() !== "development") return null;
     // Dev mode: no token configured and none presented → read-only system context is NOT granted.
     // If EVEX_AUTH_TOKEN is unset, allow a scoped operator context so local dev works.
     if (!masterToken()) {
@@ -392,15 +410,28 @@ export interface ProductionInput {
   vmBackend?: string;
   publicUrl?: string;
   objectEndpoint?: string;
+  /** Execution mode under evaluation. Only "production" applies the
+   *  fail-closed rules below; development/test keep advisory warns so
+   *  existing unit expectations and local ergonomics are unchanged. */
+  mode?: ExecutionMode;
+  /** Explicit operator acknowledgment of file-primary durability
+   *  (DATA_DIR on durable storage with backups). The filesystem IS the
+   *  designed system of record — this flag records that the operator
+   *  knows postgres/redis add no durability here, instead of letting an
+   *  empty requireServices silently imply a service-backed deployment. */
+  filePrimaryAck?: boolean;
 }
 
 const WEAK_TOKENS = new Set(["", "change-me", "changeme", "test", "dev", "password", "evex", "secret"]);
+// Unreplaced template tokens (e.g. from a copied .env.example) must fail:
+// a long template-looking value is not a credential.
+const TEMPLATE_TOKEN_RE = /replace[_-]?me|change[_-]?me|example|template|xxxx/i;
 
 export function evaluateProduction(input: ProductionInput): { verdict: "production-safe" | "development-only"; findings: ProductionFinding[] } {
   const findings: ProductionFinding[] = [];
   const t = (input.authToken ?? "").trim();
-  if (!t || WEAK_TOKENS.has(t.toLowerCase())) {
-    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset or a well-known value (dev auth)" });
+  if (!t || WEAK_TOKENS.has(t.toLowerCase()) || TEMPLATE_TOKEN_RE.test(t)) {
+    findings.push({ name: "auth", status: "fail", detail: "EVEX_AUTH_TOKEN unset, a well-known value, or an unreplaced template token (dev auth)" });
   } else if (t.length < 32) {
     findings.push({ name: "auth", status: "fail", detail: `EVEX_AUTH_TOKEN too short (${t.length} chars; require >= 32)` });
   } else {
@@ -417,7 +448,11 @@ export function evaluateProduction(input: ProductionInput): { verdict: "producti
     findings.push({ name: "cors", status: "pass", detail: `allowlist: ${origins.join(",")}` });
   }
   if (input.requireServices.length === 0) {
-    findings.push({ name: "services", status: "warn", detail: "EVEX_REQUIRE_SERVICES unset: silent file fallback possible (development-only posture)" });
+    if (input.mode === "production" && input.filePrimaryAck !== true) {
+      findings.push({ name: "services", status: "fail", detail: "EVEX_REQUIRE_SERVICES unset in production without EVEX_FILE_PRIMARY_ACK=1: declare required services, or explicitly acknowledge file-primary durability (DATA_DIR on durable storage with backups)" });
+    } else {
+      findings.push({ name: "services", status: "warn", detail: "EVEX_REQUIRE_SERVICES unset: silent file fallback possible (development-only posture)" });
+    }
   }
   for (const svc of input.requireServices) {
     const st = input.serviceStatus[svc];
@@ -437,8 +472,14 @@ export function evaluateProduction(input: ProductionInput): { verdict: "producti
     findings.push({ name: "quotas", status: "pass", detail: `max sessions ${input.maxSessions}` });
   }
   const backend = (input.vmBackend ?? "auto").toLowerCase();
-  if (backend.startsWith("dev")) {
-    findings.push({ name: "vm-backend", status: "warn", detail: `VM_BACKEND=${backend} is development-only (no isolation)` });
+  if (backend === "auto" && input.mode === "production") {
+    findings.push({ name: "vm-backend", status: "fail", detail: "VM_BACKEND=auto in production: pin qemu or docker explicitly (auto may silently select the synthetic dev backend)" });
+  } else if (backend.startsWith("dev")) {
+    if (input.mode === "production") {
+      findings.push({ name: "vm-backend", status: "fail", detail: `VM_BACKEND=${backend} in production: no isolation, synthetic evidence` });
+    } else {
+      findings.push({ name: "vm-backend", status: "warn", detail: `VM_BACKEND=${backend} is development-only (no isolation)` });
+    }
   } else {
     findings.push({ name: "vm-backend", status: "pass", detail: `VM_BACKEND=${backend}` });
   }

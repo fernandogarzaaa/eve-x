@@ -1,4 +1,4 @@
-# EVE-X release deployment: prebuilt :1.0.1 images, no source builds.
+# EVE-X release deployment: prebuilt :1.1.1 images, no source builds.
 # Virgin-host rehearsal:
 #   EVEX_AUTH_TOKEN=<strong> POSTGRES_PASSWORD=<strong> GARAGE_RPC_SECRET=<64hex> GARAGE_ADMIN_TOKEN=<64hex> \
 #   docker compose -f infra/deployment/docker-compose.yml -f infra/deployment/docker-compose.release.yml -p evex-virgin up -d
@@ -9,19 +9,19 @@ name: eve-x
 services:
   inference:
     build: !reset null
-    image: evex-inference:${EVEX_IMAGE_TAG:-1.0.1}
+    image: evex-inference:${EVEX_IMAGE_TAG:-1.1.1}
   api:
     build: !reset null
-    image: evex-api:${EVEX_IMAGE_TAG:-1.0.1}
+    image: evex-api:${EVEX_IMAGE_TAG:-1.1.1}
   worker:
     build: !reset null
-    image: evex-worker:${EVEX_IMAGE_TAG:-1.0.1}
+    image: evex-worker:${EVEX_IMAGE_TAG:-1.1.1}
   mcp:
     build: !reset null
-    image: evex-mcp:${EVEX_IMAGE_TAG:-1.0.1}
+    image: evex-mcp:${EVEX_IMAGE_TAG:-1.1.1}
   console:
     build: !reset null
-    image: evex-console:${EVEX_IMAGE_TAG:-1.0.1}
+    image: evex-console:${EVEX_IMAGE_TAG:-1.1.1}
 
 volumes:
   garagedata-meta:

@@ -15,12 +15,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
 import random
 import re
 import sys
+
+from fingerprints import fingerprint_png, hamming
 
 SECRET_PATTERNS = [
     (re.compile(r"sk-[A-Za-z0-9_-]{8,}"), "[REDACTED_API_KEY]"),
@@ -71,17 +75,85 @@ def redact_obj(obj: object) -> tuple[object, int]:
     return obj, 0
 
 
+def norm_text(s: object) -> str:
+    import string as _string
+    t = str(s or "").lower()
+    t = t.translate(str.maketrans({c: " " for c in _string.punctuation}))
+    return " ".join(t.split())
+
+
+def visual_identity(step: dict) -> dict:
+    """Visual identity of the observed screen, when pixel data is present.
+
+    Returns {_visual: {visual_sha256, visual_phash, ...}} or
+    {_visual: {unfingerprinted: reason}}. Steps without pixel bytes keep
+    frame-id binding only (documented constraint, not silent skippage).
+    """
+    for key in ("png_base64", "screenshot_base64", "image_base64"):
+        raw = step.get(key)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                data = base64.b64decode(raw, validate=True)
+            except (binascii.Error, ValueError):
+                return {"_visual": {"unfingerprinted": f"invalid base64 in {key}"}}
+            try:
+                info = fingerprint_png(data)
+            except ValueError as e:
+                return {"_visual": {"unfingerprinted": f"undecodable image: {e}"}}
+            return {"_visual": info}
+    return {"_visual": {"unfingerprinted": "no pixel data (frame-id binding only)"}}
+
+
 def fingerprint(step: dict) -> str:
+    """Identity of a training example. Binds the NORMALIZED goal + action
+    core to the VISUAL STATE (frame ids + step digest when present): two
+    examples with materially different screens never dedupe together, while
+    near-identical phrasing over the same frame does. Pure goal+action
+    dedupe is forbidden (it merges distinct visual states)."""
     goal = str(step.get("goal", ""))
     sel = step.get("selected_action") or step.get("actual_action") or {}
     if isinstance(sel, dict):
-        core = {"t": sel.get("type"), "x": sel.get("text"),
+        tgt = sel.get("target") if isinstance(sel.get("target"), dict) else {}
+        core = {"t": sel.get("type"), "x": norm_text(sel.get("text")),
                 "to": sel.get("to"), "from": sel.get("from"),
-                "keys": sel.get("keys"), "delta": sel.get("delta")}
+                "keys": sel.get("keys"), "delta": sel.get("delta"),
+                "region": tgt.get("regionId"), "label": norm_text(tgt.get("label"))}
     else:
         core = {"t": str(sel)}
-    norm = json.dumps({"g": goal.strip().lower(), "a": core}, sort_keys=True)
+    visual = {"before": step.get("screen_before"), "after": step.get("screen_after"),
+              "png": step.get("png_sha256") or step.get("png_sha")}
+    vis = step.get("_visual") if isinstance(step.get("_visual"), dict) else {}
+    if isinstance(vis.get("visual_sha256"), str):
+        # Pixel identity dominates: identical screenshots dedupe even across
+        # different frame IDs. Frame IDs are observation-point labels, not
+        # content — without this, the same screen re-observed never dedupes.
+        visual = {"pixels": vis["visual_sha256"]}
+    norm = json.dumps({"g": norm_text(goal), "a": core, "v": visual}, sort_keys=True)
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def label_block(step: dict) -> dict:
+    """Provenance of the training label: what the supervision is, where it
+    came from, and whether independent verification backs it."""
+    ver = step.get("verification")
+    verified = ver.get("passed") is True if isinstance(ver, dict) else None
+    g = step.get("grounding")
+    grounded = g.get("verified") is True if isinstance(g, dict) else None
+    judgments = step.get("human_judgment") or step.get("human_intervention")
+    return {
+        "source": "demonstration-action",
+        "validation_status": ("verified" if verified else
+                              "human-judged" if judgments else
+                              "unvalidated"),
+        "frame_before": step.get("screen_before"),
+        "frame_after": step.get("screen_after"),
+        "frame_digest": step.get("digest"),
+        "grounding_verified": grounded,
+        "task_id": step.get("task_id"),
+        "session_id": step.get("session_id"),
+        "environment": step.get("environment_version"),
+        "model": step.get("model_version"),
+    }
 
 
 def iter_steps(path: str):
@@ -128,6 +200,8 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--heldout", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--min-goal-chars", type=int, default=4)
+    ap.add_argument("--allow-visual-leak", action="store_true",
+                    help="Record visual-leakage violations without failing (explicit, noted in manifest; default refuses)")
     args = ap.parse_args(argv)
 
     if not (0 <= args.val < 1 and 0 <= args.test < 1 and 0 <= args.heldout < 1
@@ -145,6 +219,11 @@ def main(argv: list | None = None) -> int:
         if len(str(step.get("goal", ""))) < args.min_goal_chars:
             stats["short_goal_dropped"] += 1
             continue
+        vis = visual_identity(step)
+        if isinstance(vis.get("_visual"), dict) and "visual_sha256" in vis["_visual"]:
+            step["_visual"] = vis["_visual"]
+        elif "_visual" not in step:
+            step["_visual"] = vis["_visual"]
         fp = fingerprint(step)
         if fp in seen:
             stats["dedup_dropped"] += 1
@@ -159,6 +238,7 @@ def main(argv: list | None = None) -> int:
         assert isinstance(clean, dict)
         clean["_fingerprint"] = fp
         clean["_redactions"] = n
+        clean["_label"] = label_block(step)
         kept.append(clean)
 
     # Provenance-preserving split: group by task_id so one task never lands in
@@ -203,6 +283,55 @@ def main(argv: list | None = None) -> int:
         manifest["splits"][name] = {"rows": len(rows_sorted),
                                     "tasks": len({str(r.get('task_id')) for r in rows_sorted}),
                                     "sha256": h.hexdigest(), "file": f"{name}.jsonl"}
+    # Visual leakage defense: pixel-identical screens must never straddle
+    # train/val/test/held-out, even with different frame IDs. Exact digest
+    # matches FAIL the build (correctness property); near-duplicate phash
+    # pairs (distance <= 10) are reported for review, never sole identity.
+    train_shas: dict[str, str] = {}
+    for r in splits["train"]:
+        v = r.get("_visual") if isinstance(r.get("_visual"), dict) else {}
+        if isinstance(v.get("visual_sha256"), str):
+            train_shas[v["visual_sha256"]] = str(r.get("task_id"))
+    visual_leakage = []
+    for name in ("val", "test", "held-out"):
+        for r in splits[name]:
+            v = r.get("_visual") if isinstance(r.get("_visual"), dict) else {}
+            sha = v.get("visual_sha256")
+            if isinstance(sha, str) and sha in train_shas:
+                visual_leakage.append({"split": name, "task_id": str(r.get("task_id")),
+                                       "visual_sha256": sha, "also_in_train_task": train_shas[sha]})
+    manifest["visual_leakage"] = {"violations": visual_leakage,
+                                  "count": len(visual_leakage)}
+    # Near-duplicate review band (informational): closest cross-split phash
+    # pairs. Capped for cost; absence of a pair here is not proof of absence.
+    train_ph: list[tuple[str, int, str]] = []
+    for r in splits["train"][:2000]:
+        v = r.get("_visual") if isinstance(r.get("_visual"), dict) else {}
+        if isinstance(v.get("visual_phash"), str):
+            train_ph.append((str(r.get("task_id")), int(v["visual_phash"], 16), v["visual_phash"]))
+    near_dupes = []
+    for name in ("val", "test", "held-out"):
+        for r in splits[name][:2000]:
+            v = r.get("_visual") if isinstance(r.get("_visual"), dict) else {}
+            if not isinstance(v.get("visual_phash"), str):
+                continue
+            ph = int(v["visual_phash"], 16)
+            best = min(((hamming(ph, tph), ttask) for ttask, tph, _ in train_ph), default=None)
+            if best is not None and best[0] <= 10:
+                near_dupes.append({"split": name, "task_id": str(r.get("task_id")),
+                                   "phash_distance": best[0], "train_task_id": best[1]})
+                if len(near_dupes) >= 50:
+                    break
+        if len(near_dupes) >= 50:
+            break
+    manifest["visual_near_duplicates"] = {"pairs": near_dupes, "count": len(near_dupes),
+                                          "note": "review band only (phash<=10); not sole identity; capped at 50/2000-row scan"}
+    with open(os.path.join(args.out, "digest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    dataset_digest = hashlib.sha256(json.dumps(
+        {k: v["sha256"] for k, v in sorted(manifest["splits"].items())},
+        sort_keys=True).encode("utf-8")).hexdigest()
+    manifest["dataset_digest"] = dataset_digest
     with open(os.path.join(args.out, "digest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"done read={stats['read']} kept={len(kept)} "
@@ -210,7 +339,14 @@ def main(argv: list | None = None) -> int:
           f"val={manifest['splits']['val']['rows']} "
           f"test={manifest['splits']['test']['rows']} "
           f"held-out={manifest['splits']['held-out']['rows']} "
-          f"redactions={stats['redactions']}")
+          f"redactions={stats['redactions']} "
+          f"visual_leaks={manifest['visual_leakage']['count']} "
+          f"near_dupes={manifest['visual_near_duplicates']['count']}")
+    if manifest["visual_leakage"]["count"] > 0 and not args.allow_visual_leak:
+        print(f"ERROR: {manifest['visual_leakage']['count']} pixel-identical screens straddle splits "
+              "(see digest.json visual_leakage); refusing. Re-split or pass --allow-visual-leak explicitly.",
+              file=sys.stderr)
+        return 3
     return 0
 
 

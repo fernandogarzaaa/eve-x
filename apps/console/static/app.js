@@ -7,8 +7,12 @@ let steps = [];
 let curIdx = -1;
 
 function log(msg) {
+  // textContent only: log lines echo server/model-controlled text (action
+  // types, labels, error detail) and must never become live HTML (XSS).
   const t = new Date().toLocaleTimeString();
-  logEl.innerHTML += `<div>[${t}] ${msg}</div>`;
+  const div = document.createElement("div");
+  div.textContent = `[${t}] ${msg}`;
+  logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
 }
 function apiBase() { return $("apiBase").value.replace(/\/$/, ""); }
@@ -69,7 +73,10 @@ function drawOverlays(overlays, W = 1920, H = 1080) {
     d.style.width = `${Math.max(8, (w / W) * stage.width)}px`;
     d.style.height = `${Math.max(8, (h / H) * stage.height)}px`;
     const conf = o.confidence !== undefined ? ` ${(Math.round(o.confidence * 100))}%` : "";
-    d.innerHTML = `<span>${o.label || o.regionId || "target"}${conf}</span>`;
+    // textContent only: labels/regionIds are perception/model-controlled.
+    const span = document.createElement("span");
+    span.textContent = `${o.label || o.regionId || "target"}${conf}`;
+    d.appendChild(span);
     ov.appendChild(d);
   });
 }

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { appendFileSync as fsAppendFileSync, readFileSync as fsReadFileSync, existsSync as fsExistsSync } from "node:fs";
 import { join, basename, resolve } from "node:path";
@@ -90,7 +90,9 @@ export function validateSnapshotLabel(name: string): string {
 
 // V7: docker image names are interpolated into `docker run` argv. Constrain
 // the alphabet so a hostile spec cannot smuggle flags or shell metacharacters.
-const DOCKER_IMAGE_RE = /^[a-z0-9._/:~-]{1,128}$/i;
+// Digest references (name@sha256:<64hex>) are part of the alphabet: production
+// boots nothing else.
+const DOCKER_IMAGE_RE = /^[a-z0-9._/:~@-]{1,256}$/i;
 export function validateDockerImage(image: string): string {
   if (!DOCKER_IMAGE_RE.test(image)) {
     throw new EveError("BAD_IMAGE", `Illegal docker image name: ${image}`);
@@ -127,33 +129,35 @@ export function readAuditFile(workdir: string): VmAuditEntry[] {
 // ── Base-image overlays + guest-secret provisioning ─────────────────────────
 // Base images are read-only golden artifacts. Every VM boots a private
 // copy-on-write overlay; the base file itself is never opened for writing by
-// EVE-X. `backingDigest` fingerprints size + head/tail bytes (fast even for
-// multi-GB images) so boot can detect accidental or hostile base mutation.
+// EVE-X. `backingDigest` is the FULL SHA-256 of the base file (streamed, so
+// it stays constant-memory on multi-GB images). The pin records size+mtime
+// so boot can skip re-hashing an untouched file; ANY stat change triggers a
+// full re-hash, and any digest/size drift refuses boot (fail closed).
+// A middle-of-file mutation that preserves size still changes mtime under
+// normal writes and is therefore re-hashed and detected. (A privileged
+// attacker who can also forge mtime/size defeats stat caching — defense in
+// depth for that tier is dm-verity / read-only media, documented in VM.md.)
 
 export interface BasePin {
   base: string;
   digest: string;
   size: number;
+  mtimeMs: number;
 }
 
-export async function backingDigest(path: string): Promise<{ digest: string; size: number }> {
+export async function backingDigest(path: string): Promise<{ digest: string; size: number; mtimeMs: number }> {
   const fh = await fs.open(path, "r");
   try {
     const st = await fh.stat();
+    if (!st.isFile()) throw new Error(`not a regular file: ${path}`);
     const h = createHash("sha256");
-    h.update(`size:${st.size}\n`);
-    const span = Math.min(65536, st.size);
-    if (span > 0) {
-      const head = Buffer.alloc(span);
-      await fh.read(head, 0, span, 0);
-      h.update(head);
-      if (st.size > span) {
-        const tail = Buffer.alloc(span);
-        await fh.read(tail, 0, span, st.size - span);
-        h.update(tail);
-      }
+    const buf = Buffer.alloc(1 << 20);
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, 0, buf.length, null);
+      if (bytesRead === 0) break;
+      h.update(buf.subarray(0, bytesRead));
     }
-    return { digest: h.digest("hex"), size: st.size };
+    return { digest: h.digest("hex"), size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
   } finally {
     await fh.close();
   }
@@ -195,7 +199,13 @@ export async function readGuestSecret(workdir: string): Promise<string | null> {
 
 /** Default NoCloud user-data: locked guest account, qemu-guest-agent,
  *  openssh, and the per-VM EVE agent secret written for the in-guest
- *  runtime. The secret travels only inside the seed ISO, never in logs. */
+ *  runtime. The secret travels only inside the seed ISO, never in logs.
+ *
+ *  Privilege separation: the agent account (eveagent) has NO sudo — the
+ *  in-guest workload runs unprivileged. Privileged guest maintenance
+ *  (display mode, power, gdm config) runs through the authenticated root
+ *  QGA channel (host-side VmManager.guestExecSync), never through the
+ *  agent account. There is intentionally no NOPASSWD blanket grant. */
 export function defaultSeedUserData(input: { hostname: string; sshKey?: string; guestSecret: string }): string {
   const keyBlock = input.sshKey
     ? `    ssh_authorized_keys:\n      - ${input.sshKey}\n`
@@ -205,7 +215,7 @@ hostname: ${input.hostname}
 manage_etc_hosts: true
 users:
   - name: eveagent
-    sudo: ALL=(ALL) NOPASSWD:ALL
+    sudo: false
     shell: /bin/bash
     lock_passwd: true
 ${keyBlock}packages:
@@ -296,7 +306,9 @@ export class QmpConnection {
    */
   async connectQga(sockPath: string, timeoutMs = 15000): Promise<void> {
     await this.connectRaw(sockPath, timeoutMs);
-    const syncId = Math.floor(Math.random() * 1_000_000_000);
+    // Unpredictable sync id (crypto, not Math.random): the id echoes in the
+    // guest-visible channel, and predictable ids weaken the liveness proof.
+    const syncId = randomInt(1_000_000_000);
     let res: QmpResponse;
     try {
       res = await this.commandRaw("guest-sync", { id: syncId });
@@ -912,6 +924,12 @@ export class QemuDriver implements VmDriver {
       const pin = await backingDigest(base).catch((err) => {
         throw new EveError("BASE_MISSING", `Base image unreadable: ${opts.baseImage}: ${err instanceof Error ? err.message : String(err)}`);
       });
+      // Deploy-time pin: EVEX_BASE_IMAGE_SHA256 names the ONLY base digest
+      // this host boots. A mismatch refuses creation (fail closed).
+      const expectedBase = (process.env["EVEX_BASE_IMAGE_SHA256"] ?? "").trim().toLowerCase();
+      if (expectedBase && pin.digest !== expectedBase) {
+        throw new EveError("BASE_MISMATCH", `Base image ${opts.baseImage} digest ${pin.digest.slice(0, 16)}… does not match EVEX_BASE_IMAGE_SHA256`);
+      }
       await fs.writeFile(join(workdir, "base-pin.json"), JSON.stringify({ base, ...pin }, null, 2), "utf8");
       imgArgs = ["create", "-f", "qcow2", "-F", "qcow2", "-b", base, this.qcow2(cell)];
       cell.note("create", `overlay over ${opts.baseImage} digest=${pin.digest.slice(0, 16)} cpu=${spec.cpu} mem=${spec.memoryMb}Mb`);
@@ -929,18 +947,35 @@ export class QemuDriver implements VmDriver {
     return cell.snapshotRecord();
   }
 
-  /** Re-fingerprint the pinned base; any drift refuses boot (fail closed). */
+  /** Re-verify the pinned base; any drift refuses boot (fail closed).
+   *  Unchanged size+mtime short-circuits (no re-hash); any stat change
+   *  triggers a full SHA-256 re-hash. A verified re-hash refreshes the
+   *  cached mtime so a touched-but-identical file does not re-hash forever. */
   private async verifyBaseImmutable(cell: VmCell): Promise<void> {
     let pin: BasePin;
+    const pinPath = join(cell.record.workdir, "base-pin.json");
     try {
-      pin = JSON.parse(await fs.readFile(join(cell.record.workdir, "base-pin.json"), "utf8")) as BasePin;
+      pin = JSON.parse(await fs.readFile(pinPath, "utf8")) as BasePin;
     } catch {
       return; // no overlay: nothing pinned
     }
+    let st: { size: number; mtimeMs: number };
+    try {
+      const s = await fs.stat(pin.base);
+      st = { size: s.size, mtimeMs: Math.floor(s.mtimeMs) };
+    } catch {
+      throw new EveError("BASE_MUTATED", `Base image ${pin.base} is unreadable since overlay creation; refusing boot`);
+    }
+    if (st.size === pin.size && st.mtimeMs === pin.mtimeMs) return; // untouched
     const cur = await backingDigest(pin.base).catch(() => null);
     if (!cur || cur.digest !== pin.digest || cur.size !== pin.size) {
       throw new EveError("BASE_MUTATED", `Base image ${pin.base} changed since overlay creation; refusing boot`);
     }
+    // Content verified identical: refresh the stat cache (mtime may have
+    // moved through a touch / copy round-trip).
+    try {
+      await fs.writeFile(pinPath, JSON.stringify({ ...pin, mtimeMs: cur.mtimeMs }, null, 2), "utf8");
+    } catch { /* cache refresh is best-effort; verification already passed */ }
   }
 
   async boot(vmId: string): Promise<void> {
@@ -1511,7 +1546,32 @@ export function parseGuestExecStatus(res: Record<string, unknown>): { exited: bo
 
 // ── DockerDesktopDriver (real docker CLI: run/start/stop/commit/cp/exec/logs) ─
 
+// Development default only (dev-only): a mutable :latest tag is NEVER acceptable in
+// production (it can move under a pinned release). Production boot requires
+// a digest-pinned reference (image@sha256:<64hex>), enforced by
+// requirePinnedDockerImage() below; EVEX_DOCKER_IMAGE sets the deployment's
+// pinned desktop image.
 const DEFAULT_DOCKER_IMAGE = "dorowu/ubuntu-desktop-lxde-vnc:latest";
+
+function vmExecutionMode(): "development" | "test" | "production" {
+  const raw = (process.env["EVEX_MODE"] ?? "").trim().toLowerCase();
+  if (raw === "production" || raw === "prod") return "production";
+  if (raw === "test" || raw === "testing" || raw === "ci") return "test";
+  return "development";
+}
+
+/** Production image policy: only immutable digest references boot. */
+export function requirePinnedDockerImage(image: string): string {
+  const valid = validateDockerImage(image);
+  const at = valid.indexOf("@sha256:");
+  if (at === -1 || !/^[0-9a-f]{64}$/i.test(valid.slice(at + "@sha256:".length))) {
+    throw new EveError(
+      "UNPINNED_IMAGE",
+      `Production requires a digest-pinned desktop image (name@sha256:<64hex>); refusing mutable tag: ${image}`,
+    );
+  }
+  return valid;
+}
 
 // V7: hardening + network flags shared by boot and restore so a restored
 // container can never come back less isolated than a fresh boot.
@@ -1556,7 +1616,10 @@ export class DockerDesktopDriver implements VmDriver {
 
   constructor(opts: DockerDriverOpts = {}) {
     this.base = opts.workdirBase ?? join(tmpdir(), "eve-x", "docker");
-    this.defaultImage = opts.defaultImage ?? DEFAULT_DOCKER_IMAGE;
+    // Deployment override first: EVEX_DOCKER_IMAGE names the pinned desktop
+    // image for this host (production requires a digest reference).
+    const envImage = (process.env["EVEX_DOCKER_IMAGE"] ?? "").trim();
+    this.defaultImage = opts.defaultImage ?? (envImage || DEFAULT_DOCKER_IMAGE);
   }
 
   private withCellLock<T>(cell: VmCell, fn: () => Promise<T>): Promise<T> {
@@ -1588,7 +1651,10 @@ export class DockerDesktopDriver implements VmDriver {
   async create(specInput: unknown, owner: string, opts: CreateOpts = {}): Promise<VmRecord> {
     const spec = VmSpec.parse(specInput);
     if (!owner) throw new EveError("BAD_OWNER", "Owner is required");
-    validateDockerImage(this.imageFor(spec));
+    // Production boots only digest-pinned images; dev/test keep the
+    // (explicitly mutable) default.
+    if (vmExecutionMode() === "production") requirePinnedDockerImage(this.imageFor(spec));
+    else validateDockerImage(this.imageFor(spec));
     if (opts.baseImage) {
       // Container backend boots from registry images, not qcow2 bases.
       throw new EveError("UNSUPPORTED", "Docker backend does not use qcow2 base images");
@@ -1608,7 +1674,9 @@ export class DockerDesktopDriver implements VmDriver {
     const cell = cellOrThrow(this.cells, vmId);
     return this.withCellLock(cell, async () => {
       const spec = cell.record.spec;
-      const image = validateDockerImage(this.imageFor(spec));
+      const image = vmExecutionMode() === "production"
+        ? requirePinnedDockerImage(this.imageFor(spec))
+        : validateDockerImage(this.imageFor(spec));
       // V6: FAILED retry re-enters the creation pipeline (via CREATED, since
       // CREATING cannot transition straight to BOOTING).
       if (cell.sm.state === "FAILED") {
@@ -2067,9 +2135,13 @@ export async function selectDriver(opts: QemuDriverOpts & DockerDriverOpts = {})
   const qemu = new QemuDriver(opts);
   const docker = new DockerDesktopDriver(opts);
   const dev = new DevFramebufferDriver();
+  const production = vmExecutionMode() === "production";
   if (env === "qemu") return { driver: qemu, backend: "qemu", note: "VM_BACKEND=qemu (explicit)" };
   if (env === "docker") return { driver: docker, backend: "docker", note: "VM_BACKEND=docker (explicit)" };
   if (env === "dev" || env === "dev-framebuffer" || env === "devfb") {
+    if (production) {
+      throw new EveError("DEV_BACKEND_REFUSED", `VM_BACKEND=${env} is refused in production: no isolation, synthetic evidence`);
+    }
     return { driver: dev, backend: dev.backend, note: `VM_BACKEND=${env} (explicit): ${dev.note}` };
   }
   if (await hasBinary("qemu-system-x86_64")) {
@@ -2080,6 +2152,9 @@ export async function selectDriver(opts: QemuDriverOpts & DockerDriverOpts = {})
       const info = await runCmd("docker", ["info"], 10000);
       if (info.code === 0) return { driver: docker, backend: "docker", note: "auto: docker daemon reachable" };
     } catch { /* fall through */ }
+  }
+  if (production) {
+    throw new EveError("DEV_BACKEND_REFUSED", "auto selection found no hypervisor; dev-framebuffer is refused in production");
   }
   return { driver: dev, backend: dev.backend, note: `auto: no hypervisor found; ${dev.note}` };
 }
@@ -2127,7 +2202,7 @@ const PersistedEntrySchema = z.object({
 });
 const PersistedFileSchema = z.object({
   version: z.literal(1),
-  entries: z.record(PersistedEntrySchema),
+  entries: z.record(z.string(), PersistedEntrySchema),
 });
 type PersistedEntry = z.infer<typeof PersistedEntrySchema>;
 
@@ -2243,6 +2318,12 @@ export class VmManager {
     // (concurrent callers serialize on the event loop between these awaits).
     const spec = VmSpec.parse(specInput);
     this.checkQuotas(owner, spec);
+    // Production egress discipline: unrestricted bridge/NAT egress ("full")
+    // is refused unless the operator explicitly allows it. The proxy-layer
+    // allowlist assumption must not be silently bypassed by a spec flag.
+    if (spec.network === "full" && vmExecutionMode() === "production" && process.env["EVEX_ALLOW_FULL_NETWORK"] !== "1") {
+      throw new EveError("FORBIDDEN_NETWORK", 'network:"full" is refused in production without EVEX_ALLOW_FULL_NETWORK=1');
+    }
     const rec = await this.primary.create(spec, owner, driverOpts);
     this.registry.set(rec.vmId, { owner, backend: this.primary.backend, spec: rec.spec });
     this.leases.set(rec.vmId, { owner, expiresAtMs: Date.now() + ttl, ttlMs: ttl });

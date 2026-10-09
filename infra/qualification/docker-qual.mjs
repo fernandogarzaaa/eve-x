@@ -32,8 +32,11 @@ const sh = (cmd, a = []) => {
 
 const driver = new DockerDesktopDriver();
 // Qualification image with baked screenshot tooling (see
-// Dockerfile.qual-desktop). Full network for this run; the
-// allowlisted→none mapping was proven in a prior run (NetworkMode=none).
+// Dockerfile.qual-desktop). TEST-ONLY tag: evex-qual-desktop:latest is a
+// local qual artifact, never a production image (production boots
+// digest-pinned references; see requirePinnedDockerImage). Full network
+// for this run; the allowlisted→none mapping was proven in a prior run
+// (NetworkMode=none).
 const spec = { image: "evex-qual-desktop:latest", cpu: 2, memoryMb: 2048, diskGb: 8, width: 1280, height: 800, network: "full" };
 const t0 = Date.now();
 const vm = await driver.create(spec, "qual-tenant");

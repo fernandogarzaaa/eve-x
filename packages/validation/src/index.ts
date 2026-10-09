@@ -2,6 +2,211 @@ import { z } from "zod";
 import { EveError, nowIso, uid } from "../../core/src/index.js";
 import { HumanJudgment, type HumanJudgment as HumanJudgmentType } from "../../protocol/src/index.js";
 
+// ── EvidenceValidator / TaskOracle ─────────────────────────────────────────
+// Task validation must never trust agent-emitted verdicts. A verdict is
+// derived ONLY from server-resolved evidence:
+//
+// * the session trace (sequence + SHA-256 chain must verify — tampered,
+//   reordered, gapped, or duplicated evidence is INVALID_EVIDENCE);
+// * caller-nominated step ids, resolved server-side (unknown ids are
+//   INVALID_EVIDENCE, never ignored);
+// * oracle assertions evaluated deterministically against the cited steps
+//   (failures → FAILED; note that verification-passed attests EXECUTION
+//   only and can never confirm a verdict by itself);
+// * supporting human judgments (reasonable + targetCorrect) on cited steps,
+//   or server-verified grounding of the acted point.
+//
+// PASS additionally requires independent confirmation: either a supporting
+// human judgment, or a server-verified grounding assertion (the acted point
+// demonstrably inside a region of the exact observed frame). Execution
+// verification and agent-written outcome strings alone can only ever yield
+// INCONCLUSIVE — uncertainty is never collapsed into success. Every result
+// names the exact evidence that caused it.
+
+export const ValidationVerdictSchema = z.enum(["PASS", "FAILED", "INCONCLUSIVE", "INVALID_EVIDENCE"]);
+export type ValidationVerdict = z.infer<typeof ValidationVerdictSchema>;
+
+export const OracleAssertionSchema = z.object({
+  kind: z.enum(["signal-present", "outcome-is", "grounding-verified", "verification-passed"]),
+  signal: z.string().min(1).max(256).optional(),
+  outcome: z.string().min(1).max(64).optional(),
+});
+export type OracleAssertion = z.infer<typeof OracleAssertionSchema>;
+
+export const EvidenceBundleSchema = z.object({
+  sessionId: z.string().min(1).max(128),
+  stepIds: z.array(z.string().min(1).max(128)).min(1).max(200),
+  assertions: z.array(OracleAssertionSchema).max(50).default([]),
+  judgmentIds: z.array(z.string().min(1).max(128)).max(50).default([]),
+});
+export type EvidenceBundle = z.infer<typeof EvidenceBundleSchema>;
+
+export interface ResolvedStep {
+  step_id: string;
+  seq: number;
+  outcome?: string;
+  grounding?: { verified?: boolean };
+  verification?: { passed?: boolean };
+  raw: Record<string, unknown>;
+}
+
+export interface SupportingJudgment {
+  id: string;
+  stepId: string;
+  reviewer: string;
+  reasonable: boolean;
+  targetCorrect: boolean;
+}
+
+export interface ReplaySummary {
+  verdict: string;
+  issues: string[];
+  chained: boolean;
+}
+
+export const AssertionResultSchema = z.object({
+  kind: OracleAssertionSchema.shape.kind,
+  pass: z.boolean(),
+  stepId: z.string().optional(),
+  detail: z.string().max(512),
+});
+export type AssertionResult = z.infer<typeof AssertionResultSchema>;
+
+export const ValidationResultSchema = z.object({
+  verdict: ValidationVerdictSchema,
+  taskId: z.string(),
+  sessionId: z.string(),
+  stepIds: z.array(z.string()),
+  assertionResults: z.array(AssertionResultSchema),
+  judgmentIds: z.array(z.string()),
+  causedBy: z.array(z.string().max(512)),
+  checkedAt: z.string(),
+});
+export type ValidationResult = z.infer<typeof ValidationResultSchema>;
+
+function stepText(s: ResolvedStep): string {
+  return JSON.stringify(s.raw);
+}
+
+function evalAssertion(a: OracleAssertion, steps: ResolvedStep[]): AssertionResult {
+  if (a.kind === "signal-present") {
+    const sig = a.signal ?? "";
+    const hit = steps.find((s) => stepText(s).includes(sig));
+    if (hit) return { kind: a.kind, pass: true, stepId: hit.step_id, detail: `signal ${JSON.stringify(sig)} present in step ${hit.step_id}` };
+    return { kind: a.kind, pass: false, detail: `signal ${JSON.stringify(sig)} absent from all ${steps.length} cited steps` };
+  }
+  if (a.kind === "outcome-is") {
+    const want = a.outcome ?? "";
+    const hit = steps.find((s) => s.outcome === want);
+    if (hit) return { kind: a.kind, pass: true, stepId: hit.step_id, detail: `step ${hit.step_id} outcome is ${JSON.stringify(want)}` };
+    return { kind: a.kind, pass: false, detail: `no cited step has outcome ${JSON.stringify(want)}` };
+  }
+  if (a.kind === "grounding-verified") {
+    const hit = steps.find((s) => s.grounding?.verified === true);
+    if (hit) return { kind: a.kind, pass: true, stepId: hit.step_id, detail: `step ${hit.step_id} carries server-verified grounding` };
+    return { kind: a.kind, pass: false, detail: "no cited step carries server-verified grounding" };
+  }
+  const hit = steps.find((s) => s.verification?.passed === true);
+  if (hit) return { kind: a.kind, pass: true, stepId: hit.step_id, detail: `step ${hit.step_id} carries server-passed verification` };
+  return { kind: a.kind, pass: false, detail: "no cited step carries server-passed verification" };
+}
+
+/** Pure deterministic validator: same inputs → same verdict, always. */
+export function validateEvidence(input: {
+  taskId: unknown;
+  evidence: EvidenceBundle;
+  /** Cited steps, resolved server-side from the session trace. */
+  resolvedSteps: ResolvedStep[];
+  /** Replay verdict over the FULL session trace (chain + sequence). */
+  replay: ReplaySummary;
+  /** Judgments resolved server-side by id. */
+  judgments: SupportingJudgment[];
+  traceChained: boolean;
+}): ValidationResult {
+  const taskId = z.string().min(1).parse(input.taskId);
+  const ev = EvidenceBundleSchema.parse(input.evidence);
+  const checkedAt = nowIso();
+  const causedBy: string[] = [];
+  const fail = (reasons: string[]): ValidationResult => ValidationResultSchema.parse({
+    verdict: "INVALID_EVIDENCE" as const, taskId, sessionId: ev.sessionId,
+    stepIds: ev.stepIds, assertionResults: [], judgmentIds: [], causedBy: reasons, checkedAt,
+  });
+
+  // 1. Trace integrity first: tamper evidence poisons everything downstream.
+  if (input.replay.verdict !== "deterministic-replay-ok") {
+    return fail([
+      `trace replay is ${input.replay.verdict}`,
+      ...input.replay.issues.slice(0, 5).map((i) => `replay: ${i}`),
+    ]);
+  }
+  if (!input.traceChained) {
+    return fail(["trace carries no SHA-256 evidence chain — tampering is undetectable, refusing verdict"]);
+  }
+  // 2. Every cited step must resolve. Unknown ids are evidence failure.
+  const byId = new Map(input.resolvedSteps.map((s) => [s.step_id, s]));
+  const missing = ev.stepIds.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    return fail([`cited steps not found in session trace: ${missing.slice(0, 10).join(", ")}`]);
+  }
+  const cited = ev.stepIds.map((id) => byId.get(id) as ResolvedStep);
+  // 3. Judgments must resolve to cited steps.
+  const jById = new Map(input.judgments.map((j) => [j.id, j]));
+  const unknownJ = ev.judgmentIds.filter((id) => !jById.has(id));
+  if (unknownJ.length > 0) {
+    return fail([`cited judgments not found: ${unknownJ.slice(0, 10).join(", ")}`]);
+  }
+  const citedJudgments = ev.judgmentIds.map((id) => jById.get(id) as SupportingJudgment);
+  const stray = citedJudgments.filter((j) => !byId.has(j.stepId));
+  if (stray.length > 0) {
+    return fail([`judgments cite steps outside the evidence set: ${stray.map((j) => j.id).join(", ")}`]);
+  }
+  // 4. Deterministic oracle assertions.
+  const assertionResults = ev.assertions.map((a) => evalAssertion(a, cited));
+  const failed = assertionResults.filter((r) => !r.pass);
+  if (failed.length > 0) {
+    return ValidationResultSchema.parse({
+      verdict: "FAILED" as const, taskId, sessionId: ev.sessionId,
+      stepIds: ev.stepIds, assertionResults,
+      judgmentIds: ev.judgmentIds,
+      causedBy: failed.map((f) => `assertion failed: ${f.detail}`),
+      checkedAt,
+    });
+  }
+  // 5. No failures — but PASS needs independent confirmation tied to the
+  // GOAL, not to execution. verification-passed attests only that an
+  // actuation ran and a post-frame was captured (stamped on every act,
+  // including wait/observe) — it is deliberately NOT confirmation, or any
+  // acted step would launder itself into a verdict. Likewise
+  // signal-present/outcome-is match agent-written text. Confirmation is:
+  // a supporting human judgment, or server-verified grounding (the acted
+  // point demonstrably inside a region of the exact observed frame).
+  const supporting = citedJudgments.filter((j) => j.reasonable && j.targetCorrect);
+  const independent = assertionResults.filter(
+    (r) => r.pass && r.kind === "grounding-verified",
+  );
+  if (supporting.length > 0 || independent.length > 0) {
+    const causes = [
+      ...supporting.map((j) => `human judgment ${j.id} by ${j.reviewer} supports step ${j.stepId}`),
+      ...independent.map((r) => `independent evidence: ${r.detail}`),
+      ...assertionResults.filter((r) => r.pass).map((r) => `oracle: ${r.detail}`),
+    ];
+    if (causes.length === 0) causes.push("evidence present with no failing assertions and independent confirmation");
+    return ValidationResultSchema.parse({
+      verdict: "PASS" as const, taskId, sessionId: ev.sessionId,
+      stepIds: ev.stepIds, assertionResults,
+      judgmentIds: supporting.map((j) => j.id),
+      causedBy: causes, checkedAt,
+    });
+  }
+  return ValidationResultSchema.parse({
+    verdict: "INCONCLUSIVE" as const, taskId, sessionId: ev.sessionId,
+    stepIds: ev.stepIds, assertionResults,
+    judgmentIds: [],
+    causedBy: ["no failing assertions, but no independent confirmation (supporting human judgment or server-verified grounding) — refusing to infer success"],
+    checkedAt,
+  });
+}
+
 // ── Blind-review queue: reviewers see claims WITHOUT confidence/rationale
 // until their judgment is submitted. Plus agreement stats + ledger. ──
 

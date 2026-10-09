@@ -2,26 +2,33 @@
 
 ## Loop
 
-Each step the worker runs: **observe → propose → ground → gate → act → record**.
+The production worker ORCHESTRATES this loop through the control plane —
+it never synthesizes perception or verification itself. Each step:
+**observe → propose → ground → gate → act → record**.
 
-1. **Observe.** `GET /v1/vms/{vmId}/screen` returns a `ComputerPercept`:
-   frame id, dimensions, PNG (base64), detected regions
+1. **Observe.** `GET /v1/computer/{sessionId}/observe` returns a
+   `ComputerPercept`: frame id, dimensions, PNG (base64), detected regions
    (`{regionId, bbox, label, confidence}`), cursor, window/dialog lists,
-   loading flag, and provenance.
-2. **Propose.** The inference service (`POST /infer` with frame + goal +
-   regions) returns ranked `candidate_actions` — `ActionIR` objects with
-   confidence scores.
-3. **Ground.** The verifier binds the selected action to a detected region:
-   the region must exist, the bbox must lie inside the frame, and confidence
-   must clear the 0.5 gate. Region-free actions (`wait`, `observe`,
-   `terminate`) pass on confidence alone.
+   loading flag, and provenance. The `frameId` anchors everything after it.
+2. **Propose.** The inference service (`POST /v1/computer/{sessionId}/suggest`
+   → inference `POST /infer` with frame + goal + regions) returns an action
+   with full model identity (`model_id/version/sha256`, `degraded`).
+3. **Ground.** The verifier binds the selected action to a detected region
+   of the EXACT observed frame: the region must exist, the point must fall
+   inside its bbox, and the frame must be current (stale `frameId` → 409).
+   Region-free actions (`wait`, `observe`, `terminate`) pass without
+   pointing. Ungrounded pointing is recorded `verified: false`, never
+   upgraded.
 4. **Gate.** The policy layer denies destructive / external-comms /
    credential-adjacent actions unless the task policy opts in, and escalates
    approval-listed categories to a human.
-5. **Act.** `POST /v1/vms/{vmId}/act` executes exactly one validated action
-   under an idempotency key; replays collapse to a single execution.
-6. **Record.** Before/after screens, the chosen action, grounding, and outcome
-   append to the trace ledger as a `TraceStep`.
+5. **Act.** `POST /v1/computer/{sessionId}/act` executes exactly one
+   validated action against the grounded `frameId` under an idempotency key;
+   replays collapse to a single execution; failures never advance the
+   trajectory.
+6. **Record.** Before/after frames, the chosen action, server-written
+   grounding and execution verification, and outcome append to the
+   SHA-256-chained trace ledger as a `TraceStep` (control-plane stamped).
 
 ## Action IR
 

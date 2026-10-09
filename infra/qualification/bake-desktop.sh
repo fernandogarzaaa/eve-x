@@ -53,7 +53,9 @@ case "$MODE" in
     echo "manage_etc_hosts: true"
     echo "users:"
     echo "  - name: eveagent"
-    echo "    sudo: ALL=(ALL) NOPASSWD:ALL"
+    echo "    # Privilege separation: unprivileged agent account. Bake-time"
+    echo "    # privileged steps run as root via cloud-init/QGA, never sudo."
+    echo "    sudo: false"
     echo "    shell: /bin/bash"
     echo "    lock_passwd: true"
     if [ -n "$SSH_PUBKEY" ]; then

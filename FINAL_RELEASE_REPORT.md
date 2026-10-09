@@ -1,5 +1,12 @@
 # EVE-X 1.0.0 FINAL RELEASE REPORT
 
+> Historical record for the 1.0.0 tag. Superseded by 1.1.0 (evidence-integrity
+> rebuild): worker contract, validation semantics, benchmark execution,
+> inference readiness, trace digest algorithm, guest jail/allowlist/sudo,
+> auth modes, image pins, and several API behaviors changed incompatibly
+> where honesty required it. See CHANGELOG.md, PRODUCTION_QUALIFICATION.md
+> Addendum 1.1.0, and `artifacts/final-verification/final-verification.json`.
+
 **Status: RELEASE QUALIFIED**
 
 ## Version

@@ -1,12 +1,26 @@
 # OPERATIONS
 
+## Execution modes
+
+`EVEX_MODE` selects the posture: `development` (default, zero-config local
+dev with a scoped dev-anon fallback), `test` (hermetic suites, no fallback),
+`production` (fail closed). In production, `startApi` refuses to serve unless
+the posture evaluates production-safe: strong `EVEX_AUTH_TOKEN` (≥32 chars,
+no well-known or template values), required services reachable
+(`EVEX_REQUIRE_SERVICES`), quotas set, non-dev VM backend, sane TLS posture.
+Weak or missing secrets refuse startup — they are never defaulted.
+
 ## Daily rhythm
 
-- Check `/health` on api + inference `/health`; confirm `/ready` is 200
-  (unready means degraded heuristic mode — serving, but investigate).
+- Check `/health` on api + inference `/health`; confirm inference `/ready`
+  is 200 with the expected `model_id`/`model_sha256` (503 = not serving;
+  the plane answers 503, never heuristic-as-model — investigate).
   `/health` also reports the release identity; a commit that does not match
   the deployed release is an incident, not a curiosity.
-- Review worker backlog (Redis queue depth) and VM fleet states; any VM in
+- Review `/metrics` counters (stale rejections, actuation failures,
+  takeovers, benchmark runs/failures, validation verdicts, vm losses);
+  spikes get investigated, not muted.
+- Review worker backlog and VM fleet states; any VM in
   `FAILED` longer than 15 min gets destroyed and reprovisioned.
 - Scan the governance audit log for 403/409 spikes — a burst of policy
   denials usually means a misconfigured task policy, not an attack.
@@ -34,9 +48,11 @@ then restart the units. Sysctl baseline lives in
 
 ## Runbooks
 
-**Inference degraded (`/ready` 503, `/health` 200).**
-Reload weights or restart the inference container; the plane keeps serving
-with low-confidence heuristic actions meanwhile. No traffic shift needed.
+**Inference not ready (`/ready` 503, `/health` 200).**
+Reload verified weights (`--weights` + `--weights-sha256`) or restart the
+inference container; dependents see explicit 502/503 (suggest →
+`inference_unavailable`, benchmarks → inconclusive), never silent
+heuristic output labeled as model output. No traffic shift needed.
 
 **Queue full (429s on `/infer`).**
 Scale inference replicas or lower population-study concurrency; the bounded
@@ -50,6 +66,14 @@ older than the configured window, and confirm `pgdata` volume growth.
 `eve-x vm status <id>` to confirm state; stop the session
 (`eve-x session stop <id>`), then `eve-x vm rm <id>` and reprovision from
 the clean snapshot. Never delete overlays by hand.
+
+**Restart recovery (nothing auto-runs).**
+On boot, sessions persisted as RUNNING demote to PAUSED (`recoveryNote`
+recorded, worker control flags set) — VM, runtime, and lease state are
+unproven after a restart. Re-arm explicitly per session:
+`POST /v1/sessions/{id}/resume` (409 unless PAUSED). FAILED stays FAILED
+with its reason; judgments, dedupe keys, and pending blind reviews
+rehydrate from disk, so validation evidence survives restarts.
 
 **Orphaned QEMU after a control-plane crash.**
 `VmManager.recover()` (runs at worker/API start) SIGKILLs recorded live PIDs
@@ -86,9 +110,12 @@ container/volume, then confirm `/ready` persistence mode flips back to
 `production` when `EVEX_REQUIRE_SERVICES` is set.
 
 **Model / inference failure.**
-`/v1/models/status` reports reachability; the plane serves heuristic
-actions degraded meanwhile. Roll back via the registry (`retire` the bad
-checkpoint; the previous production record remains authoritative).
+`/v1/models/status` reports live reachability plus the model identity; when
+the plane is down, dependents see explicit 502/503 and benchmarks go
+inconclusive. Roll back via the registry (`retire` the bad checkpoint; the
+previous production record remains authoritative). Heuristic output is only
+ever served labeled `degraded: true` under the explicit `--allow-heuristic`
+deployment flag — never as a trained model.
 
 **TLS failure.**
 Qual/prod certs live in `infra/deployment/tls/certs/` (gitignored).

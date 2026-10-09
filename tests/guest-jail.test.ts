@@ -1,0 +1,341 @@
+import { describe, it, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname, basename } from "node:path";
+import {
+  createGuestAgent,
+  HostGuestChannel,
+  hmacSign,
+  createReplayCache,
+  resolveExecutable,
+  lexicalInsideRoot,
+  canonicalInsideRoot,
+  type GuestAgent,
+} from "../packages/guest/src/index.js";
+
+// Guest jail + executable identity: symlink traversal and basename
+// spoofing must fail closed. Symlink-creation tests classify precisely
+// when the OS refuses links (Windows without Developer Mode): they pass
+// only on proven EPERM/EACCES, and the same properties run on Linux CI.
+
+const SECRET = "test-guest-jail-secret-0123456789abcdef";
+
+let ROOT = "";
+let agent: GuestAgent | null = null;
+let chan: HostGuestChannel | null = null;
+let fsRoot = "";
+
+async function trySymlink(target: string, path: string): Promise<boolean> {
+  try {
+    await fs.symlink(target, path);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "EPERM" || code === "EACCES" || code === "EROFS") return false;
+    throw err;
+  }
+}
+
+before(async () => {
+  ROOT = mkdtempSync(join(tmpdir(), "evex-jail-"));
+  fsRoot = join(ROOT, "jail");
+  agent = await createGuestAgent({
+    port: 0, host: "127.0.0.1", secret: SECRET, fsRoot,
+    execAllowlist: [basename(process.execPath)],
+    execAllowDirs: [dirname(process.execPath)],
+  });
+  chan = new HostGuestChannel({ baseUrl: (agent as GuestAgent).url, secret: SECRET });
+});
+
+after(async () => {
+  await agent?.close();
+  rmSync(ROOT, { recursive: true, force: true });
+});
+
+function C(): HostGuestChannel {
+  if (!chan) throw new Error("guest channel not started");
+  return chan;
+}
+
+/** Assert a rejection carrying an EveError code (server replies surface the
+ *  code in the message body; direct calls surface it on .code). */
+async function assertRejectsCode(promise: Promise<unknown>, code: string): Promise<void> {
+  try {
+    await promise;
+  } catch (err) {
+    const text = `${String((err as { code?: unknown })?.code ?? "")} ${err instanceof Error ? err.message : String(err)}`;
+    assert.match(text, new RegExp(code), `expected ${code}, got: ${text.slice(0, 300)}`);
+    return;
+  }
+  assert.fail(`expected rejection with ${code}`);
+}
+
+/** Sync variant: assert a throw carrying an EveError code. */
+function assertThrowsCode(fn: () => unknown, code: string): void {
+  try {
+    fn();
+  } catch (err) {
+    const text = `${String((err as { code?: unknown })?.code ?? "")} ${err instanceof Error ? err.message : String(err)}`;
+    assert.match(text, new RegExp(code), `expected ${code}, got: ${text.slice(0, 300)}`);
+    return;
+  }
+  assert.fail(`expected throw with ${code}`);
+}
+
+describe("lexical + canonical jail", () => {
+  it("rejects .. traversal lexically", () => {
+    for (const p of ["../escape", "a/../../escape"]) {
+      try {
+        lexicalInsideRoot(fsRoot, p);
+        assert.fail(`expected FS_ESCAPE for ${p}`);
+      } catch (err) {
+        assert.equal((err as { code?: string })?.code, "FS_ESCAPE");
+      }
+    }
+  });
+
+  it("accepts a benign nested path", async () => {
+    const full = await canonicalInsideRoot(fsRoot, "a/b/c.txt");
+    assert.ok(full.endsWith(join("a", "b", "c.txt")));
+  });
+
+  it("refuses reads through a symlink pointing outside", async () => {
+    const outside = join(ROOT, "outside.txt");
+    await fs.writeFile(outside, "TOP-SECRET-OUTSIDE", "utf8");
+    const link = join(fsRoot, "link.txt");
+    if (!(await trySymlink(outside, link))) {
+      assert.ok(true, "classified: symlink creation unavailable on this host");
+      return;
+    }
+    await assertRejectsCode(C().readFile("link.txt"), "FS_ESCAPE");
+    // The outside file is untouched and its content never returned.
+    assert.equal(await fs.readFile(outside, "utf8"), "TOP-SECRET-OUTSIDE");
+  });
+
+  it("refuses writes through a directory symlink pointing outside", async () => {
+    const outsideDir = join(ROOT, "outside-dir");
+    await fs.mkdir(outsideDir, { recursive: true });
+    const linkDir = join(fsRoot, "linkdir");
+    if (!(await trySymlink(outsideDir, linkDir))) {
+      assert.ok(true, "classified: symlink creation unavailable on this host");
+      return;
+    }
+    await assertRejectsCode(C().writeFile("linkdir/evil.txt", Buffer.from("x")), "FS_ESCAPE");
+    assert.equal((await fs.readdir(outsideDir)).length, 0);
+  });
+
+  it("refuses writes that escape via ..", async () => {
+    const dest = join(ROOT, "escaped.txt");
+    await assertRejectsCode(C().writeFile("../escaped.txt", Buffer.from("x")), "FS_ESCAPE");
+    let exists = false;
+    try { await fs.stat(dest); exists = true; } catch { exists = false; }
+    assert.equal(exists, false);
+  });
+
+  it("round-trips a legitimate file", async () => {
+    const n = await C().writeFile("legit/note.txt", Buffer.from("hello-jail"));
+    assert.equal(n, Buffer.byteLength("hello-jail"));
+    const back = await C().readFile("legit/note.txt");
+    assert.equal(back.toString("utf8"), "hello-jail");
+  });
+
+  it("refuses reads through a hardlink pointing outside", async () => {
+    const outside = join(ROOT, "hard-outside.txt");
+    await fs.writeFile(outside, "HARD-SECRET", "utf8");
+    const link = join(fsRoot, "hardlink.txt");
+    try {
+      await fs.link(outside, link);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "EPERM" || code === "EACCES" || code === "EXDEV") {
+        assert.ok(true, "classified: hardlink creation unavailable across these paths");
+        return;
+      }
+      throw err;
+    }
+    await assertRejectsCode(C().readFile("hardlink.txt"), "FS_ESCAPE");
+    await assertRejectsCode(C().writeFile("hardlink.txt", Buffer.from("x")), "FS_ESCAPE");
+    assert.equal(await fs.readFile(outside, "utf8"), "HARD-SECRET");
+  });
+
+  it("normalizes unicode before the lexical check", () => {
+    // U+FF0E FULLWIDTH FULL STOP folds to "." under NFKC: without
+    // normalization this looks like a benign dirname but resolves to "../".
+    assertThrowsCode(() => lexicalInsideRoot(fsRoot, "．．/escape"), "FS_ESCAPE");
+    // A combining mark attached to ".." is NOT traversal — just a odd name
+    // inside the root — and café spellings stay inside.
+    const odd = lexicalInsideRoot(fsRoot, "..\u030a/escape");
+    assert.ok(odd.startsWith(fsRoot));
+    const benign = lexicalInsideRoot(fsRoot, "caf\u00e9/note.txt");
+    assert.ok(benign.endsWith(join("café", "note.txt")) || benign.includes("caf"));
+  });
+
+  it("absolute and dot-heavy paths never escape", async () => {
+    // join() folds absolute segments under the root: the write either lands
+    // inside the jail or fails closed — but nothing may appear outside it.
+    for (const p of ["/etc/absolute.txt", "a/./b/../b/c.txt", "x/../../y.txt"]) {
+      try {
+        await C().writeFile(p, Buffer.from("x"));
+      } catch (err) {
+        assert.match(String((err as { code?: string })?.code ?? err), /FS_ESCAPE|GUEST_ERROR/);
+      }
+    }
+    for (const outside of [join(ROOT, "etc", "absolute.txt"), join(ROOT, "y.txt")]) {
+      let exists = false;
+      try { await fs.stat(outside); exists = true; } catch { exists = false; }
+      assert.equal(exists, false, `${outside} must not exist`);
+    }
+  });
+
+  it("round-trips strange-but-inside names", async () => {
+    const name = "sp ace+uniçode/n.e..sted/file  .txt";
+    await C().writeFile(name, Buffer.from("strange"));
+    assert.equal((await C().readFile(name)).toString("utf8"), "strange");
+  });
+
+  it("a file swapped for a symlink between walk and open is refused", async () => {
+    // Compose the mechanisms directly: validate the real file, swap in a
+    // link to outside, then open fresh — O_NOFOLLOW + re-check must refuse.
+    await C().writeFile("swap-me.txt", Buffer.from("real"));
+    await canonicalInsideRoot(fsRoot, "swap-me.txt");
+    await fs.rm(join(fsRoot, "swap-me.txt"));
+    const outside = join(ROOT, "swap-target.txt");
+    await fs.writeFile(outside, "OUT", "utf8");
+    if (!(await trySymlink(outside, join(fsRoot, "swap-me.txt")))) {
+      assert.ok(true, "classified: symlink creation unavailable on this host");
+      return;
+    }
+    await assertRejectsCode(C().readFile("swap-me.txt"), "FS_ESCAPE");
+  });
+});
+
+describe("executable identity (not basename)", () => {
+  it("executes the allowlisted binary by canonical path", async () => {
+    const r = await C().exec([process.execPath, "--version"]);
+    assert.equal(r.ok, true);
+    assert.match(String(r.stdout ?? ""), /v\d+\.\d+/);
+  });
+
+  it("refuses an attacker-controlled binary with an allowed basename", async () => {
+    const evilDir = join(ROOT, "evil");
+    await fs.mkdir(evilDir, { recursive: true });
+    const bin = basename(process.execPath);
+    await fs.copyFile(process.execPath, join(evilDir, bin));
+    await assertRejectsCode(
+      C().exec([join(evilDir, bin), "--version"]),
+      "NOT_ALLOWLISTED",
+    );
+  });
+
+  it("resolveExecutable: bare names resolve to trusted dirs even with attacker PATH", async () => {
+    const evilDir = join(ROOT, "evil-path");
+    await fs.mkdir(evilDir, { recursive: true });
+    const bin = basename(process.execPath);
+    await fs.copyFile(process.execPath, join(evilDir, bin));
+    // The evil copy is on the (simulated) PATH, but resolution prefers the
+    // trusted dir and returns the canonical trusted binary — never the evil
+    // copy.
+    const got = await resolveExecutable(bin, new Set([bin]), [dirname(process.execPath)], [evilDir]);
+    const trustedReal = await fs.realpath(join(dirname(process.execPath), bin));
+    assert.equal(got, trustedReal);
+  });
+
+  it("resolveExecutable: binary present only on attacker PATH is refused", async () => {
+    const evilDir = join(ROOT, "evil-path-only");
+    await fs.mkdir(evilDir, { recursive: true });
+    const bin = basename(process.execPath);
+    await fs.copyFile(process.execPath, join(evilDir, bin));
+    await assertRejectsCode(
+      resolveExecutable(bin, new Set([bin]), [join(ROOT, "empty-trust")], [evilDir]),
+      "NOT_ALLOWLISTED",
+    );
+  });
+
+  it("resolveExecutable: symlink inside trusted dirs that escapes is refused", async () => {
+    const trustDir = join(ROOT, "trust");
+    await fs.mkdir(trustDir, { recursive: true });
+    const bin = basename(process.execPath);
+    const evilCopy = join(ROOT, "evil-shim-target", bin);
+    await fs.mkdir(dirname(evilCopy), { recursive: true });
+    await fs.copyFile(process.execPath, evilCopy);
+    const link = join(trustDir, `shim-${bin}`);
+    if (!(await trySymlink(evilCopy, link))) {
+      assert.ok(true, "classified: symlink creation unavailable on this host");
+      return;
+    }
+    // Link target is outside the trusted dir -> canonical identity is
+    // attacker-controlled -> refuse even though the link itself is trusted.
+    // (The link basename is allowlisted so only the escape can refuse.)
+    await assertRejectsCode(
+      resolveExecutable(link, new Set([basename(link)]), [trustDir]),
+      "NOT_ALLOWLISTED",
+    );
+  });
+
+  it("resolveExecutable: non-allowlisted basename is refused", async () => {
+    await assertRejectsCode(
+      resolveExecutable(process.execPath, new Set(["definitely-not-it"]), [dirname(process.execPath)]),
+      "NOT_ALLOWLISTED",
+    );
+  });
+
+  it("shell metacharacters in arguments never execute (no shell)", async () => {
+    const r = await C().exec([process.execPath, "--eval", "process.exit(3); $(touch pwned)"]);
+    // node received a filename-ish argument, not a command: no code ran
+    // through a shell, and no file was created.
+    assert.equal(r.ok, false);
+    let exists = false;
+    try { await fs.stat(join(ROOT, "pwned")); exists = true; } catch { exists = false; }
+    assert.equal(exists, false);
+  });
+
+  it("wrapper scripts with an allowed basename are refused by identity", async () => {
+    const bin = basename(process.execPath);
+    const wrapper = join(ROOT, "evil-wrap", bin);
+    await fs.mkdir(dirname(wrapper), { recursive: true });
+    await fs.writeFile(wrapper, "#!/bin/sh\nexec /bin/echo pwned\n", "utf8");
+    await assertRejectsCode(C().exec([wrapper, "--version"]), "NOT_ALLOWLISTED");
+  });
+});
+
+describe("HMAC replay resistance", () => {
+  it("a captured request cannot be replayed inside the window", async () => {
+    const url = (agent as GuestAgent).url;
+    const body = JSON.stringify({ argv: [process.execPath, "--version"] });
+    const ts = String(Date.now());
+    const sig = hmacSign(SECRET, "POST", "/exec", body, ts);
+    const headers = { "content-type": "application/json", "x-eve-ts": ts, "x-eve-sig": sig };
+    const first = await fetch(`${url}/exec`, { method: "POST", headers, body });
+    assert.equal(first.status, 200);
+    await first.text();
+    // Byte-identical replay: same ts, same sig, same body.
+    const replay = await fetch(`${url}/exec`, { method: "POST", headers, body });
+    assert.equal(replay.status, 401);
+    assert.match(await replay.text(), /replayed request/);
+  });
+
+  it("tampered body with a fresh signature fails closed (no replay bypass)", async () => {
+    const url = (agent as GuestAgent).url;
+    const ts = String(Date.now());
+    const sig = hmacSign(SECRET, "POST", "/exec", JSON.stringify({ argv: ["nope"] }), ts);
+    const res = await fetch(`${url}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-eve-ts": ts, "x-eve-sig": sig },
+      body: JSON.stringify({ argv: [process.execPath, "--version"] }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it("createReplayCache bounds memory and expires entries", () => {
+    const cache = createReplayCache(1000, 8);
+    for (let i = 0; i < 20; i += 1) {
+      assert.equal(cache.checkFresh(`sig-${i}`, 1000000), true);
+    }
+    assert.ok(cache.size() <= 8, `cache must stay bounded, got ${cache.size()}`);
+    assert.equal(cache.checkFresh("sig-0", 1000000), true, "evicted entries may be seen again (bounded cache)");
+    assert.equal(cache.checkFresh("sig-fresh", 1000000), true);
+    assert.equal(cache.checkFresh("sig-fresh", 1000000), false, "immediate reuse is a replay");
+  });
+});

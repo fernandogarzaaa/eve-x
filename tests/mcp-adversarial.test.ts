@@ -4,8 +4,8 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { buildMcpServer, startHttp } from "../apps/mcp/src/index.js";
 import { ControlPlaneClient } from "../packages/mcp-shared/src/index.js";
 

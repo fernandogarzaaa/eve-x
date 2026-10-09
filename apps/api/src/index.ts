@@ -8,8 +8,9 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 
 // Static imports of guaranteed-present siblings.
-import { uid, nowIso, prng, sha1hex, EveError, StateMachine, VM_TRANSITIONS, releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
+import { uid, nowIso, sha256hex, canonicalJson, EveError, StateMachine, VM_TRANSITIONS, RELEASE, releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
 import { ActionIR, ActionType, ComputerPercept, VmSpec, TaskSpec } from "../../../packages/protocol/src/index.js";
+import { validateEvidence, EvidenceBundleSchema } from "../../../packages/validation/src/index.js";
 import {
   VmManager, selectDriver, QemuDriver, DockerDesktopDriver, DevFramebufferDriver,
 } from "../../../packages/vm/src/index.js";
@@ -21,8 +22,10 @@ type StorageMod = typeof import("../../../packages/storage/src/index.js");
 type BenchMod = {
   buildRegistry: () => Array<{
     benchTaskId: string; category: string; goal: string; split: string;
-    seed: number; maxSteps: number; stepsOptimal: number;
+    seed: number; maxSteps: number; stepsOptimal: number; successSignals: string[];
   }>;
+  evaluateBenchTask: (input: unknown) => Record<string, unknown>;
+  mockAgentAdapter: (seed: number, label?: string) => unknown;
   runBench: (registry: unknown, agentFn: unknown, opts: unknown) => Promise<Record<string, unknown>>;
 };
 let sec: SecurityMod | null = null;
@@ -199,6 +202,13 @@ function safeEq(a: string, b: string): boolean {
   return timingSafeEqual(ba, bb);
 }
 
+function executionMode(): "development" | "test" | "production" {
+  const raw = (process.env["EVEX_MODE"] ?? "").trim().toLowerCase();
+  if (raw === "production" || raw === "prod") return "production";
+  if (raw === "test" || raw === "testing" || raw === "ci") return "test";
+  return "development";
+}
+
 function localAuth(req: Request): Ctx | null {
   const master = process.env["EVEX_AUTH_TOKEN"] ?? "";
   const raw = String(req.headers["authorization"] ?? "");
@@ -209,9 +219,44 @@ function localAuth(req: Request): Ctx | null {
     return null;
   }
   if (!master) {
-    // Security package absent + no master token: scoped dev operator, fail closed.
+    // Security package absent + no master token: scoped dev operator ONLY
+    // in development mode. Test/production fail closed (401 downstream).
+    if (executionMode() !== "development") return null;
     return { tenant: "default", user: "dev-anon", session: "dev", role: "operator", capabilities: [...FALLBACK_OPERATOR_CAPS], scopes: ["dev"] };
   }
+  if (token && safeEq(token, master)) {
+    return { tenant: "default", user: "master", session: "master", role: "admin", capabilities: ["*"], scopes: ["*"] };
+  }
+  return null;
+}
+
+/** Verify a WebSocket upgrade request: bearer token via Authorization
+ *  header or ?token= query (the WS path performs the same auth as HTTP —
+ *  an HTTP 401 never becomes a WS hello). */
+function upgradeAuth(req: { headers: Record<string, string | string[] | undefined>; url?: string }): Ctx | null {
+  const fromQuery = (() => {
+    try {
+      const u = new URL(req.url ?? "/", "http://ws");
+      const t = u.searchParams.get("token") ?? u.searchParams.get("access_token") ?? "";
+      return t.trim();
+    } catch {
+      return "";
+    }
+  })();
+  const headers = { ...(req.headers as Record<string, string | string[] | undefined>) };
+  if (fromQuery && !headers["authorization"]) headers["authorization"] = `Bearer ${fromQuery}`;
+  if (sec) {
+    const ctx = sec.authFromHeaders(headers);
+    if (ctx) return ctx as unknown as Ctx;
+    return null;
+  }
+  const master = process.env["EVEX_AUTH_TOKEN"] ?? "";
+  if (!master) {
+    if (executionMode() !== "development") return null;
+    return { tenant: "default", user: "dev-anon", session: "dev", role: "operator", capabilities: [...FALLBACK_OPERATOR_CAPS], scopes: ["dev"] };
+  }
+  const raw = String(headers["authorization"] ?? "");
+  const token = raw.replace(/^Bearer\s+/i, "").trim();
   if (token && safeEq(token, master)) {
     return { tenant: "default", user: "master", session: "master", role: "admin", capabilities: ["*"], scopes: ["*"] };
   }
@@ -316,6 +361,11 @@ const streams = new Map<string, Set<WebSocket>>();
 const idemResponses = new Map<string, unknown>();
 // Judgment dedupe: "<stepId>:<reviewer>".
 const judgmentKeys = new Set<string>();
+interface JudgmentRec {
+  id: string; stepId: string; sessionId: string; reviewer: string;
+  reasonable: boolean; targetCorrect: boolean; at: string;
+}
+const judgmentRecs = new Map<string, JudgmentRec>();
 // Blind reviews: "<reviewId>" -> pending review (server-side blinding).
 interface ReviewRec {
   reviewId: string; sessionId: string; stepId: string;
@@ -385,6 +435,7 @@ function markSessionVmLost(s: SessionRec, reason: string): void {
   s.updatedAt = nowIso();
   persistSession(s);
   closeRuntime(s.id);
+  bump("vm_lost");
   s.seq += 1;
   appendStep(s.id, {
     session_id: s.id, task_id: s.taskId, step_id: uid("step"), seq: s.seq,
@@ -514,7 +565,7 @@ function mgrOwner(req: Request): string {
 }
 
 /** Get-or-build the live computer runtime for a session (real backends only). */
-async function runtimeFor(req: Request, s: SessionRec): Promise<SessionRuntime> {
+async function runtimeForOwner(owner: string, s: SessionRec): Promise<SessionRuntime> {
   const v = s.vmId ? vms.get(s.vmId) : undefined;
   const d = v ? driverOf(v) : null;
   if (!d || d.backend === "dev-framebuffer") {
@@ -523,7 +574,6 @@ async function runtimeFor(req: Request, s: SessionRec): Promise<SessionRuntime> 
   const hit = runtimes.get(s.id);
   if (hit) return hit;
   const { mgr } = await vmManager();
-  const owner = mgrOwner(req);
   // Force reattach for stale post-restart entries BEFORE resolving ports:
   // status() re-establishes QMP-proven control (or fails loudly), so the
   // VNC port below always belongs to this VM, never a recycled number.
@@ -562,6 +612,20 @@ function closeRuntime(sessionId: string): void {
   // so there is nothing else to release.
 }
 
+/** Cache perceived regions on the session for point→region grounding at act
+ *  time. Best-effort: a cache failure never fails the observation. */
+function cachePerceivedRegions(s: SessionRec, regions: unknown): void {
+  try {
+    const regs = (regions ?? []) as Array<{ regionId?: unknown; bbox?: unknown; label?: unknown }>;
+    s.lastRegions = regs
+      .filter((r) => typeof r.regionId === "string" && Array.isArray(r.bbox) && r.bbox.length === 4)
+      .map((r) => ({
+        regionId: String(r.regionId),
+        bbox: (r.bbox as number[]).slice(0, 4) as [number, number, number, number],
+        label: typeof r.label === "string" ? String(r.label) : "",
+      }));
+  } catch { /* grounding cache is best-effort */ }
+}
 /** Provision (create+boot) a driver VM for an API vm record. Throws loudly on failure. */
 async function provisionDriverVm(owner: string, spec: Record<string, unknown>): Promise<{ driverVmId: string; backend: string }> {
   const { mgr, backend } = await vmManager();
@@ -589,7 +653,7 @@ type FlatAction = {
  * statuses, anything else becomes actuation_failed.
  */
 async function realAct(
-  req: Request,
+  owner: string,
   s: SessionRec,
   v: VmRec,
   drv: { driverVmId: string; backend: string },
@@ -597,8 +661,7 @@ async function realAct(
   action: FlatAction,
 ): Promise<Record<string, unknown>> {
   const { mgr } = await vmManager();
-  const owner = mgrOwner(req);
-  const { runtime, backend } = await runtimeFor(req, s);
+  const { runtime, backend } = await runtimeForOwner(owner, s);
   const frameId = body.frameId ?? runtime.observedFrameId() ?? s.lastFrame;
   const type = action.type;
   if (type === "terminal" || type === "tool") {
@@ -699,6 +762,10 @@ async function realAct(
     goal: s.goal, candidate_actions: [action],
     selected_action: { ...action, confidence: body.confidence, ...(target ? { target } : {}) },
     ...(grounding ? { grounding } : {}),
+    // Execution verification (NOT goal verification): the actuation ran
+    // through the runtime and a post-action frame was captured. Whether the
+    // goal advanced is decided by task oracles / human judgment, never here.
+    verification: { passed: true, reason: `actuated via ${backend}; post-action frame ${String(after.frameId)} captured` },
     screen_after: String(after.frameId), outcome: "acted",
     provenance: { source: "screenshot", channel: `api-act:${backend}`, at: nowIso() },
     model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
@@ -708,30 +775,186 @@ async function realAct(
   return { sessionId: s.id, seq: s.seq, action, frameId: after.frameId, synthetic: false };
 }
 
+// ── inference plane client ──────────────────────────────────────────────
+// Shared by /suggest and the benchmark RealAgentAdapter. Every inference
+// failure throws (callers map to an explicit 502 / inconclusive verdict) —
+// the control plane never synthesizes an action when the model is down.
+// When EVEX_INFERENCE_TOKEN is set it is forwarded as a bearer token so a
+// hardened inference plane can authenticate callers.
+
+export interface InferenceResult {
+  action: Record<string, unknown>;
+  modelId: string;
+  modelVersion?: string;
+  modelSha256?: string | null;
+  degraded: boolean;
+  latencyMs?: number;
+}
+
+export interface InferenceModelInfo {
+  model_id: string;
+  model_version?: string;
+  model_sha256?: string | null;
+  architecture?: string;
+  device?: string;
+  degraded: boolean;
+}
+
+function inferenceUrl(): string {
+  return (process.env["INFERENCE_URL"] ?? "http://localhost:8090").replace(/\/$/, "");
+}
+
+function inferenceTimeoutMs(): number {
+  return Math.max(100, Math.min(120000, Number(process.env["EVEX_INFERENCE_TIMEOUT_MS"] ?? 15000) || 15000));
+}
+
+function inferenceHeaders(): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const tok = (process.env["EVEX_INFERENCE_TOKEN"] ?? "").trim();
+  if (tok) h["authorization"] = `Bearer ${tok}`;
+  return h;
+}
+
+export async function fetchInference(percept: {
+  frameId: string; goal: string; width: number; height: number;
+  pngBase64: string; regions: unknown;
+}): Promise<InferenceResult> {
+  const timeoutMs = inferenceTimeoutMs();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${inferenceUrl()}/infer`, {
+      method: "POST",
+      headers: inferenceHeaders(),
+      body: JSON.stringify({
+        frame_id: percept.frameId, goal: percept.goal,
+        width: percept.width, height: percept.height,
+        png_base64: percept.pngBase64, regions: percept.regions,
+        timeout_ms: timeoutMs,
+      }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (r.status === 401 || r.status === 403) {
+      throw new EveError("INFERENCE_AUTH", "inference plane refused credentials (set EVEX_INFERENCE_TOKEN)");
+    }
+    if (!r.ok) throw new EveError("INFERENCE_FAILED", `inference HTTP ${r.status}`);
+    const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+    const action = (j !== null && typeof j === "object" ? (j["action"] as unknown) : null) as Record<string, unknown> | null;
+    if (!action || typeof action !== "object") {
+      throw new EveError("INFERENCE_FAILED", "inference returned no action");
+    }
+    return {
+      action,
+      modelId: String((j as Record<string, unknown>)["model_id"] ?? "unknown"),
+      modelVersion: typeof (j as Record<string, unknown>)["model_version"] === "string"
+        ? ((j as Record<string, unknown>)["model_version"] as string)
+        : undefined,
+      modelSha256: typeof (j as Record<string, unknown>)["model_sha256"] === "string"
+        ? ((j as Record<string, unknown>)["model_sha256"] as string)
+        : null,
+      degraded: ((j as Record<string, unknown>)["degraded"] as boolean) !== false,
+      latencyMs: typeof (j as Record<string, unknown>)["latency_ms"] === "number"
+        ? ((j as Record<string, unknown>)["latency_ms"] as number)
+        : undefined,
+    };
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof EveError) throw err;
+    const reason = err instanceof Error && err.name === "AbortError" ? "inference timeout" : (err instanceof Error ? err.message : String(err));
+    throw new EveError("INFERENCE_FAILED", reason.slice(0, 200));
+  }
+}
+
+/** Best-effort model identity for benchmark provenance. Null when the plane
+ *  is unreachable — recorded as null with reason, never invented. When
+ *  EVEX_EXPECTED_MODEL_SHA256 pins the deployed artifact, a plane whose
+ *  reported digest differs (or is absent) is treated as unknown: an
+ *  unproven identity must not flow into benchmark provenance. */
+export async function fetchModelInfo(): Promise<InferenceModelInfo | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(`${inferenceUrl()}/model-info`, { headers: inferenceHeaders(), signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) return null;
+    const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!j || typeof j["model_id"] !== "string") return null;
+    const expected = (process.env["EVEX_EXPECTED_MODEL_SHA256"] ?? "").trim().toLowerCase();
+    const reported = typeof j["model_sha256"] === "string" ? (j["model_sha256"] as string).toLowerCase() : "";
+    if (expected && reported !== expected) {
+      log("warn", "inference model pin mismatch; identity treated as unknown", {
+        expected: expected.slice(0, 16), reported: reported.slice(0, 16) || "absent",
+      });
+      bump("inference_failed");
+      return null;
+    }
+    return {
+      model_id: j["model_id"] as string,
+      model_version: typeof j["model_version"] === "string" ? (j["model_version"] as string) : undefined,
+      model_sha256: typeof j["model_sha256"] === "string" ? (j["model_sha256"] as string) : null,
+      architecture: typeof j["architecture"] === "string" ? (j["architecture"] as string) : undefined,
+      device: typeof j["device"] === "string" ? (j["device"] as string) : undefined,
+      degraded: (j["degraded"] as boolean) === true,
+    };
+  } catch {
+    clearTimeout(timer);
+    return null;
+  }
+}
+
 /** Best-effort restart recovery: load persisted sessions/tasks/vms into memory. */
-export function hydrateFromDisk(): { sessions: number; tasks: number; vms: number } {
-  const out = { sessions: 0, tasks: 0, vms: 0 };
+export function hydrateFromDisk(): { sessions: number; tasks: number; vms: number; demoted?: number } {
+  const out: { sessions: number; tasks: number; vms: number; demoted?: number } = { sessions: 0, tasks: 0, vms: 0 };
   if (!stor) return out;
   try {
     for (const d of stor.store.list("sessions", 500)) {
       const id = String(d["id"] ?? "");
       if (!id || sessions.has(id)) continue;
-      const status = String(d["status"] ?? "STOPPED");
+      // Recovery honesty: a session that was RUNNING when the process died
+      // is NOT resurrected as RUNNING — its VM, runtime, and lease state
+      // are unproven after a restart. It demotes to PAUSED with an explicit
+      // reason and requires POST /v1/sessions/:id/resume to continue.
+      // Nothing auto-executes on boot, ever.
+      let status = String(d["status"] ?? "STOPPED");
+      let paused = d["paused"] === true;
+      let demoted = 0;
+      if (status === "RUNNING") {
+        status = "PAUSED";
+        paused = true;
+        demoted = 1;
+      }
       const sm = new StateMachine<string>(status, SESSION_SM);
-      sessions.set(id, {
+      const rec: SessionRec = {
         id, taskId: String(d["taskId"] ?? d["task_id"] ?? ""),
         goal: String(d["goal"] ?? ""), vmId: String(d["vmId"] ?? ""),
         status, seq: Number(d["seq"] ?? 0) || 0,
-        paused: d["paused"] === true, humanControl: d["humanControl"] === true,
-        createdAt: String(d["createdAt"] ?? nowIso()), updatedAt: String(d["updatedAt"] ?? nowIso()),
+        paused, humanControl: d["humanControl"] === true,
+        createdAt: String(d["createdAt"] ?? nowIso()), updatedAt: nowIso(),
         sm, owner: typeof d["owner"] === "string" ? String(d["owner"]) : "",
         lastFrame: typeof d["lastFrame"] === "string" ? String(d["lastFrame"]) : undefined,
         modeEnforced: d["modeEnforced"] === true,
         modeRetryAt: typeof d["modeRetryAt"] === "number" ? d["modeRetryAt"] : undefined,
         vmLossReason: typeof d["vmLossReason"] === "string" ? String(d["vmLossReason"]) : undefined,
-      });
+      };
+      sessions.set(id, rec);
+      if (demoted === 1) {
+        try {
+          stor.store.put("sessions", {
+            id, goal: rec.goal, vmId: rec.vmId, status: rec.status, taskId: rec.taskId,
+            seq: rec.seq, paused: rec.paused, humanControl: rec.humanControl,
+            lastFrame: rec.lastFrame, owner: rec.owner,
+            createdAt: rec.createdAt, updatedAt: rec.updatedAt,
+            recoveryNote: "demoted RUNNING->PAUSED on restart (unproven state; resume explicitly)",
+          });
+        } catch { /* best effort */ }
+        try {
+          writeControlFlag(id, rec.humanControl, true);
+        } catch { /* best effort */ }
+      }
       if (!traces.has(id)) traces.set(id, []);
       out.sessions += 1;
+      out.demoted = (out.demoted ?? 0) + demoted;
     }
     for (const d of stor.store.list("tasks", 500)) {
       const id = String(d["id"] ?? "");
@@ -763,6 +986,20 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
       if (!kind.startsWith("review")) {
         const k = `${String(d["stepId"] ?? "")}:${String(d["reviewer"] ?? "")}`;
         if (k !== ":") judgmentKeys.add(k);
+        // Rehydrate judgment verdicts so task validation keeps its human
+        // evidence across restarts (unknown ids stay unknown — no forging).
+        if (typeof d["id"] === "string" && typeof d["stepId"] === "string") {
+          const jid = String(d["id"]);
+          if (!judgmentRecs.has(jid)) {
+            judgmentRecs.set(jid, {
+              id: jid, stepId: String(d["stepId"]),
+              sessionId: typeof d["sessionId"] === "string" ? String(d["sessionId"]) : "",
+              reviewer: String(d["reviewer"] ?? ""),
+              reasonable: d["reasonable"] === true, targetCorrect: d["targetCorrect"] === true,
+              at: String(d["at"] ?? nowIso()),
+            });
+          }
+        }
       }
       // Rehydrate pending blind reviews (full step re-resolved at unlock).
       if (String(d["kind"] ?? "") === "review-pending" && typeof d["id"] === "string") {
@@ -784,7 +1021,7 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
     // hydration is best-effort
   }
   if (out.sessions + out.tasks + out.vms > 0) {
-    log("info", "hydrated persisted docs", { ...out, note: "in-flight RUNNING stays RUNNING" });
+    log("info", "hydrated persisted docs", { ...out, note: "in-flight RUNNING demoted to PAUSED (resume explicitly; nothing auto-runs)" });
   }
   return out;
 }
@@ -793,7 +1030,7 @@ export function hydrateFromDisk(): { sessions: number; tasks: number; vms: numbe
 export function __clearMemory(): void {
   for (const sid of runtimes.keys()) closeRuntime(sid);
   vms.clear(); sessions.clear(); tasks.clear(); traces.clear();
-  benchmarks.clear(); idemResponses.clear(); judgmentKeys.clear(); rateBuckets.clear();
+  benchmarks.clear(); idemResponses.clear(); judgmentKeys.clear(); judgmentRecs.clear(); rateBuckets.clear();
   reviews.clear();
   manager = null;
   managerBackend = "";
@@ -839,16 +1076,70 @@ function resolveFullStep(sessionId: string, stepId: string): Record<string, unkn
   return undefined;
 }
 
+/** Locate the owning session for a step id across live sessions. Returns
+ *  undefined when no session holds the step — callers must fail closed. */
+function findSessionForStep(stepId: string): string | undefined {
+  for (const [sid] of sessions) {
+    try {
+      const steps = mergedTraceSteps(sid, 2000);
+      if (steps.some((st) => String(st["step_id"] ?? "") === stepId)) return sid;
+    } catch { /* ignore unreadable sessions */ }
+  }
+  return undefined;
+}
+
+function broadcast(sessionId: string, payload: unknown): void {
+  const set = streams.get(sessionId);
+  if (!set) return;
+  const text = JSON.stringify(payload);
+  for (const ws of set) {
+    try {
+      if (ws.readyState === 1) ws.send(text);
+    } catch {
+      // ignore dead sockets
+    }
+  }
+}
+
+const CHAIN_GENESIS_DIGEST = "0".repeat(64);
+const traceHeads = new Map<string, string>();
+
+/** Chain-stamp a step with the session's SHA-256 append-only digest before
+ *  it is stored or broadcast. Replayed/validated later by verifyReplay:
+ *  any post-hoc mutation, reorder, deletion, or duplication of a chained
+ *  step breaks verification. Heads survive in memory; after a restart the
+ *  head is rebuilt from the persisted tail so the chain never forks. */
+function chainStamp(sessionId: string, step: Record<string, unknown>): Record<string, unknown> {
+  let head = traceHeads.get(sessionId);
+  if (head === undefined) {
+    head = CHAIN_GENESIS_DIGEST;
+    if (stor) {
+      try {
+        const tail = stor.store.readTrace(sessionId, 1) as Array<Record<string, unknown>>;
+        const last = tail.length > 0 ? tail[tail.length - 1] : undefined;
+        const d = last !== undefined ? String(last["digest"] ?? "") : "";
+        if (/^[0-9a-f]{64}$/.test(d)) head = d;
+      } catch { /* no history: genesis head */ }
+    }
+  }
+  const { digest: _d, prevDigest: _p, prev: _pv, ...body } = step;
+  void _d; void _p; void _pv;
+  const digest = sha256hex(`${head}.${canonicalJson(body)}`);
+  traceHeads.set(sessionId, digest);
+  return { ...step, prevDigest: head, digest };
+}
+
 function appendStep(sessionId: string, step: Record<string, unknown>): void {
+  const stamped = chainStamp(sessionId, step);
   const arr = traces.get(sessionId) ?? [];
-  arr.push(step);
+  arr.push(stamped);
   traces.set(sessionId, arr);
   try {
-    stor?.store.appendTrace(sessionId, step);
+    stor?.store.appendTrace(sessionId, stamped);
   } catch {
-    // ignore
+    bump("trace_write_failed");
   }
-  broadcast(sessionId, { kind: "step", sessionId, step });
+  broadcast(sessionId, { kind: "step", sessionId, step: stamped });
 }
 
 /**
@@ -870,22 +1161,11 @@ function mergedTraceSteps(sessionId: string, limit = 100000): Array<Record<strin
   const memIds = new Set(mem.map((st) => String(st["step_id"] ?? st["seq"])));
   const extra = file.filter((st) => !memIds.has(String(st["step_id"] ?? st["seq"])));
   if (extra.length === 0) return mem;
-  // Same merge order as the replay route (memory appends first); extras are
-  // pre-restart file history missing from this process's memory.
-  return [...mem, ...extra];
-}
-
-function broadcast(sessionId: string, payload: unknown): void {
-  const set = streams.get(sessionId);
-  if (!set) return;
-  const text = JSON.stringify(payload);
-  for (const ws of set) {
-    try {
-      if (ws.readyState === 1) ws.send(text);
-    } catch {
-      // ignore dead sockets
-    }
-  }
+  // Extras are pre-restart file history missing from this process's memory,
+  // so they come FIRST (their seqs predate the in-memory tail). No sorting:
+  // file order IS append order, and sorting would mask a reordered
+  // (tampered) log from the replay physical-order check.
+  return [...extra, ...mem];
 }
 
 function syntheticFrame(sessionId: string, seq: number): Record<string, unknown> {
@@ -954,9 +1234,15 @@ const BenchmarkStart = z.object({
   cases: z.array(z.string()).default(["login", "file-save", "web-form"]),
   size: z.number().int().min(1).max(200).default(6),
   seed: z.number().int().default(42),
+  /** Execution agent. "real" drives real sessions/VMs through the control
+   *  plane. "mock-test-only" is the explicit harness double: it requires
+   *  testOnly:true and the record is stamped synthetic/test_only. */
+  agent: z.enum(["real", "mock-test-only"]).default("real"),
+  testOnly: z.boolean().default(false),
 });
 const JudgmentBody = z.object({
   stepId: z.string(),
+  sessionId: z.string().min(1).max(128).optional(),
   reviewer: z.string().default("reviewer"),
   reasonable: z.boolean(),
   targetCorrect: z.boolean(),
@@ -970,6 +1256,9 @@ const ReviewEnqueue = z.object({
   sessionId: z.string().min(1),
   stepId: z.string().min(1).optional(),
 });
+const ValidateRequest = z.object({
+  evidence: EvidenceBundleSchema,
+});
 
 function validate<T extends z.ZodTypeAny>(schema: T, body: unknown, res: Response): z.infer<T> | null {
   const r = schema.safeParse(body);
@@ -980,19 +1269,19 @@ function validate<T extends z.ZodTypeAny>(schema: T, body: unknown, res: Respons
   return r.data as z.infer<T>;
 }
 
-function stableJson(v: unknown): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "";
-  if (Array.isArray(v)) return `[${v.map((e) => stableJson(e)).join(",")}]`;
-  const o = v as Record<string, unknown>;
-  return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`).join(",")}}`;
-}
-
 type ReplayVerdict = "deterministic-replay-ok" | "replay-divergent";
 
 export function verifyReplay(
   steps: Array<Record<string, unknown>>,
+  expectedCount?: number,
 ): { replayed: number; verdict: ReplayVerdict; issues: string[] } {
   const issues: string[] = [];
+  // Truncation is invisible to chain/sequence checks (a prefix replays
+  // cleanly): callers that know the expected length pass it, and any
+  // shortfall is reported instead of silently accepted.
+  if (expectedCount !== undefined && steps.length !== expectedCount) {
+    issues.push(`truncated/partial trace: replayed ${steps.length}, expected ${expectedCount}`);
+  }
   const seen = new Map<number, number>();
   const LITE = ["session_id", "task_id", "step_id", "seq", "timestamp", "actor"];
   steps.forEach((st, idx) => {
@@ -1025,19 +1314,25 @@ export function verifyReplay(
   steps.forEach((st, idx) => {
     if (st["seq"] !== idx) issues.push(`out-of-order seq at position ${idx} (seq ${String(st["seq"])})`);
   });
-  // Digest chain: only when every step carries the digest+prev convention.
-  const hasChain = steps.length > 0 && steps.every((st) => typeof st["digest"] === "string" && "prev" in st);
+  // Digest chain: only when every step carries the SHA-256 digest+prevDigest
+  // convention stamped by appendStep. Legacy 40-hex digests (pre-SHA-256
+  // toy hash) are flagged, never trusted: they cannot verify tampering.
+  const hasChain = steps.length > 0 && steps.every((st) => typeof st["digest"] === "string" && (typeof st["prevDigest"] === "string" || "prev" in st));
   if (hasChain) {
     let prevDigest = "";
     for (const st of steps) {
-      const { digest: _d, prev: _p, ...rest } = st as Record<string, unknown> & { digest: unknown; prev: unknown };
-      void _d; void _p;
-      const pStr = String(st["prev"] ?? "");
+      const { digest: _d, prev: _p, prevDigest: _pd, ...rest } = st as Record<string, unknown> & { digest: unknown; prev: unknown; prevDigest: unknown };
+      void _d; void _p; void _pd;
+      const pStr = String(st["prevDigest"] ?? st["prev"] ?? "");
       const dStr = String(st["digest"] ?? "");
+      if (!/^[0-9a-f]{64}$/.test(dStr) || (pStr !== "" && !/^[0-9a-f]{64}$/.test(pStr))) {
+        issues.push(`weak legacy digest at seq ${String(st["seq"])} (not SHA-256 — cannot verify tampering)`);
+        continue;
+      }
       if (prevDigest !== "" && pStr !== prevDigest) {
         issues.push(`digest chain break at seq ${String(st["seq"])}: prev mismatch`);
       }
-      const recomputed = sha1hex(`${pStr}|${stableJson(rest)}`);
+      const recomputed = sha256hex(`${pStr}.${canonicalJson(rest)}`);
       if (recomputed !== dStr) issues.push(`digest mismatch at seq ${String(st["seq"])}`);
       prevDigest = dStr;
     }
@@ -1049,6 +1344,29 @@ export function verifyReplay(
 function corsOrigins(): string[] {
   return (process.env["EVEX_CORS_ORIGINS"] ?? "http://localhost:3000,http://localhost:3001")
     .split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+// ── observability counters (in-memory; reset on restart, documented) ──
+// verbs: _failed/_rejected count deterministic failure behavior, never
+// hidden. Correlation: every counter event carries requestId in the
+// structured log line emitted at the same site.
+const metricsCounters: Record<string, number> = {
+  actuation_failed: 0, stale_rejected: 0, unsupported_action: 0,
+  human_takeover: 0, human_release: 0, benchmark_runs: 0, benchmark_failures: 0,
+  inference_failed: 0, vm_lost: 0, vm_provision_failed: 0, trace_write_failed: 0,
+  validation_pass: 0, validation_failed: 0, validation_inconclusive: 0, validation_invalid: 0,
+};
+function bump(name: string): void {
+  metricsCounters[name] = (metricsCounters[name] ?? 0) + 1;
+}
+
+export function metricsSnapshot(): { gauges: Record<string, number>; counters: Record<string, number> } {
+  let wsConnections = 0;
+  for (const set of streams.values()) wsConnections += set.size;
+  return {
+    gauges: { sessions_active: sessions.size, vms_active: vms.size, queue_depth: 0, ws_connections: wsConnections },
+    counters: { ...metricsCounters },
+  };
 }
 
 export function buildApp(): express.Express {
@@ -1100,9 +1418,19 @@ export function buildApp(): express.Express {
     });
   });
   app.get("/metrics", (_req: Request, res: Response) => {
-    res.type("text/plain").send(
-      `# HELP evex_sessions Total sessions\n# TYPE evex_sessions gauge\nevex_sessions ${sessions.size}\n# HELP evex_vms Total VMs\n# TYPE evex_vms gauge\nevex_vms ${vms.size}\n`,
-    );
+    const snap = metricsSnapshot();
+    const lines = [
+      "# HELP evex_sessions Total sessions",
+      "# TYPE evex_sessions gauge",
+      `evex_sessions ${sessions.size}`,
+      "# HELP evex_vms Total VMs",
+      "# TYPE evex_vms gauge",
+      `evex_vms ${vms.size}`,
+    ];
+    for (const [k, v] of Object.entries(snap.counters)) {
+      lines.push(`# HELP evex_${k} Total ${k.replace(/_/g, " ")}`, `# TYPE evex_${k} counter`, `evex_${k} ${v}`);
+    }
+    res.type("text/plain").send(lines.join("\n") + "\n");
   });
 
   const v1 = express.Router();
@@ -1130,6 +1458,7 @@ export function buildApp(): express.Express {
       try {
         provisioned = await provisionDriverVm(owner, spec as Record<string, unknown>);
       } catch (err) {
+        bump("vm_provision_failed");
         res.status(500).json({ error: "vm_provision_failed", message: err instanceof Error ? err.message : String(err) });
         return;
       }
@@ -1174,6 +1503,12 @@ export function buildApp(): express.Express {
     const s = sessions.get(req.params["id"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
+    try {
+      s.sm.transition("STOPPED", "session stop");
+    } catch (err) {
+      res.status(409).json({ error: "illegal_transition", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
     s.status = "STOPPED";
     s.updatedAt = nowIso();
     persistSession(s);
@@ -1185,8 +1520,39 @@ export function buildApp(): express.Express {
     const s = sessions.get(req.params["id"] as string);
     if (!s) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(s, req, res)) return;
+    try {
+      s.sm.transition("PAUSED", "session pause");
+    } catch (err) {
+      res.status(409).json({ error: "illegal_transition", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
     s.paused = true; s.status = "PAUSED"; s.updatedAt = nowIso();
     persistSession(s);
+    broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status });
+    res.json({ id: s.id, status: s.status });
+  });
+  // Explicit resume after pause OR restart-demotion. Resuming re-arms the
+  // session for workers; it never backfills execution. Only PAUSED sessions
+  // resume (FAILED/STOPPED/DONE are terminal; RUNNING needs no resume).
+  v1.post("/sessions/:id/resume", requireCap("computer:act"), (req: Request, res: Response) => {
+    const s = sessions.get(req.params["id"] as string);
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
+    if (s.status !== "PAUSED") {
+      res.status(409).json({ error: "illegal_transition", message: `only PAUSED sessions resume (status ${s.status})` });
+      return;
+    }
+    try {
+      s.sm.transition("RUNNING", "explicit resume");
+    } catch (err) {
+      res.status(409).json({ error: "illegal_transition", message: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    s.paused = false; s.status = "RUNNING"; s.updatedAt = nowIso();
+    persistSession(s);
+    try {
+      writeControlFlag(s.id, s.humanControl, false);
+    } catch { /* best effort */ }
     broadcast(s.id, { kind: "status", sessionId: s.id, status: s.status });
     res.json({ id: s.id, status: s.status });
   });
@@ -1219,6 +1585,7 @@ export function buildApp(): express.Express {
     try {
       provisioned = await provisionDriverVm(owner, body as Record<string, unknown>);
     } catch (err) {
+      bump("vm_provision_failed");
       res.status(500).json({ error: "vm_provision_failed", message: err instanceof Error ? err.message : String(err) });
       return;
     }
@@ -1385,6 +1752,7 @@ export function buildApp(): express.Express {
     if (denyIfNotOwner(v, req, res)) return;
     const drv = driverOf(v);
     if (!drv || drv.backend === "dev-framebuffer") {
+      bump("unsupported_action");
       res.status(501).json({ error: "unsupported_action", message: `${op} requires a driver-backed VM` });
       return;
     }
@@ -1450,7 +1818,7 @@ export function buildApp(): express.Express {
     if (drv && drv.backend !== "dev-framebuffer") {
       // REAL path: hypervisor screendump → perception → candidate regions.
       try {
-        const { runtime } = await runtimeFor(req, s);
+        const { runtime } = await runtimeForOwner(mgrOwner(req), s);
         let percept = await runtime.observe();
         // Lazy resolution enforcement: the guest negotiates its own initial
         // mode (GDM/Xorg) and may drift later (idle resets); whenever the
@@ -1480,23 +1848,14 @@ export function buildApp(): express.Express {
         s.updatedAt = nowIso();
         persistSession(s);
         // Cache perceived regions for point→region grounding at act time.
-        try {
-          const regs = (percept.regions ?? []) as Array<{ regionId?: unknown; bbox?: unknown; label?: unknown }>;
-          s.lastRegions = regs
-            .filter((r) => typeof r.regionId === "string" && Array.isArray(r.bbox) && r.bbox.length === 4)
-            .map((r) => ({
-              regionId: String(r.regionId),
-              bbox: (r.bbox as number[]).slice(0, 4) as [number, number, number, number],
-              label: typeof r.label === "string" ? String(r.label) : "",
-            }));
-        } catch { /* grounding cache is best-effort */ }
+        cachePerceivedRegions(s, percept.regions);
         // Stall annotation: consecutive byte-identical frames mean the guest
         // is producing no visual change (wedged boot, frozen compositor, or
         // a genuinely idle screen). Advisory only — the console surfaces it;
         // no state change is inferred from pixels alone.
         let stalled = false;
         try {
-          const sha = sha1hex(String(percept.pngBase64 ?? ""));
+          const sha = sha256hex(String(percept.pngBase64 ?? ""));
           if (s.lastPngSha !== undefined && s.lastPngSha === sha) {
             s.stallCount = (s.stallCount ?? 0) + 1;
           } else {
@@ -1524,6 +1883,14 @@ export function buildApp(): express.Express {
           message: err instanceof Error ? err.message : String(err),
         });
       }
+      return;
+    }
+    // Production never serves synthetic perception: a dev-backend session
+    // reaching this point in production means the boot gate was bypassed —
+    // refuse loudly instead of manufacturing evidence.
+    if (executionMode() === "production") {
+      bump("unsupported_action");
+      res.status(503).json({ error: "synthetic_backend_refused", message: "dev-framebuffer perception is refused in production" });
       return;
     }
     const percept = {
@@ -1559,7 +1926,7 @@ export function buildApp(): express.Express {
     let percept: { frameId: string; width: number; height: number; pngBase64: string; regions: unknown[] };
     try {
       if (drv && drv.backend !== "dev-framebuffer") {
-        const { runtime } = await runtimeFor(req, s);
+        const { runtime } = await runtimeForOwner(mgrOwner(req), s);
         const p = await runtime.observe();
         percept = {
           frameId: String((p as { frameId?: unknown }).frameId ?? s.lastFrame ?? `f-${s.seq}`),
@@ -1575,6 +1942,12 @@ export function buildApp(): express.Express {
       } else {
         // Dev backend: synthetic percept (empty pixels). Product inference
         // servers reject empty png_base64; that 400 surfaces as 502 below.
+        // In production the dev branch is refused outright (see observe).
+        if (executionMode() === "production") {
+          bump("unsupported_action");
+          res.status(503).json({ error: "synthetic_backend_refused", message: "dev-framebuffer suggest is refused in production" });
+          return;
+        }
         percept = {
           frameId: `f-${s.seq}`, width: 1920, height: 1080, pngBase64: "",
           regions: [{ regionId: "r-taskbar", bbox: [0, 1040, 1919, 1079], label: "taskbar", confidence: 0.99 }],
@@ -1592,38 +1965,21 @@ export function buildApp(): express.Express {
     const inferUrl = (process.env["INFERENCE_URL"] ?? "http://localhost:8090").replace(/\/$/, "");
     const timeoutMs = Math.max(100, Math.min(120000,
       Number(process.env["EVEX_INFERENCE_TIMEOUT_MS"] ?? 15000) || 15000));
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const r = await fetch(`${inferUrl}/infer`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          frame_id: percept.frameId, goal: s.goal,
-          width: percept.width, height: percept.height,
-          png_base64: percept.pngBase64, regions: percept.regions,
-          timeout_ms: timeoutMs,
-        }),
-        signal: ctrl.signal,
+      const out = await fetchInference({
+        frameId: percept.frameId, goal: s.goal,
+        width: percept.width, height: percept.height,
+        pngBase64: percept.pngBase64, regions: percept.regions,
       });
-      clearTimeout(timer);
-      if (!r.ok) {
-        res.status(502).json({ error: "inference_unavailable", detail: `inference HTTP ${r.status}` });
-        return;
-      }
-      const j = (await r.json().catch(() => null)) as Record<string, unknown> | null;
-      if (!j || typeof j !== "object" || !j["action"]) {
-        res.status(502).json({ error: "inference_unavailable", detail: "inference returned no action" });
-        return;
-      }
       res.json({
-        sessionId: s.id, frameId: percept.frameId, suggestion: j["action"],
-        model_id: j["model_id"] ?? "unknown", latency_ms: j["latency_ms"] ?? null,
-        degraded: j["degraded"] ?? true, inference: inferUrl,
+        sessionId: s.id, frameId: percept.frameId, suggestion: out.action,
+        model_id: out.modelId, model_version: out.modelVersion ?? null,
+        model_sha256: out.modelSha256 ?? null, latency_ms: out.latencyMs,
+        degraded: out.degraded, inference: inferUrl,
       });
     } catch (err) {
-      clearTimeout(timer);
-      const reason = err instanceof Error && err.name === "AbortError" ? "inference timeout" : (err instanceof Error ? err.message : String(err));
+      const reason = err instanceof Error ? err.message : String(err);
+      bump("inference_failed");
       res.status(502).json({ error: "inference_unavailable", detail: reason.slice(0, 200) });
     }
   });
@@ -1659,6 +2015,7 @@ export function buildApp(): express.Express {
     const realPath = Boolean(drv && drv.backend !== "dev-framebuffer");
     const current = realPath ? (s.lastFrame ?? `f-${s.seq}`) : `f-${s.seq}`;
     if (body.frameId !== undefined && body.frameId !== current) {
+      bump("stale_rejected");
       res.status(409).json({ error: "stale_perception", current });
       return;
     }
@@ -1676,7 +2033,7 @@ export function buildApp(): express.Express {
       // REAL path: verify → actuate through the computer runtime →
       // re-observe the outcome. Failures never advance the trajectory.
       try {
-        const resp = await realAct(req, s, v as VmRec, drv, body, action);
+        const resp = await realAct(mgrOwner(req), s, v as VmRec, drv, body, action);
         if (body.idempotencyKey) idemResponses.set(`${sessionId}:${body.idempotencyKey}`, resp);
         res.json(resp);
       } catch (err) {
@@ -1686,11 +2043,30 @@ export function buildApp(): express.Express {
           return;
         }
         if (err instanceof EveError && (err.code === "STALE_PERCEPTION" || err.code === "UNSUPPORTED")) {
+          bump(err.code === "STALE_PERCEPTION" ? "stale_rejected" : "unsupported_action");
           res.status(err.code === "STALE_PERCEPTION" ? 409 : 501).json({ error: err.code === "STALE_PERCEPTION" ? "stale_perception" : "unsupported_action", message: err.message });
           return;
         }
+        bump("actuation_failed");
         res.status(502).json({ error: "actuation_failed", message: err instanceof Error ? err.message : String(err) });
       }
+      return;
+    }
+    // Production never advances synthetic trajectories (see observe above).
+    if (executionMode() === "production") {
+      bump("unsupported_action");
+      res.status(503).json({ error: "synthetic_backend_refused", message: "dev-framebuffer actuation is refused in production" });
+      return;
+    }
+    // Dev backend honesty: the same shape validation the real path enforces.
+    // A pointer act without coordinates (or a text act without text) is a
+    // malformed action — 400 with no trajectory advance, on every backend.
+    if ((action.type === "click" || action.type === "double_click" || action.type === "move" || action.type === "drag" || action.type === "scroll") && !action.from) {
+      res.status(400).json({ error: "bad_request", message: `${action.type} requires x/y coordinates` });
+      return;
+    }
+    if ((action.type === "type" || action.type === "terminal" || action.type === "tool") && (action.text ?? "") === "") {
+      res.status(400).json({ error: "bad_request", message: `${action.type} requires text` });
       return;
     }
     s.seq += 1;
@@ -1731,6 +2107,7 @@ export function buildApp(): express.Express {
     s.humanControl = true; s.updatedAt = nowIso();
     persistSession(s);
     writeControlFlag(sessionId, true, s.paused);
+    bump("human_takeover");
     broadcast(sessionId, { kind: "takeover", sessionId });
     res.json({ sessionId, humanControl: true });
   });
@@ -1743,6 +2120,7 @@ export function buildApp(): express.Express {
     s.humanControl = false; s.updatedAt = nowIso();
     persistSession(s);
     writeControlFlag(sessionId, false, s.paused);
+    bump("human_release");
     broadcast(sessionId, { kind: "release", sessionId });
     res.json({ sessionId, humanControl: false });
   });
@@ -1769,37 +2147,82 @@ export function buildApp(): express.Express {
     const t = tasks.get(req.params["id"] as string);
     if (!t) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(t, req, res)) return;
-    t.status = "DONE";
-    t.result = { verdict: "pass", checkedAt: nowIso(), input: req.body ?? {} };
+    // Independent validation: a verdict is DERIVED from server-resolved
+    // trace evidence + oracle assertions + human judgments. Calling this
+    // endpoint never manufactures success — without evidence the result is
+    // INCONCLUSIVE or INVALID_EVIDENCE, never PASS.
+    const parsed = ValidateRequest.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "evidence_required", message: "validation requires an evidence bundle", issues: parsed.error.issues });
+      return;
+    }
+    const ev = parsed.data.evidence;
+    const s = sessions.get(ev.sessionId);
+    if (!s) { res.status(404).json({ error: "not_found", message: "evidence session unknown" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
+    const steps = mergedTraceSteps(ev.sessionId);
+    const replay = verifyReplay(steps, s.seq + 1);
+    const chained = steps.length > 0 && steps.every(
+      (st) => /^[0-9a-f]{64}$/.test(String(st["digest"] ?? "")) &&
+        (/^[0-9a-f]{64}$/.test(String(st["prevDigest"] ?? "")) || /^[0-9a-f]{64}$/.test(String(st["prev"] ?? ""))),
+    );
+    const byId = new Map(steps.map((st) => [String(st["step_id"] ?? ""), st]));
+    const resolvedSteps = ev.stepIds
+      .map((id) => byId.get(id))
+      .filter((st): st is Record<string, unknown> => st !== undefined)
+      .map((st) => ({
+        step_id: String(st["step_id"] ?? ""),
+        seq: Number(st["seq"] ?? 0),
+        outcome: typeof st["outcome"] === "string" ? (st["outcome"] as string) : undefined,
+        grounding: (st["grounding"] ?? undefined) as { verified?: boolean } | undefined,
+        verification: (st["verification"] ?? undefined) as { passed?: boolean } | undefined,
+        raw: st,
+      }));
+    const judgments = ev.judgmentIds
+      .map((id) => judgmentRecs.get(id))
+      .filter((j): j is JudgmentRec => j !== undefined)
+      .map((j) => ({ id: j.id, stepId: j.stepId, reviewer: j.reviewer, reasonable: j.reasonable, targetCorrect: j.targetCorrect }));
+    const result = validateEvidence({
+      taskId: t.id, evidence: ev, resolvedSteps,
+      replay: { verdict: replay.verdict, issues: replay.issues, chained },
+      judgments, traceChained: chained,
+    });
+    t.result = result;
+    if (result.verdict === "PASS" || result.verdict === "FAILED") t.status = "DONE";
+    bump(result.verdict === "PASS" ? "validation_pass" : result.verdict === "FAILED" ? "validation_failed" : result.verdict === "INCONCLUSIVE" ? "validation_inconclusive" : "validation_invalid");
     persistTask(t);
-    res.json(t);
+    res.json({ task: { id: t.id, status: t.status }, validation: result });
   });
 
   // ── trace / replay / report ──
+  // Owner enforcement is unconditional: an unknown session fails closed
+  // (404) even when file-backed steps exist — legacy/unowned records never
+  // become a cross-tenant read path (including post-restart, when memory
+  // may lag the files).
   v1.get("/trace/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
-    if (s && denyIfNotOwner(s, req, res)) return;
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
     const steps = mergedTraceSteps(id, 2000);
-    if (steps.length === 0 && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
     res.json({ sessionId: id, steps });
   });
   v1.post("/replay/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
-    if (s && denyIfNotOwner(s, req, res)) return;
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
     // Merge worker/file-appended steps missing from memory (dedupe by step_id).
     const steps = mergedTraceSteps(id);
-    if (steps.length === 0 && !sessions.has(id)) { res.status(404).json({ error: "not_found" }); return; }
-    const { replayed, verdict, issues } = verifyReplay(steps);
+    const { replayed, verdict, issues } = verifyReplay(steps, s.seq + 1);
     res.json({ sessionId: id, replayed, verdict, issues });
   });
   v1.get("/report/:sessionId", requireCap("trace:read"), (req: Request, res: Response) => {
     const id = req.params["sessionId"] as string;
     const s = sessions.get(id);
-    if (s && denyIfNotOwner(s, req, res)) return;
+    if (!s) { res.status(404).json({ error: "not_found" }); return; }
+    if (denyIfNotOwner(s, req, res)) return;
     const steps = mergedTraceSteps(id);
-    if (!s && steps.length === 0) { res.status(404).json({ error: "not_found" }); return; }
     res.json({
       sessionId: id, goal: s?.goal ?? "", status: s?.status ?? "UNKNOWN",
       steps: steps.length, success: (s?.status ?? "") !== "FAILED",
@@ -1857,7 +2280,12 @@ export function buildApp(): express.Express {
     }
     // Blind-review unlock path: a reviewId pins this judgment to a pending
     // server-side blind review. Double-submit of the same reviewId → 409.
+    // Owner enforcement: the owning session must exist and belong to the
+    // caller. Review-bound judgments inherit the review's session; direct
+    // judgments carry sessionId or are resolved by step scan. Unknown
+    // sessions/steps fail closed (404) — no orphan or cross-tenant judgments.
     let review: ReviewRec | undefined;
+    let judgmentSessionId: string | undefined;
     if (body.reviewId) {
       review = reviews.get(body.reviewId);
       if (!review) { res.status(404).json({ error: "not_found", message: "no such review" }); return; }
@@ -1869,6 +2297,30 @@ export function buildApp(): express.Express {
         res.status(400).json({ error: "bad_request", message: "stepId does not match the blind review" });
         return;
       }
+      judgmentSessionId = review.sessionId;
+    } else if (body.sessionId) {
+      judgmentSessionId = body.sessionId;
+    } else {
+      judgmentSessionId = findSessionForStep(body.stepId);
+      if (!judgmentSessionId) {
+        res.status(404).json({ error: "not_found", message: "step is unknown to every live session" });
+        return;
+      }
+    }
+    const js = sessions.get(judgmentSessionId);
+    if (!js) { res.status(404).json({ error: "not_found", message: "owning session unknown" }); return; }
+    if (denyIfNotOwner(js, req, res)) return;
+    // The judged step must exist in the owning session's trace: judgments
+    // on phantom steps are evidence failure, not verdicts.
+    try {
+      const steps = mergedTraceSteps(judgmentSessionId, 2000);
+      if (!steps.some((st) => String(st["step_id"] ?? "") === body.stepId)) {
+        res.status(404).json({ error: "not_found", message: "step is unknown to the owning session" });
+        return;
+      }
+    } catch {
+      res.status(404).json({ error: "not_found", message: "owning session trace unreadable" });
+      return;
     }
     const key = `${body.stepId}:${reviewer}`;
     if (judgmentKeys.has(key)) {
@@ -1877,8 +2329,14 @@ export function buildApp(): express.Express {
     }
     judgmentKeys.add(key);
     const id = uid("judg");
+    const rec: JudgmentRec = {
+      id, stepId: body.stepId, sessionId: judgmentSessionId,
+      reviewer, reasonable: body.reasonable === true, targetCorrect: body.targetCorrect === true,
+      at: nowIso(),
+    };
+    judgmentRecs.set(id, rec);
     try {
-      stor?.store.put("judgments", { id, ...body, reviewer, at: nowIso(), blind: true });
+      stor?.store.put("judgments", { id, ...body, reviewer, sessionId: judgmentSessionId, at: rec.at, blind: true });
     } catch { /* ignore */ }
     if (review) {
       review.status = "complete";
@@ -1899,6 +2357,202 @@ export function buildApp(): express.Express {
   });
 
   // ── benchmarks / models ──
+  // RealAgentAdapter: every benchmark task executes against a REAL
+  // session/VM through the same observe → infer → act path as production
+  // traffic (observe via ComputerRuntime, action from the inference plane,
+  // actuation via realAct with grounding + stale enforcement + evidence
+  // steps). There is no synthetic inline agent: benchmark numbers come
+  // from executed trajectories scored by the IndependentEvaluator, or the
+  // run reports invalid/inconclusive counts instead of numbers.
+  async function runRealBenchTask(
+    owner: string,
+    mod: BenchMod,
+    task: {
+      benchTaskId: string; category: string; goal: string; split: string;
+      seed: number; maxSteps: number; stepsOptimal: number; successSignals: string[];
+    },
+    modelInfo: InferenceModelInfo | null,
+  ): Promise<Record<string, unknown>> {
+    const modelIdentity = modelInfo
+      ? {
+        model_id: modelInfo.model_id,
+        ...(modelInfo.model_version !== undefined ? { model_version: modelInfo.model_version } : {}),
+        model_sha256: modelInfo.model_sha256 ?? null,
+        degraded: modelInfo.degraded,
+      }
+      : null;
+    const invalid = (): Record<string, unknown> => mod.evaluateBenchTask({
+      task, steps: [], evidenceDigests: [],
+      agentIdentity: "evex-real-agent", modelIdentity, backendSynthetic: true,
+    }) as Record<string, unknown>;
+    const spec = { image: "ubuntu-desktop-v1", width: 1280, height: 800 };
+    let provisioned: { driverVmId: string; backend: string };
+    try {
+      provisioned = await provisionDriverVm(owner, spec as Record<string, unknown>);
+    } catch {
+      return invalid();
+    }
+    const sid = uid("sess");
+    const vmId = uid("vm");
+    const rec: VmRec = {
+      id: vmId, spec: spec as Record<string, unknown>, state: "READY", createdAt: nowIso(),
+      snapshots: [], owner, driverVmId: provisioned.driverVmId, backend: provisioned.backend,
+    };
+    vms.set(vmId, rec);
+    persistVm(rec);
+    const sm = new StateMachine<string>("READY", SESSION_SM);
+    const srec: SessionRec = {
+      id: sid, taskId: task.benchTaskId, goal: task.goal, vmId,
+      status: "RUNNING", seq: 0, paused: false, humanControl: false,
+      createdAt: nowIso(), updatedAt: nowIso(), sm, owner,
+    };
+    try { sm.transition("RUNNING", "benchmark task start"); } catch { /* already */ }
+    sessions.set(sid, srec);
+    traces.set(sid, []);
+    persistSession(srec);
+    appendStep(sid, {
+      session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: 0,
+      timestamp: nowIso(), actor: "system", vm_state_before: "READY", screen_before: "",
+      goal: task.goal, candidate_actions: [],
+      provenance: { source: "system", channel: "api-bench", at: nowIso() },
+      model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+    });
+    const realPath = provisioned.backend !== "dev-framebuffer";
+    const drv = { driverVmId: provisioned.driverVmId, backend: provisioned.backend };
+    let lastModel = modelIdentity;
+    let terminated = false;
+    try {
+      const maxSteps = Math.min(Math.max(task.maxSteps, 1), 200);
+      for (let i = 0; i < maxSteps && !terminated; i += 1) {
+        if (effectiveHumanControl(srec)) break;
+        if (!realPath) {
+          // Dev backend: no pixels exist. Advance with an explicitly
+          // synthetic step so the loop shape is exercised; the evaluator
+          // scores the trajectory invalid (counted, never scored).
+          srec.seq += 1;
+          srec.lastFrame = `f-${srec.seq}`;
+          srec.updatedAt = nowIso();
+          persistSession(srec);
+          appendStep(sid, {
+            session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+            timestamp: nowIso(), actor: "eve-agent", vm_state_before: "RUNNING", screen_before: `f-${srec.seq - 1}`,
+            goal: task.goal, candidate_actions: [{ type: "observe", confidence: 0.5 }],
+            screen_after: `f-${srec.seq}`, outcome: "acted", synthetic: true,
+            provenance: { source: "evaluator-tool", channel: "api-bench:dev-synthetic", at: nowIso() },
+            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+          });
+          continue;
+        }
+        let frameId: string;
+        let percept: { frameId: string; width: number; height: number; pngBase64: string; regions: unknown };
+        try {
+          const { runtime } = await runtimeForOwner(owner, srec);
+          const p = await runtime.observe();
+          frameId = String((p as { frameId?: unknown }).frameId ?? "");
+          if (!frameId) throw new EveError("OBSERVE_FAILED", "runtime returned no frame");
+          percept = {
+            frameId,
+            width: Number((p as { width?: unknown }).width ?? 0) || 0,
+            height: Number((p as { height?: unknown }).height ?? 0) || 0,
+            pngBase64: String((p as { pngBase64?: unknown }).pngBase64 ?? ""),
+            regions: (p as { regions?: unknown }).regions ?? [],
+          };
+          srec.lastFrame = frameId;
+          srec.updatedAt = nowIso();
+          persistSession(srec);
+          cachePerceivedRegions(srec, percept.regions);
+        } catch (err) {
+          if (err instanceof EveError && isVmLostCode(err.code)) {
+            markSessionVmLost(srec, `${err.code}: ${err.message}`);
+          } else {
+            srec.seq += 1;
+            appendStep(sid, {
+              session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+              timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: srec.lastFrame ?? "",
+              goal: task.goal, candidate_actions: [], outcome: "observe-failed",
+              provenance: { source: "system", channel: "api-bench", at: nowIso() },
+              model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+            });
+          }
+          break;
+        }
+        let inf: InferenceResult;
+        try {
+          inf = await fetchInference({ ...percept, goal: task.goal });
+        } catch {
+          srec.seq += 1;
+          appendStep(sid, {
+            session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+            timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: frameId,
+            goal: task.goal, candidate_actions: [], outcome: "inference-failed",
+            provenance: { source: "system", channel: "api-bench", at: nowIso() },
+            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+          });
+          break;
+        }
+        lastModel = {
+          model_id: inf.modelId,
+          ...(inf.modelVersion !== undefined ? { model_version: inf.modelVersion } : {}),
+          model_sha256: inf.modelSha256 ?? null,
+          degraded: inf.degraded,
+        };
+        const a = inf.action;
+        const pt = (a["to"] ?? a["from"]) as { x?: unknown; y?: unknown } | undefined;
+        const action = {
+          type: String(a["type"] ?? "observe"),
+          text: typeof a["text"] === "string" ? (a["text"] as string) : undefined,
+          keys: Array.isArray(a["keys"]) ? (a["keys"] as string[]) : undefined,
+          from: pt !== undefined && typeof pt.x === "number" && typeof pt.y === "number"
+            ? { x: pt.x as number, y: pt.y as number }
+            : undefined,
+          ms: typeof a["ms"] === "number" ? (a["ms"] as number) : undefined,
+          confidence: typeof a["confidence"] === "number" ? (a["confidence"] as number) : 0.5,
+        };
+        try {
+          const resp = await realAct(owner, srec, rec, drv, { frameId, confidence: action.confidence }, action) as Record<string, unknown>;
+          if (resp["terminated"] === true) terminated = true;
+        } catch (err) {
+          if (err instanceof EveError && err.code === "STALE_PERCEPTION") continue;
+          if (err instanceof EveError && isVmLostCode(err.code)) {
+            markSessionVmLost(srec, `${err.code}: ${err.message}`);
+            break;
+          }
+          srec.seq += 1;
+          appendStep(sid, {
+            session_id: sid, task_id: task.benchTaskId, step_id: uid("step"), seq: srec.seq,
+            timestamp: nowIso(), actor: "system", vm_state_before: "RUNNING", screen_before: frameId,
+            goal: task.goal, candidate_actions: [], outcome: "actuation-failed",
+            provenance: { source: "system", channel: "api-bench", at: nowIso() },
+            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+          });
+          break;
+        }
+      }
+    } finally {
+      // Bound benchmark resources: destroy the driver VM, stop the session.
+      try {
+        const { mgr } = await vmManager();
+        await mgr.destroy(drv.driverVmId, owner);
+      } catch { /* best effort */ }
+      closeRuntime(sid);
+      try { srec.sm.transition("STOPPED", "benchmark task complete"); } catch { /* already terminal */ }
+      srec.status = "STOPPED";
+      srec.updatedAt = nowIso();
+      persistSession(srec);
+    }
+    const steps = mergedTraceSteps(sid);
+    const last = steps.length > 0 ? steps[steps.length - 1] : undefined;
+    const headDigest = last !== undefined ? String(last["digest"] ?? "") : "";
+    return mod.evaluateBenchTask({
+      task,
+      steps,
+      evidenceDigests: /^[0-9a-f]{64}$/.test(headDigest) ? [headDigest] : [],
+      agentIdentity: "evex-real-agent",
+      modelIdentity: lastModel,
+      backendSynthetic: !realPath,
+    }) as Record<string, unknown>;
+  }
+
   v1.post("/benchmarks", requireCap("task:execute"), async (req: Request, res: Response) => {
     const body = validate(BenchmarkStart, req.body, res);
     if (!body) return;
@@ -1937,45 +2591,73 @@ export function buildApp(): express.Express {
       }
       const selected = picked.slice(0, Math.min(Math.max(body.size, 1), 200));
       const splits = [...new Set(selected.map((t) => t.split))];
-      // Deterministic inline agent: seeded by task.seed, returns schema-valid steps.
-      const agentFn = async (task: {
-        benchTaskId: string; goal: string; seed: number; maxSteps: number; stepsOptimal: number;
-      }): Promise<Record<string, unknown>> => {
-        const rand = prng(task.seed);
-        const n = Math.max(1, Math.min(task.maxSteps, task.stepsOptimal + Math.floor(rand() * 3)));
-        const steps: Array<Record<string, unknown>> = [];
-        for (let i = 0; i < n; i += 1) {
-          steps.push({
-            session_id: `bench-${task.benchTaskId}`, task_id: task.benchTaskId, step_id: `bstep-${i}`,
-            seq: i, timestamp: nowIso(), actor: "eve-agent",
-            vm_state_before: "RUNNING", screen_before: `f-${i}`,
-            goal: task.goal,
-            candidate_actions: [{ type: "observe", confidence: 0.9 }],
-            provenance: { source: "evaluator-tool", channel: "bench-inline", at: nowIso() },
-            model_version: "evex-1", environment_version: "ubuntu-desktop-v1",
+      const owner = ownerOf(req);
+      let agentFn: (task: unknown) => Promise<Record<string, unknown>>;
+      let agentIdentity = "evex-real-agent";
+      let testOnly = false;
+      let modelIdentity: InferenceModelInfo | null = null;
+      if (body.agent === "mock-test-only") {
+        // Explicit harness double: requires testOnly:true, and the record
+        // is stamped so production consumers refuse it.
+        if (body.testOnly !== true) {
+          res.status(400).json({
+            error: "mock_agent_requires_test_only",
+            message: "mock-test-only agent requires testOnly:true — production benchmarks refuse mock evidence",
           });
+          return;
         }
-        const success = rand() < 0.6;
-        return {
-          success,
-          actionSuccesses: success ? n : Math.max(0, n - 1), actionTotal: n,
-          groundedCorrect: success ? n : Math.max(0, n - 1), groundedTotal: n,
-          stepsUsed: n, predictionsCorrect: n, predictionsTotal: n,
-          recovered: 0, recoveryOpportunities: 0,
-          humanAgreements: 0, humanJudged: 0,
-          unsafe: false, takeover: false,
-          latenciesMs: steps.map((_, i) => 100 + ((task.seed + i * 37) % 400)),
-          steps,
-        };
-      };
-      const record = await mod.runBench(selected, agentFn, { splits, runId: id });
-      const full: Record<string, unknown> = { id, name: body.name, seed: body.seed, ...record };
+        if (typeof mod.mockAgentAdapter !== "function") {
+          res.status(503).json({ error: "benchmark-unavailable" });
+          return;
+        }
+        testOnly = true;
+        agentIdentity = "mock-test-only";
+        agentFn = mod.mockAgentAdapter(body.seed, "mock-test-only") as (task: unknown) => Promise<Record<string, unknown>>;
+      } else {
+        if (body.testOnly === true) {
+          res.status(400).json({
+            error: "contradictory_request",
+            message: "testOnly:true is only meaningful with agent mock-test-only",
+          });
+          return;
+        }
+        if (typeof mod.evaluateBenchTask !== "function") {
+          res.status(503).json({ error: "benchmark-unavailable" });
+          return;
+        }
+        modelIdentity = await fetchModelInfo();
+        const vmImageDigest = typeof process.env["EVEX_BASE_IMAGE_SHA256"] === "string" && process.env["EVEX_BASE_IMAGE_SHA256"]
+          ? String(process.env["EVEX_BASE_IMAGE_SHA256"])
+          : null;
+        agentFn = async (task: unknown): Promise<Record<string, unknown>> =>
+          runRealBenchTask(owner, mod, task as Parameters<typeof runRealBenchTask>[2], modelIdentity);
+      }
+      const record = await mod.runBench(selected, agentFn, {
+        splits, runId: id, testOnly, agentIdentity,
+        modelIdentity: modelIdentity
+          ? {
+            model_id: modelIdentity.model_id,
+            ...(modelIdentity.model_version !== undefined ? { model_version: modelIdentity.model_version } : {}),
+            model_sha256: modelIdentity.model_sha256 ?? null,
+            degraded: modelIdentity.degraded,
+          }
+          : null,
+        environmentIdentity: `backend:${process.env["VM_BACKEND"] ?? "auto"} node:${process.version}`,
+        vmImageDigest: typeof process.env["EVEX_BASE_IMAGE_SHA256"] === "string" && process.env["EVEX_BASE_IMAGE_SHA256"]
+          ? String(process.env["EVEX_BASE_IMAGE_SHA256"])
+          : null,
+        sourceCommit: String(RELEASE.commit ?? ""),
+        sourceTree: String(RELEASE.tree ?? ""),
+      });
+      const full: Record<string, unknown> = { id, name: body.name, seed: body.seed, owner, ...record };
       benchmarks.set(id, full);
+      bump("benchmark_runs");
       try {
-        stor?.store.put("benchmarks", { id, name: body.name, status: "DONE", at: nowIso(), taskCount: selected.length, owner: ownerOf(req) });
+        stor?.store.put("benchmarks", { id, name: body.name, status: "DONE", at: nowIso(), taskCount: selected.length, owner });
       } catch { /* ignore */ }
       res.status(201).json(full);
     } catch (err) {
+      bump("benchmark_failures");
       log("error", "benchmark run failed", { requestId, msg: err instanceof Error ? err.message : String(err) });
       res.status(500).json({ error: "internal", requestId });
     }
@@ -1989,11 +2671,32 @@ export function buildApp(): express.Express {
     }
     res.json(b);
   });
-  v1.get("/models/status", requireCap("computer:observe"), (_req: Request, res: Response) => {
+  v1.get("/models/status", requireCap("computer:observe"), async (_req: Request, res: Response) => {
+    // Live probe: reachable reflects an actual /ready round-trip, and the
+    // model identity is read from the plane — never asserted by config.
+    const url = inferenceUrl();
+    let reachable = false;
+    let ready: Record<string, unknown> | null = null;
+    let model: InferenceModelInfo | null = null;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const r = await fetch(`${url}/ready`, { signal: ctrl.signal });
+        reachable = r.ok;
+        ready = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch { /* unreachable: reported, not thrown */ }
+    if (reachable) model = await fetchModelInfo();
     res.json({
-      inferenceUrl: process.env["INFERENCE_URL"] ?? "http://localhost:8090",
-      model: process.env["EVEX_MODEL"] ?? "evex-cua-1",
-      reachable: false,
+      inferenceUrl: url,
+      model: model?.model_id ?? process.env["EVEX_MODEL"] ?? "evex-cua-1",
+      reachable,
+      ready: ready?.["ready"] ?? false,
+      degraded: ready?.["degraded"] ?? model?.degraded ?? true,
+      modelIdentity: model,
       at: nowIso(),
     });
   });
@@ -2027,6 +2730,39 @@ export async function startApi(port?: number): Promise<Server> {
   } else {
     log("info", "persistence: file-primary (EVEX_REQUIRE_SERVICES unset)");
   }
+  // Production boot gate (fail closed): EVEX_MODE=production refuses to
+  // serve unless the full production posture evaluates production-safe
+  // (strong token, services reachable, quotas, safe backend, TLS sense).
+  // No silent dev fallback, no known default credentials, ever.
+  if (executionMode() === "production") {
+    if (!sec) {
+      throw new Error("production startup refused: security package unavailable (no fail-open dev auth)");
+    }
+    const statuses = await probeServices();
+    const required = (process.env["EVEX_REQUIRE_SERVICES"] ?? "")
+      .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+      .map((s) => (s === "minio" || s === "s3" || s === "garage" ? "object" : s));
+    const maxSessions = process.env["EVEX_MAX_SESSIONS"] !== undefined ? Number(process.env["EVEX_MAX_SESSIONS"]) : undefined;
+    const verdict = sec.evaluateProduction({
+      authToken: process.env["EVEX_AUTH_TOKEN"] ?? "",
+      corsOrigins: process.env["EVEX_CORS_ORIGINS"] ?? "",
+      requireServices: required,
+      serviceStatus: statuses,
+      maxSessions: Number.isFinite(maxSessions) ? maxSessions : undefined,
+      vmBackend: process.env["VM_BACKEND"] ?? "auto",
+      publicUrl: process.env["EVEX_PUBLIC_URL"] ?? "",
+      objectEndpoint: process.env["OBJECT_ENDPOINT"] ?? "",
+      mode: "production",
+      filePrimaryAck: (process.env["EVEX_FILE_PRIMARY_ACK"] ?? "") === "1",
+    });
+    for (const f of verdict.findings) {
+      log(f.status === "fail" ? "error" : "info", `production gate: ${f.name}=${f.status}`, { detail: f.detail });
+    }
+    if (verdict.verdict !== "production-safe") {
+      throw new Error("production startup refused: configuration is development-only (see production gate findings above)");
+    }
+    log("info", "production gate passed: production-safe posture");
+  }
   const app = buildApp();
   const srv = createServer(app);
   srv.headersTimeout = 60_000;
@@ -2039,6 +2775,11 @@ export async function startApi(port?: number): Promise<Server> {
   srv.on("upgrade", (req, socket, head) => {
     const url = String(req.url ?? "");
     if (url === "/v1/stream" || url.startsWith("/v1/stream?")) {
+      const ctx = upgradeAuth(req as unknown as { headers: Record<string, string | string[] | undefined>; url?: string });
+      if (!ctx) {
+        try { socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         ws.send(JSON.stringify({ kind: "hello", at: nowIso(), hint: "connect to /v1/stream/:sessionId" }));
       });
@@ -2049,14 +2790,41 @@ export async function startApi(port?: number): Promise<Server> {
       try { socket.destroy(); } catch { /* ignore */ }
       return;
     }
+    // Session streams require the same auth as HTTP + ownership of the
+    // session. Unknown sessions fail closed before the upgrade completes.
+    const ctx = upgradeAuth(req as unknown as { headers: Record<string, string | string[] | undefined>; url?: string });
+    if (!ctx) {
+      try { socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
+    const sessionId = m[1] as string;
+    const s = sessions.get(sessionId);
+    if (!s) {
+      try { socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
+    if (s.owner && s.owner !== `${ctx.tenant}:${ctx.user}` && ctx.role !== "admin" && !(ctx.capabilities.includes("*"))) {
+      try { socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
+    // Resource bound: per-session and global WS caps fail predictably (429)
+    // instead of accumulating unbounded sockets (flood discipline).
+    const maxPerSession = Number(process.env["EVEX_MAX_WS_PER_SESSION"] ?? 32);
+    const maxTotal = Number(process.env["EVEX_MAX_WS_CONNECTIONS"] ?? 1024);
+    let totalWs = 0;
+    for (const set of streams.values()) totalWs += set.size;
+    const sessionWs = streams.get(sessionId)?.size ?? 0;
+    if (sessionWs >= maxPerSession || totalWs >= maxTotal) {
+      try { socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 5\r\n\r\n"); socket.destroy(); } catch { /* ignore */ }
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const sessionId = m[1] as string;
       let set = streams.get(sessionId);
       if (!set) { set = new Set(); streams.set(sessionId, set); }
       set.add(ws);
       ws.send(JSON.stringify({ kind: "hello", sessionId, at: nowIso() }));
-      const s = sessions.get(sessionId);
-      if (s) ws.send(JSON.stringify(syntheticFrame(sessionId, s.seq)));
+      const cur0 = sessions.get(sessionId);
+      if (cur0) ws.send(JSON.stringify(syntheticFrame(sessionId, cur0.seq)));
       const timer = setInterval(() => {
         try {
           const cur = sessions.get(sessionId);

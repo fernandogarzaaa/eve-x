@@ -14,13 +14,24 @@ at minimum `skill.json` (manifest) and an entrypoint markdown file (default
   "entrypoint": "SKILL.md",
   "tools": ["computer.observe", "computer.act"],
   "permissions": ["computer:observe", "computer:act"],
-  "mcpVersion": "mcp/1"
+  "mcpVersion": "evex-tools/1"
 }
 ```
 
 Validated by the `SkillManifest` zod schema: name/version/description
-required, `tools` and `permissions` default to empty, entrypoint defaults to
-`SKILL.md`.
+required (name must be lowercase alphanumeric + hyphens AND match its
+directory), `tools` and `permissions` default to empty, entrypoint defaults
+to `SKILL.md`.
+
+The entrypoint must open with YAML frontmatter carrying at least `name` +
+`description`, with `name` agreeing with the manifest:
+
+```markdown
+---
+name: eve-computer
+description: Drive an EVE-X isolated desktop over the computer-use loop
+---
+```
 
 ## Install
 
@@ -47,7 +58,9 @@ const v = verifySkill("/home/op/.config/opencode/skills/pdf-triage");
 ```
 
 - **Discovery check** — manifest re-parses at the installed path and the
-  entrypoint exists; the platform is inferred from the path suffix.
+  entrypoint exists; the manifest name must equal the directory name; the
+  entrypoint frontmatter must carry name + description agreeing with the
+  manifest; the platform is inferred from the path suffix.
 - **Smoke test** — entrypoint is ≥ 64 chars with at least one markdown
   heading, and every tool named in the manifest is mentioned in the
   entrypoint body (the wiring contract the runtime relies on). No agent is

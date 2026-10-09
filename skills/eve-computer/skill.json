@@ -1,0 +1,9 @@
+{
+  "name": "eve-computer",
+  "version": "1.0.0",
+  "description": "Drive an EVE-X isolated desktop over the computer-use loop: observe, ground, act, verify",
+  "entrypoint": "SKILL.md",
+  "tools": ["eve_computer_observe", "eve_computer_act", "eve_trace_get", "eve_replay"],
+  "permissions": ["computer:observe", "computer:act", "trace:read"],
+  "mcpVersion": "evex-tools/1"
+}

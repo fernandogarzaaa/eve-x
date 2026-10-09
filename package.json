@@ -1,6 +1,6 @@
 {
   "name": "eve-x",
-  "version": "1.0.3",
+  "version": "1.1.1",
   "description": "EVE-X: isolated-VM computer-use experience validation platform",
   "license": "MIT",
   "type": "module",
@@ -13,10 +13,11 @@
     "prebuild": "node scripts/gen-release-identity.mjs",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-static.mjs",
     "typecheck": "node scripts/gen-release-identity.mjs && tsc --noEmit",
-    "lint": "node scripts/lint.mjs",
+    "lint": "node scripts/lint.mjs && node scripts/honesty-gates.mjs",
     "pretest": "node scripts/gen-release-identity.mjs && tsc -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
     "test:all": "node scripts/run-tests.mjs",
+    "ml:test": "node scripts/ml-selftest.mjs",
     "doctor": "node dist/apps/cli/src/index.js doctor",
     "server": "node dist/apps/api/src/index.js",
     "worker": "node dist/apps/worker/src/index.js",
@@ -24,16 +25,19 @@
     "cli": "node dist/apps/cli/src/index.js",
     "benchmark": "node dist/apps/cli/src/index.js benchmark run",
     "security:audit": "node scripts/security-audit.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "package": "node scripts/package-release.mjs",
-    "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs"
+    "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs && node scripts/verify-release.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.0",
+    "@modelcontextprotocol/node": "^2.1.1",
+    "@modelcontextprotocol/server": "^2.3.1",
     "express": "^4.19.2",
     "ws": "^8.18.0",
-    "zod": "^3.23.8"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.0",
     "@types/ws": "^8.5.10",

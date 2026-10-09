@@ -17,13 +17,17 @@ blinded human review, and live sessions can escalate to a human operator.
 
 ## Takeover
 
-- `POST /v1/sessions/{sessionId}/takeover` with `{stepId, reason}` (MCP tool
-  `human.takeover`) pauses the agent and pages an operator.
+- `POST /v1/human/takeover` with `{sessionId}` (MCP tool
+  `eve_human_takeover`) pauses the agent and pages an operator; acts during
+  takeover are 409 `human_control` until `POST /v1/human/release`.
 - Approval-gated categories (`destructive`, `purchase`, `data-export` by
   default) escalate automatically instead of executing.
 - Takeover sessions record `human_intervention: true` on subsequent steps so
   the dataset pipeline can treat them as supervised corrections rather than
   autonomous behavior.
+- Judgments bind to owned sessions/steps server-side: phantom steps 404,
+  double-submits 409, cross-tenant judgments 403. Direct (non-blind)
+  judgments are allowed but never unlock blinded fields.
 
 ## Reviewer guidance
 
