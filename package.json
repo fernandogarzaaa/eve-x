@@ -28,16 +28,16 @@
     "release": "node scripts/gen-release-manifest.mjs && node scripts/gen-provenance.mjs && node scripts/package-release.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "express": "^5.2.1",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
-    "@types/node": "^20.11.0",
+    "@types/node": "^26.6.4",
     "@types/ws": "^8.5.10",
-    "typescript": "^5.4.0"
+    "typescript": "^7.0.2"
   },
   "bin": {
     "eve-x": "dist/apps/cli/src/index.js"
