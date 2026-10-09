@@ -3,6 +3,6 @@
 # NOTE: `python ml/training/train.py --smoke` needs NOTHING below — the smoke
 # path is pure stdlib and runs without installing this file.
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.0,<3.0
+torch>=2.14.1+cpu,<3.0
 numpy>=2.5.3,<3.0
-pillow>=10.0,<12.0
+pillow>=12.3.0,<13.0
