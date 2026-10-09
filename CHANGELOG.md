@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Dependabot: weekly update checks for npm, the `ml/` Python requirements, Docker base images (`infra/docker`, `infra/qualification`) and GitHub Actions.
+
 ## EVE-X 1.0.3
 
 - Advisory inference loop: `POST /v1/computer/:id/suggest` proposes an
