@@ -3,7 +3,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promises as fs } from "node:fs";
-import { join, normalize, relative, resolve, sep, basename, dirname } from "node:path";
+import { join, normalize, relative, resolve, sep, basename, dirname, isAbsolute } from "node:path";
 import { z } from "zod";
 import { EveError, nowIso } from "../../core/src/index.js";
 
@@ -214,10 +214,16 @@ export async function canonicalInsideRoot(fsRoot: string, p: string): Promise<st
   } catch {
     throw new EveError("FS_JAIL_BROKEN", "Guest fs root is unreachable");
   }
-  const rel = relative(rootReal, lexical);
-  if (rel.startsWith("..") || resolve(rootReal, rel) !== lexical) {
+  // Take the relative path against the root as given (the same form the
+  // lexical gate used), then rebase it onto the canonical root. Comparing
+  // the lexical path against realpath(root) directly breaks whenever the
+  // root spelling differs from its canonical form (Windows 8.3 short names
+  // such as RUNNER~1, macOS /var -> /private/var) and refuses every path.
+  const rel = relative(normalize(fsRoot), lexical);
+  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
     throw new EveError("FS_ESCAPE", "Path escapes guest fs root");
   }
+  const canonical = rel.length > 0 ? join(rootReal, rel) : rootReal;
   // Walk existing prefixes; every one must be a non-symlink. The walk
   // stops at the first missing component (create path); the verified
   // prefix chain plus the no-follow open below carry the guarantee.
@@ -246,7 +252,7 @@ export async function canonicalInsideRoot(fsRoot: string, p: string): Promise<st
       throw new EveError("FS_ESCAPE", "Path traverses a non-directory — refusing");
     }
   }
-  return lexical;
+  return canonical;
 }
 
 async function recheckContainment(fsRoot: string, full: string): Promise<void> {
