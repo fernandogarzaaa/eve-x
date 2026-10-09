@@ -241,7 +241,7 @@ const REDACTED = "***REDACTED***";
 
 /** Strip secret-bearing vars before they cross into the guest environment. */
 export function scrubEnv(envInput: unknown): ScrubReport {
-  const env = z.record(z.string()).parse(envInput);
+  const env = z.record(z.string(), z.string()).parse(envInput);
   const clean: Record<string, string> = {};
   const redacted: string[] = [];
   for (const [k, v] of Object.entries(env)) {

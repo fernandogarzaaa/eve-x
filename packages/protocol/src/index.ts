@@ -105,7 +105,12 @@ export const TaskSpec = z.object({
     allowExternalComms: z.boolean().default(false),
     allowCredentialUse: z.boolean().default(false),
     requireApprovalFor: z.array(z.string()).default(["destructive","purchase","data-export"]),
-  }).default({}),
+  }).default({
+    allowDestructive: false,
+    allowExternalComms: false,
+    allowCredentialUse: false,
+    requireApprovalFor: ["destructive","purchase","data-export"],
+  }),
 });
 export type TaskSpec = z.infer<typeof TaskSpec>;
 
