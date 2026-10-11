@@ -1151,6 +1151,23 @@ export function buildApp(): express.Express {
     sessions.set(id, srec);
     traces.set(id, []);
     persistSession(srec);
+    // Sessions mint task ids (body.taskId ?? uid("task")) but never registered
+    // them, so task endpoints 404'd for session-created tasks. Register here:
+    // attach to an existing task when body.taskId names one, else create it.
+    {
+      const existing = body.taskId ? tasks.get(body.taskId) : undefined;
+      if (existing) {
+        existing.sessionId = id;
+        persistTask(existing);
+      } else {
+        const trec: TaskRec = {
+          id: srec.taskId, goal: srec.goal, status: "QUEUED",
+          sessionId: id, createdAt: nowIso(), result: null, owner,
+        };
+        tasks.set(srec.taskId, trec);
+        persistTask(trec);
+      }
+    }
     appendStep(id, {
       session_id: id, task_id: srec.taskId, step_id: uid("step"), seq: 0,
       timestamp: nowIso(), actor: "system", vm_state_before: "READY", screen_before: "",
@@ -1769,8 +1786,44 @@ export function buildApp(): express.Express {
     const t = tasks.get(req.params["id"] as string);
     if (!t) { res.status(404).json({ error: "not_found" }); return; }
     if (denyIfNotOwner(t, req, res)) return;
+    // Evidence-based verdict: a validation platform must be able to fail.
+    // Checks: (a) task exists, (b) linked session exists with action-bearing
+    // trace steps, (c) replay verification over the trace is clean.
+    const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+    checks.push({ name: "task_exists", ok: true, detail: t.id });
+    let steps: Array<Record<string, unknown>> = [];
+    if (t.sessionId) {
+      const s = sessions.get(t.sessionId);
+      if (s) {
+        steps = mergedTraceSteps(t.sessionId);
+        const actionSteps = steps.filter((st) => {
+          const actor = st["actor"];
+          return typeof actor === "string" && actor !== "" && actor !== "system";
+        });
+        checks.push({ name: "session_exists", ok: true, detail: t.sessionId });
+        checks.push({
+          name: "trace_has_actions", ok: actionSteps.length > 0,
+          detail: `${actionSteps.length} action-bearing steps of ${steps.length} total`,
+        });
+      } else {
+        checks.push({ name: "session_exists", ok: false, detail: `session ${t.sessionId} not found` });
+      }
+    } else {
+      checks.push({ name: "session_exists", ok: false, detail: "task has no linked session" });
+    }
+    if (steps.length > 0) {
+      const { verdict: rv, issues } = verifyReplay(steps);
+      checks.push({
+        name: "replay_clean", ok: rv === "deterministic-replay-ok",
+        detail: issues.length > 0 ? issues.join("; ") : "deterministic-replay-ok",
+      });
+    } else {
+      checks.push({ name: "replay_clean", ok: false, detail: "no trace steps to verify" });
+    }
+    const sessionMissing = checks.some((c) => c.name === "session_exists" && !c.ok);
+    const verdict = checks.every((c) => c.ok) ? "pass" : (sessionMissing ? "inconclusive" : "fail");
     t.status = "DONE";
-    t.result = { verdict: "pass", checkedAt: nowIso(), input: req.body ?? {} };
+    t.result = { verdict, checkedAt: nowIso(), checks };
     persistTask(t);
     res.json(t);
   });
