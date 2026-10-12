@@ -1480,6 +1480,23 @@ export function buildApp(): express.Express {
     sessions.set(id, srec);
     traces.set(id, []);
     persistSession(srec);
+    // Sessions mint task ids (body.taskId ?? uid("task")) but never registered
+    // them, so task endpoints 404'd for session-created tasks. Register here:
+    // attach to an existing task when body.taskId names one, else create it.
+    {
+      const existing = body.taskId ? tasks.get(body.taskId) : undefined;
+      if (existing) {
+        existing.sessionId = id;
+        persistTask(existing);
+      } else {
+        const trec: TaskRec = {
+          id: srec.taskId, goal: srec.goal, status: "QUEUED",
+          sessionId: id, createdAt: nowIso(), result: null, owner,
+        };
+        tasks.set(srec.taskId, trec);
+        persistTask(trec);
+      }
+    }
     appendStep(id, {
       session_id: id, task_id: srec.taskId, step_id: uid("step"), seq: 0,
       timestamp: nowIso(), actor: "system", vm_state_before: "READY", screen_before: "",

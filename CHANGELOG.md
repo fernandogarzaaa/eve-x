@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Dependabot: weekly update checks for npm, the `ml/` Python requirements, Docker base images (`infra/docker`, `infra/qualification`) and GitHub Actions.
+
 ## EVE-X 1.1.1 — release-integrity hardening (no architecture changes)
 
 Targeted finalization of the 1.1.0 hardening branch. No product behavior
