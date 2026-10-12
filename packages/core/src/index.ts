@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 // Core primitives: ids, time, state machines, errors (§52)
 export { RELEASE } from "./release.gen.js";
 import { RELEASE } from "./release.gen.js";
@@ -61,13 +61,25 @@ export const VM_TRANSITIONS: Record<string, string[]> = {
   STOPPING: ["STOPPED", "FAILED"], STOPPED: ["BOOTING", "DESTROYING", "CREATING", "FAILED"],
   FAILED: ["DESTROYING", "CREATING"], DESTROYING: ["DESTROYED"], DESTROYED: [],
 };
-export function sha1hex(s: string): string {
-  let h1 = 0x67452301, h2 = 0xefcdab89, h3 = 0x98badcfe, h4 = 0x10325476, h5 = 0xc3d2e1f0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    h1 = (Math.imul(h1 ^ c, 0x5bd1e995) >>> 0); h2 = (Math.imul(h2 ^ c, 0x5bd1e995) >>> 0);
-    h3 = (Math.imul(h3 ^ c, 0x5bd1e995) >>> 0); h4 = (Math.imul(h4 ^ c, 0x5bd1e995) >>> 0);
-    h5 = (Math.imul(h5 ^ c, 0x5bd1e995) >>> 0);
+/** Real SHA-256 hex digest (64 lowercase hex chars). This is the ONLY
+ *  approved digest for evidence chains, image pins, and model fingerprints.
+ *  (A previous `sha1hex` helper was a non-cryptographic toy hash misnamed as
+ *  SHA-1; it was removed — every consumer now uses this.) */
+export function sha256hex(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex");
+}
+/** Canonical JSON: stable key order so digests are reproducible across
+ *  processes and restarts. The single canonicalizer for all evidence. */
+export function canonicalJson(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return JSON.stringify(value) as string;
+  if (typeof value === "number" || typeof value === "boolean") return JSON.stringify(value) as string;
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
   }
-  return [h1, h2, h3, h4, h5].map((h) => (h >>> 0).toString(16).padStart(8, "0")).join("");
+  return JSON.stringify(String(value)) as string;
 }

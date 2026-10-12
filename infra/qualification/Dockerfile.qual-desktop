@@ -1,4 +1,7 @@
 # Qualification desktop image: base + baked screenshot tooling.
+# TEST-ONLY artifact: the :latest tag is mutable and must never reach
+# production (production boots digest-pinned images; see
+# requirePinnedDockerImage + EVEX_DOCKER_IMAGE).
 # Production pattern: guest capabilities are baked at image-build time because
 # containers run --cap-drop ALL (runtime apt cannot drop privileges).
 FROM dorowu/ubuntu-desktop-lxde-vnc:latest

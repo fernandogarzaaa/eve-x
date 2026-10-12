@@ -4,6 +4,13 @@ Entry point: `ml/training/train.py`. Four phases run in order — SFT,
 grounding head, verifier gate, preference pass — and every reported number is
 measured from the loop that just ran.
 
+> Scope designation: this trainer is a TEST/SIMULATION artifact (token/bbox
+> regression on synthetic or toy signals), NOT the production computer-use
+> model. It exists to exercise the registry → training → eval →
+> promotion plumbing with measured numbers. The production model adapter
+> architecture (multimodal providers, real inference) is tracked separately;
+> nothing in this file may be cited as a trained computer-use model.
+
 ## Modes
 
 ```bash

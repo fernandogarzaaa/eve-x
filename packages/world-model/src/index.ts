@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { z } from "zod";
 import { ActionIR } from "../../protocol/src/index.js";
-import { EveError, sha1hex } from "../../core/src/index.js";
+import { EveError, sha256hex } from "../../core/src/index.js";
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ export type WorldModelOptions = z.infer<typeof WorldModelOptions>;
 /** Stable hash of a percept frame (frameId + png payload). */
 export function hashPercept(input: unknown): string {
   const s = z.string().min(1).max(16777216).parse(input);
-  return sha1hex(s);
+  return sha256hex(s);
 }
 
 /** Learned transition table: perceptHash -> actionKey -> nextHash -> count. */
@@ -54,7 +54,7 @@ export class WorldModel {
     const target = full.target && full.target.kind === "visual-region"
       ? `${full.target.regionId}:${full.target.bbox.join(",")}`
       : "none";
-    const textPart = full.text ? `#${sha1hex(full.text).slice(0, 12)}` : "";
+    const textPart = full.text ? `#${sha256hex(full.text).slice(0, 12)}` : "";
     const keyPart = full.keys ? `:${full.keys.join("+")}` : "";
     return `${full.type}@${target}${textPart}${keyPart}`;
   }

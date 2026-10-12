@@ -1,5 +1,58 @@
 # EVE-X Production Qualification Matrix
 
+## Addendum 1.1.0 (2026-10-07) — evidence-integrity rebuild
+
+The 2026-10-01 matrix below is retained as history. This addendum records
+the 1.1.0 re-qualification state with precise verbs (IMPLEMENTED /
+UNIT-VERIFIED / INTEGRATION-VERIFIED / LIVE-QUALIFIED / CONSTRAINED /
+UNAVAILABLE / NOT-VALIDATED). Nothing below is called VERIFIED unless the
+current implementation and the cited evidence support it.
+
+Environment: Windows 11 Pro, Node v26.7.0, WSL2 Ubuntu (Python 3.14.4, no
+torch), Docker 29.8.0, no KVM/GPU/Postgres/Redis live. Live-API rows ran
+against `buildApp()` on ephemeral ports (dev-framebuffer); inference rows
+ran against real `server.py` on ephemeral ports plus stub-torch injection;
+KVM-dependent rows remain CONSTRAINED/UNAVAILABLE as before.
+
+| Capability | Status | Evidence |
+|---|---|---|
+| Build/typecheck/lint/security-audit/npm-audit | LIVE-QUALIFIED | `npm run build/typecheck/lint`, `security:audit` (0 secrets, authz hooks pass), `npm audit --omit=dev` clean, in CI on ubuntu+windows |
+| Honesty gates (12 static prohibitions) | UNIT-VERIFIED | `scripts/honesty-gates.mjs` in `npm run lint` + CI; covers synthetic worker, hardcoded pass, model masquerade, basename authz, mock benchmarks, toy digests, mutable tags, weak defaults, secret logging |
+| Unit/integration suites | LIVE-QUALIFIED | `npm test` 302/302 (66 suites); `npm run ml:test` 65/65 checks on real Python |
+| Worker = control-plane orchestrator (synthetic loop deleted) | INTEGRATION-VERIFIED | `tests/worker-behavior.test.ts` (lease/fencing, synthetic refusal, fail-closed budgets, provenance verbatim); no `prng`/empty-pixel/synthetic path remains in `apps/worker` |
+| Trace SHA-256 chain (toy `sha1hex` deleted) | UNIT-VERIFIED | chain stamped on every control-plane append; replay + timeline player verify full-content chains; legacy 40-hex flagged; adversarial mutation/reorder/gap/dup tests |
+| Task validation independence | INTEGRATION-VERIFIED | `EvidenceValidator` unit (9 cases) + HTTP (400-without-evidence, INVALID/INCONCLUSIVE/FAILED/PASS + causedBy, tamper→INVALID, cross-tenant 403) |
+| Benchmarks from real execution | INTEGRATION-VERIFIED | inline PRNG agent deleted; RealAgentAdapter + IndependentEvaluator (verdicts, Wilson CI, identities, digests); mock refused (400/`SYNTHETIC_RESULT_REFUSED`) or stamped; dev-backend runs report `invalid`, never numbers |
+| Inference ModelRuntime | LIVE-QUALIFIED | 44/44 `selftest.py` on real Python (verified load, sha/size/format/manifest gates, torch-failure modes, readiness table, auth, identity fields); suggest/401/timeout mapping tests; internal-only topology; token forwarding |
+| Guest fs jail (canonical) | UNIT-VERIFIED | `tests/guest-jail.test.ts` incl. live symlink-escape + dir-symlink + `..` refusal on Windows; O_NOFOLLOW + post-open re-check on Linux |
+| Executable identity (not basename) | UNIT-VERIFIED | attacker binary with allowed basename refused; PATH never consulted for bare names; trusted-symlink-escape refused; Windows separator handled |
+| Agent account unprivileged | IMPLEMENTED | `sudo: false` in all three seeds (unit-pinned); maintenance via root QGA channel (documented) |
+| Fail-closed modes | INTEGRATION-VERIFIED | `EVEX_MODE` gates in security pkg + API fallback; production boot refusal test; WS 401 test; dev-anon only in development |
+| Secrets required | IMPLEMENTED | compose `:?` guards, `REPLACE_ME` example markers rejected by gate, `init` mints random tokens, scanner clean |
+| Full image digests + boot refusal | UNIT-VERIFIED | multi-region (head/middle/tail) tamper tests; mtime fast-path + re-hash; `EVEX_BASE_IMAGE_SHA256` mismatch refusal; production refuses `:latest` (unit) |
+| Containers pinned | IMPLEMENTED | compose postgres/redis/garage digest refs (verify-release cross-checks); release images versioned; qual Dockerfile marked TEST-ONLY |
+| Release cannot lie | UNIT-VERIFIED | no commit override; dirty fails closed (hermetic git test); measured manifest; `verify-release` 44 checks (fails on the 5 pre-release drifts, as designed) |
+| MCP protocol honesty | INTEGRATION-VERIFIED | SDK 1.31 pinned (no v2 exists upstream — documented with registry evidence); latest+legacy negotiation + unknown-fallback + session isolation + close + schema validation + 401 + rate-limit tests |
+| Skills compliance | UNIT-VERIFIED | frontmatter + `skill.json` + name==dir + tools-documented + install/verify round-trip + 5 negative cases |
+| Eval-v2 scoring | LIVE-QUALIFIED | 12/12 `eval_selftest.py` on real Python; qual consumer preserved (exact 1.0 / shifted 0.0); dataset self-tests 9/9 |
+| Multitenant audit | INTEGRATION-VERIFIED | all 35 v1 routes carry cap + owner checks; trace/replay/report fail closed on unknown sessions; judgments owner-bound; WS HTTP-equivalent auth |
+| Restart recovery | INTEGRATION-VERIFIED | RUNNING demotes to PAUSED (explicit resume; 409 unless PAUSED); judgments/dedupe/reviews rehydrate; nothing auto-runs |
+| Observability | IMPLEMENTED | 16 failure/behavior counters + gauges on `/metrics`; per-request IDs; no secret logging (gated) |
+| Flood discipline | INTEGRATION-VERIFIED | WS per-session/global caps (429 tested); MCP per-caller limit (429 tested); API classes, inference queue, trace 256 MB cap, benchmark size cap |
+| Agent simulation | LIVE-QUALIFIED | `agent-sim.mjs` 17/19 executed + 2 documented inconclusive (dev-backend limits), machine-readable artifacts |
+| Load | LIVE-QUALIFIED | `load.mjs` 10/10 created, p50 98ms/p95 108ms, 10/10 cleaned; earlier 429 burst correctly attributed to the rate limiter |
+| Attack simulation | INTEGRATION-VERIFIED | `tests/adversarial-evidence.test.ts` (10 cases: forgery classes, stale/idempotency, transparency, authz, legacy digests, release mechanisms) |
+
+Supersessions vs the 2026-10-01 matrix: §4 worker rows (synthetic loop
+deleted — old "seeded perception" tests replaced); §2 validate semantics
+(evidence-required); §6 benchmark/inference/eval rows (real-adapter,
+ModelRuntime, eval-v2); §5 secrets/jail rows (canonical jail, required
+secrets, modes); §7 MCP version row (1.31, no-v2 statement) and load row
+(new harness numbers above). KVM/GPU-gated rows (§9, full-size training)
+remain CONSTRAINED/UNAVAILABLE — unchanged, not re-claimed.
+
+---
+
 Date: 2026-10-01. Baseline commit `91e8ced`; this matrix covers the post-build
 adversarial audit + hardening pass. Statuses: VERIFIED / VERIFIED_WITH_CONSTRAINT /
 NOT_AVAILABLE_IN_ENVIRONMENT / FAILED. Banned vocabulary (probably/should-work/

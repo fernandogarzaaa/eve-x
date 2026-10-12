@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "EVE-X Control Plane API",
-    "version": "1.0.3",
+    "version": "1.1.1",
     "description": "Versioned public API for the EVE-X isolated-VM computer-use validation platform. Operational probes live at root (/health, /ready, /metrics); all product routes live under /v1. Auth: Bearer token (EVEX_AUTH_TOKEN) with per-route capability checks. This document describes the actual implementation.",
     "license": {
       "name": "MIT"
@@ -354,6 +354,33 @@
         "responses": {
           "200": {
             "description": "stopped"
+          },
+          "409": {
+            "description": "illegal transition (already terminal)"
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/resume": {
+      "post": {
+        "operationId": "resumeSession",
+        "summary": "Resume a PAUSED session (explicit re-arm after pause or restart-demotion; 409 unless PAUSED)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "resumed to RUNNING"
+          },
+          "409": {
+            "description": "illegal transition (only PAUSED resumes)"
           }
         }
       }
@@ -647,7 +674,7 @@
     "/v1/tasks/{id}/validate": {
       "post": {
         "operationId": "taskValidate",
-        "summary": "Validate task outcome with evidence",
+        "summary": "Derive a task verdict from server-resolved evidence (EvidenceValidator: replay integrity + cited steps + oracle assertions + human judgments). Never manufactures PASS.",
         "parameters": [
           {
             "name": "id",
@@ -660,7 +687,10 @@
         ],
         "responses": {
           "200": {
-            "description": "validated"
+            "description": "{task, validation} where validation.verdict is PASS | FAILED | INCONCLUSIVE | INVALID_EVIDENCE with causedBy evidence refs"
+          },
+          "400": {
+            "description": "evidence_required (calling validate without an evidence bundle manufactures nothing)"
           }
         }
       }
@@ -742,10 +772,13 @@
     "/v1/benchmarks": {
       "post": {
         "operationId": "runBenchmark",
-        "summary": "Run a benchmark suite (requires task:execute)",
+        "summary": "Run a benchmark suite on real sessions/VMs (requires task:execute). agent=mock-test-only requires testOnly:true and stamps the record synthetic/test_only; real runs on synthetic backends report invalid counts, never numbers",
         "responses": {
-          "200": {
-            "description": "started"
+          "201": {
+            "description": "record with metrics (verdict counts + Wilson CI), methodology, formulas, and evidence digests"
+          },
+          "400": {
+            "description": "mock_agent_requires_test_only | contradictory_request"
           }
         }
       }
@@ -774,7 +807,7 @@
     "/v1/models/status": {
       "get": {
         "operationId": "modelStatus",
-        "summary": "Inference backend status {inferenceUrl, model, reachable}",
+        "summary": "Live inference probe {inferenceUrl, model, reachable, ready, degraded, modelIdentity} — reachable reflects a real /ready round-trip, never config",
         "responses": {
           "200": {
             "description": "ok"
@@ -785,7 +818,7 @@
     "/v1/stream/{sessionId}": {
       "get": {
         "operationId": "stream",
-        "summary": "WebSocket: live frames + overlays + timeline (upgrade to WS)",
+        "summary": "WebSocket: live frames + overlays + timeline (upgrade to WS). Same bearer auth as HTTP (header or ?token=); unknown sessions 404, cross-tenant 403, floods 429",
         "parameters": [
           {
             "name": "sessionId",

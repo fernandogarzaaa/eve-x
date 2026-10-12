@@ -77,7 +77,8 @@ describe("lease TTL boundaries (20s worker lease)", () => {
     );
     assert.equal(worker.heldEpoch(sid), null, "rival epoch must void our hold");
     // A run started under the old epoch aborts instead of double-writing.
-    const r = worker.runSessionToCompletion({ id: sid, goal: "g", status: "RUNNING", maxSteps: 3 });
+    // (Async: the abort happens on the fencing check before any network use.)
+    const r = await worker.runSessionToCompletion({ id: sid, goal: "g", status: "RUNNING", maxSteps: 3 });
     assert.equal(r.outcome, "LEASE_LOST");
     assert.equal(r.steps, 0);
   });

@@ -364,6 +364,72 @@ def load_checkpoint(d: str) -> dict:
     return ck
 
 
+def consume_dataset(path: "str | None", manifest_path: "str | None") -> dict:
+    """Bind the training dataset by actually reading it: stream every row,
+    hash the consumed bytes, count samples, collect sample ids. The returned
+    consumed_content_digest reflects file content, never configuration.
+    Absent dataset: recorded as not-consumed (a config claim, labeled)."""
+    import platform as _platform
+    runtime = {"python": sys.version.split()[0], "platform": _platform.platform(),
+               "cpu_count": os.cpu_count() or 0}
+    try:
+        import torch as _torch  # type: ignore
+        runtime["torch"] = getattr(_torch, "__version__", "unknown")
+        try:
+            runtime["cuda_available"] = bool(_torch.cuda.is_available())
+        except Exception:
+            runtime["cuda_available"] = False
+    except Exception:
+        runtime["torch"] = None
+        runtime["cuda_available"] = False
+    if not path:
+        return {"consumed": False, "reason": "no --dataset given (config claim only)",
+                "runtime": runtime, "preprocessing": PREPROCESSING_VERSION}
+    h = hashlib.sha256()
+    count = 0
+    sample_ids: list = []
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                h.update(line + b"\n")
+                count += 1
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    obj = None
+                if isinstance(obj, dict):
+                    sid = obj.get("_fingerprint") or obj.get("step_id")
+                    if sid is not None and len(sample_ids) < 10000:
+                        sample_ids.append(str(sid))
+    except OSError as e:
+        raise SystemExit(f"ERROR: --dataset unreadable: {e}")
+    manifest_digest = None
+    manifest_splits = None
+    if manifest_path:
+        try:
+            with open(manifest_path, "rb") as f:
+                mbytes = f.read()
+            manifest_digest = hashlib.sha256(mbytes).hexdigest()
+            manifest_splits = json.loads(mbytes.decode("utf-8")).get("splits")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise SystemExit(f"ERROR: --dataset-manifest unreadable: {e}")
+    return {"consumed": True, "path": os.path.abspath(path),
+            "consumed_content_digest": h.hexdigest(), "sample_count": count,
+            "sample_ids": sample_ids, "sample_ids_truncated": len(sample_ids) == 10000,
+            "manifest": os.path.abspath(manifest_path) if manifest_path else None,
+            "manifest_digest": manifest_digest,
+            "manifest_splits": ({k: {"rows": v.get("rows"), "sha256": v.get("sha256")}
+                                  for k, v in manifest_splits.items()}
+                                 if isinstance(manifest_splits, dict) else None),
+            "runtime": runtime, "preprocessing": PREPROCESSING_VERSION}
+
+
+PREPROCESSING_VERSION = "1"
+
+
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description="EVE-X SFT + grounding + verifier + preference training")
     ap.add_argument("--config", default=None, help="JSON config file (merged over defaults)")
@@ -374,6 +440,10 @@ def main(argv: list | None = None) -> int:
                     help="Total epochs to train (default 1; with --resume-from, continues to this total)")
     ap.add_argument("--resume-from", default=None, metavar="DIR",
                     help="Resume from a previous --out dir (config hash must match)")
+    ap.add_argument("--dataset", default=None, metavar="JSONL",
+                    help="Training rows file (JSONL, e.g. build.py train.jsonl): streamed, hashed, and bound into lineage")
+    ap.add_argument("--dataset-manifest", default=None, metavar="JSON",
+                    help="build.py digest.json for --dataset: manifest digest recorded alongside")
     args = ap.parse_args(argv)
 
     if args.max_epochs is not None and args.max_epochs < 1:
@@ -387,6 +457,8 @@ def main(argv: list | None = None) -> int:
     max_epochs = int(args.max_epochs or 1)
     os.makedirs(args.out, exist_ok=True)
     started = time.time()
+    consumption = consume_dataset(args.dataset, args.dataset_manifest)
+    atomic_write_json(os.path.join(args.out, "consumption.json"), consumption)
 
     epochs_done = 0
     history: list = []
@@ -487,12 +559,27 @@ def main(argv: list | None = None) -> int:
                        "mode": mode, "epochs_completed": epochs_done,
                        "elapsed_s": elapsed})
     atomic_write_json(os.path.join(args.out, "metrics.json"), metrics)
+    checkpoint_digest = None
+    weights_path = os.path.join(args.out, "weights.pt")
+    if os.path.isfile(weights_path):
+        h = hashlib.sha256()
+        with open(weights_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        checkpoint_digest = h.hexdigest()
     atomic_write_json(os.path.join(args.out, "lineage.json"),
                       {"model_id": model_id, "config_hash": config_hash,
-                       "dataset_digest": cfg.get("dataset_digest", "unknown"),
+                       "dataset_digest": consumption.get("consumed_content_digest")
+                       or cfg.get("dataset_digest", "unknown"),
+                       "dataset_manifest_digest": consumption.get("manifest_digest"),
+                       "dataset_sample_count": consumption.get("sample_count"),
+                       "dataset_consumed": consumption.get("consumed"),
+                       "preprocessing": consumption.get("preprocessing"),
+                       "runtime": consumption.get("runtime"),
                        "code_digest": code_digest(),
                        "code_commit": commit,
                        "parent_model_id": cfg.get("parent_model_id"),
+                       "checkpoint_digest": checkpoint_digest,
                        "mode": mode, "epochs_completed": epochs_done,
                        "resumed_from": args.resume_from,
                        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})

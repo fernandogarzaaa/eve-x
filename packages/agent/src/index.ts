@@ -250,6 +250,13 @@ export class EveCuaAgent {
       outcome: null,
     };
 
+    // Per-step evidence flags for the final verdict. Success is NEVER
+    // inferred from outcome prose ("success", "advance", "goal achieved"
+    // substrings are guest/model-controlled text, not evidence) — only
+    // an explicit task.successSignals hit on a non-failed step counts.
+    // Declared outside the loop: after it, they describe the FINAL step.
+    let stepSignal = false;
+    let stepFailed = true;
     for (let seq = 0; seq < maxSteps && !state.done; seq += 1) {
       state.seq = seq;
       const startedAt = Date.now();
@@ -332,12 +339,14 @@ export class EveCuaAgent {
       const failed = lowered.startsWith("error") || lowered.includes("fail");
 
       state.phase = "COMPARE";
-      const matchedPrediction = !failed && (signalHit || lowered.includes("success") || lowered.includes("advance"));
+      const matchedPrediction = !failed && signalHit;
+      stepSignal = signalHit;
+      stepFailed = failed;
       if (failed) state.consecutiveFailures += 1;
       else if (signalHit) state.consecutiveFailures = 0;
 
       state.phase = "UPDATE";
-      if (signalHit || lowered.includes("goal achieved") || lowered.includes("task complete")) {
+      if (signalHit) {
         state.done = true;
         state.outcome = result.outcome;
       } else if (selected.type === "ask_human") {
@@ -380,7 +389,9 @@ export class EveCuaAgent {
     }
 
     const lastOutcome = state.outcome ?? (steps.length > 0 ? (steps[steps.length - 1]?.outcome ?? "budget exhausted") : "no steps");
-    const success = /success|achieved|complete/i.test(lastOutcome) && !/fail|error/i.test(lastOutcome);
+    // Verdict from evidence only: the final step hit an explicit success
+    // signal without failing. Outcome prose is never parsed for success.
+    const success = stepSignal && !stepFailed;
     if (steps.length === 0) throw new EveError("NO_TRAJECTORY", "Agent produced no steps within budget");
     return { steps, outcome: lastOutcome, success };
   }

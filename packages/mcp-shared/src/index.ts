@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { ActionType, TraceStep, VmSpec } from "../../protocol/src/index.js";
 
-// ── EVE-X shared MCP tool schemas (single authority for MCP surface, ADR-10) ──
+// ── EVE-X shared MCP tool schemas (single authority for the TOOL CONTRACT) ──
+// MCP_TOOL_VERSION names OUR tool contract ("evex-tools/1"), NOT the MCP
+// wire protocol (negotiated per connection: 2026-07-28 modern or 2025-era
+// legacy) and NOT the SDK version (pinned in package.json). The three
+// versions are independent by design (see MCP.md + ADR-15).
 // Every schema below mirrors the real control-plane routes 1:1
 // (see apps/api/src/index.ts + apps/api/openapi.json):
 //   probes live at ROOT: GET /health | /ready | /metrics (no /v1 prefix);
@@ -10,7 +14,7 @@ import { ActionType, TraceStep, VmSpec } from "../../protocol/src/index.js";
 // client validate the same wire contract against exactly one definition.
 // All schemas are strict: unknown fields are rejected before any fetch.
 
-export const MCP_TOOL_VERSION = "mcp/1" as const;
+export const MCP_TOOL_VERSION = "evex-tools/1" as const;
 
 /** All session/vm/task ids: [A-Za-z0-9_-]{1,128}. Rejected pre-fetch on mismatch. */
 export const ID_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -40,6 +44,23 @@ export type EveVmId = z.infer<typeof EveVmId>;
 
 export const EveTaskId = z.object({ taskId: IdString }).strict();
 export type EveTaskId = z.infer<typeof EveTaskId>;
+
+/** Validate-task input: the evidence bundle the endpoint requires (never
+ *  an empty call — the endpoint 400s without evidence by design). */
+export const EveTaskValidate = z.object({
+  taskId: IdString,
+  evidence: z.object({
+    sessionId: z.string().min(1).max(128),
+    stepIds: z.array(z.string().min(1).max(128)).min(1).max(200),
+    assertions: z.array(z.object({
+      kind: z.enum(["signal-present", "outcome-is", "grounding-verified", "verification-passed"]),
+      signal: z.string().min(1).max(256).optional(),
+      outcome: z.string().min(1).max(64).optional(),
+    })).max(50).optional(),
+    judgmentIds: z.array(z.string().min(1).max(128)).max(50).optional(),
+  }).optional(),
+}).strict();
+export type EveTaskValidate = z.infer<typeof EveTaskValidate>;
 
 export const EveVmCreate = z.object({
   image: z.string().min(1).max(256).default("ubuntu-desktop-v1"),
@@ -97,6 +118,8 @@ export type EveReplay = z.infer<typeof EveReplay>;
 export const EveBenchmark = z.object({
   name: z.string().min(1).max(128).default("evex-bench"),
   size: z.number().int().min(1).max(200).default(6),
+  agent: z.enum(["real", "mock-test-only"]).optional(),
+  testOnly: z.boolean().optional(),
 }).strict();
 export type EveBenchmark = z.infer<typeof EveBenchmark>;
 
@@ -119,7 +142,7 @@ export const TOOL_SCHEMAS = {
   "eve_human_release": EveSessionId,
   "eve_task_start": EveTaskStart,
   "eve_task_status": EveTaskId,
-  "eve_task_validate": EveTaskId,
+  "eve_task_validate": EveTaskValidate,
   "eve_trace_get": EveSessionId,
   "eve_replay": EveReplay,
   "eve_report": EveSessionId,
@@ -187,6 +210,8 @@ export const BenchmarkBody = z.object({
   cases: z.array(z.string().min(1).max(128)).max(50).optional(),
   size: z.number().int().min(1).max(200).default(6),
   seed: Seed,
+  agent: z.enum(["real", "mock-test-only"]).optional(),
+  testOnly: z.boolean().optional(),
 });
 export type BenchmarkBody = z.infer<typeof BenchmarkBody>;
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { GenesisClient } from "../packages/genesis/src/index.js";
 
 // Evidence resolution: claims must cite steps that exist in the graded session.
-const HASH = "a".repeat(40);
+const HASH = "a".repeat(64);
 const resolver = (sid: string | undefined, ids: string[]) => {
   if (sid !== "sess-real") return { known: [], unknown: ids };
   const known = new Set(["s0", "s1", "s2"]);

@@ -147,7 +147,7 @@ export function scoreLearnability(steps: TraceStepType[]): Finding {
   return FindingSchema.parse({
     dimension: "learnability",
     claim: improving
-      ? `Median effort fell ${Math.round(ratio * 100)}% in the second half — operator adapted.`
+      ? `Mean effort fell ${Math.round(ratio * 100)}% in the second half — operator adapted.`
       : "No measurable speed-up in the second half — interface did not get easier with practice.",
     evidenceStepIds: requireEvidence([steps[0]?.step_id ?? "", steps[steps.length - 1]?.step_id ?? ""], "learnability"),
     score: clampScore(improving ? 65 + Math.min(0.5, ratio) * 70 : 48),
@@ -201,7 +201,9 @@ export function scoreErrorRecovery(steps: TraceStepType[]): Finding {
   if (failIdx.length === 0) {
     return FindingSchema.parse({
       dimension: "error_recovery",
-      claim: "No errors encountered; recovery path unexercised but nothing to recover from.",
+      // Labeled as unexercised, not recovered: the 80 is a neutral UX prior
+      // for clean runs, excluded from any success reading by the grade gate.
+      claim: "No errors encountered; recovery path unexercised (nothing to recover from — not evidence of recovery skill).",
       evidenceStepIds: requireEvidence(steps.slice(0, 2).map((s) => s.step_id), "error_recovery"),
       score: 80,
       severity: "info",
@@ -338,12 +340,21 @@ const SCORERS: Array<(steps: TraceStepType[]) => Finding> = [
   scoreVisualClarity,
 ];
 
-function gradeFor(overall: number): "A" | "B" | "C" | "D" | "F" {
-  if (overall >= 85) return "A";
-  if (overall >= 70) return "B";
-  if (overall >= 55) return "C";
-  if (overall >= 40) return "D";
-  return "F";
+function gradeFor(overall: number, taskSuccessScore?: number): "A" | "B" | "C" | "D" | "F" {
+  // The overall mean must never mask task failure: a trajectory that did
+  // not succeed cannot grade above D no matter how clean its UX dimensions.
+  // `overall` is a UX rollup, NOT a success measure — consumers must read
+  // the task_success finding alongside it.
+  let grade: "A" | "B" | "C" | "D" | "F";
+  if (overall >= 85) grade = "A";
+  else if (overall >= 70) grade = "B";
+  else if (overall >= 55) grade = "C";
+  else if (overall >= 40) grade = "D";
+  else grade = "F";
+  if (taskSuccessScore !== undefined && taskSuccessScore < 50 && (grade === "A" || grade === "B" || grade === "C")) {
+    grade = "D";
+  }
+  return grade;
 }
 
 /** Score a full trajectory; throws NO_EVIDENCE when there is nothing to score. */
@@ -363,12 +374,13 @@ export function scoreExperience(stepsInput: unknown, optsInput: unknown): Experi
   }
   const findings = SCORERS.map((fn) => fn(steps));
   const overall = clampScore(avg(findings.map((f) => f.score), 0));
+  const taskSuccess = findings.find((f) => f.dimension === "task_success")?.score;
   return ExperienceReportSchema.parse({
     reportId: `expr-${steps[0]?.session_id ?? opts.sessionId}-${Date.now().toString(36)}`,
     sessionId: opts.sessionId,
     taskId: opts.taskId,
     overall,
-    grade: gradeFor(overall),
+    grade: gradeFor(overall, taskSuccess),
     findings,
     evaluatedAt: nowIso(),
     modelVersion: opts.modelVersion,
