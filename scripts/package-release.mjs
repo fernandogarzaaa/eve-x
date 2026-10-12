@@ -5,14 +5,25 @@
 // Writes RELEASE_ARTIFACTS.sha256 over every bundle.
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gitEnv } from "./git-safe.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PKG = join(ROOT, "artifacts", "release", "pkg");
 mkdirSync(PKG, { recursive: true });
-const sh = (cmd) => execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+// Stale bundles from previous regens are forgery-adjacent clutter (old
+// commit tags, superseded digests): clear the dir so the sha file describes
+// exactly what this run produced — nothing carried forward.
+for (const e of readdirSync(PKG)) {
+  const full = join(PKG, e);
+  try {
+    const st = statSync(full);
+    if (st.isFile()) rmSync(full);
+  } catch { /* best effort */ }
+}
+const sh = (cmd) => execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: gitEnv() }).trim();
 const version = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version;
 const commit = sh("git rev-parse HEAD").slice(0, 12);
 
@@ -25,10 +36,10 @@ const add = (name, make) => {
 };
 const tar = (out, paths) => execSync(`tar -cf "${out}" ${paths.join(" ")}`, { cwd: ROOT, stdio: "ignore" });
 
-add("eve-x-source", (p) => execSync(`git archive --format=tar --prefix=eve-x-${version}/ HEAD > "${p}"`, { cwd: ROOT, stdio: "ignore" }));
+add("eve-x-source", (p) => execSync(`git archive --format=tar --prefix=eve-x-${version}/ HEAD > "${p}"`, { cwd: ROOT, stdio: "ignore", env: gitEnv() }));
 add("eve-x-skill", (p) => tar(p, ["skills/eve-computer", "AGENT_SKILL.md"]));
 add("eve-x-deploy", (p) => tar(p, ["infra/deployment/docker-compose.yml", "infra/docker", "infra/deployment/object-storage/bring-up.sh", "infra/deployment/object-storage/garage.toml.template", "infra/deployment/tls", "infra/deployment/linux-bootstrap.sh", ".env.example"]));
-add("eve-x-docs", (p) => tar(p, ["README.md", "CHANGELOG.md", "ARCHITECTURE.md", "DEPLOYMENT.md", "OPERATIONS.md", "SECURITY.md", "THREAT_MODEL.md", "API.md", "CLI.md", "MCP.md", "MODEL.md", "COMPUTER_USE.md", "HUMAN_VALIDATION.md", "BENCHMARKS.md", "DATASETS.md", "TRAINING.md", "OBSERVABILITY.md", "TROUBLESHOOTING.md", "CONTRIBUTING.md", "AGENT_SKILL.md", "PRODUCTION_QUALIFICATION.md", "release-manifest.json", "RELEASE_PROVENANCE.json", "docs"]));
+add("eve-x-docs", (p) => tar(p, ["README.md", "CHANGELOG.md", "ARCHITECTURE.md", "DEPLOYMENT.md", "OPERATIONS.md", "SECURITY.md", "THREAT_MODEL.md", "API.md", "CLI.md", "MCP.md", "MODEL.md", "COMPUTER_USE.md", "HUMAN_VALIDATION.md", "BENCHMARKS.md", "DATASETS.md", "TRAINING.md", "OBSERVABILITY.md", "TROUBLESHOOTING.md", "CONTRIBUTING.md", "AGENT_SKILL.md", "PRODUCTION_QUALIFICATION.md", "RELEASE_IDENTITY.md", "release-manifest.json", "RELEASE_PROVENANCE.json", "docs"]));
 
 const lines = [];
 for (const p of [...bundles, join(ROOT, "release-manifest.json"), join(ROOT, "RELEASE_PROVENANCE.json")]) {

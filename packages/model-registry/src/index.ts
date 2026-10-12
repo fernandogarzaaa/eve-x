@@ -159,7 +159,7 @@ export class ModelRegistry {
       config: input.config,
       compat: {
         protocolVersion: "1",
-        mcpVersion: "mcp/1",
+        mcpVersion: "evex-tools/1",
         minApiVersion: "v1",
       },
       runtime: RuntimeReqs.parse(input.runtime ?? {}),
@@ -234,11 +234,17 @@ export class ModelRegistry {
     }
     // Weights integrity: a corrupt or missing local checkpoint must never
     // promote. file:// URIs and plain paths are verified (existence, size,
-    // sha256); remote URIs are out of scope for local verification and are
-    // recorded as unverified (a separate supply-chain check owns them).
+    // sha256). Remote URIs (https://, s3://, ...) can never be verified by
+    // this process — promotion is refused outright. Fetch the artifact to
+    // local disk, pin its digest, and register the file:// URI instead.
+    // There is no "recorded as unverified" promotion path: an unverified
+    // digest must not gate a staging/production transition.
     const wuri = rec.weights.uri;
     const localPath = wuri.startsWith("file://") ? wuri.slice("file://".length) : (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(wuri) ? null : wuri);
-    if (localPath !== null) {
+    if (localPath === null) {
+      throw new Error(`Refusing promotion: remote weights URI cannot be verified by this process: ${wuri} (fetch locally and register file://)`);
+    }
+    {
       const st = weightsStat(localPath);
       if (!st.exists || st.bytes === 0) {
         throw new Error(`Refusing promotion: weights missing or empty at ${localPath}`);

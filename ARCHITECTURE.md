@@ -10,7 +10,7 @@ Four runtime planes cooperate:
                     │   Console   │  operator UI (review, takeover, releases)
                     └──────┬──────┘
                            │  REST /v1 (openapi.json)
-┌──────────┐  MCP mcp/1  ┌─┴──────────┐   traces   ┌───────────┐
+┌──────────┐  MCP evex-tools/1  ┌─┴──────────┐   traces   ┌───────────┐
 │  Agents  │◄───────────►│ Control    │◄──────────►│ Postgres  │
 │ (skills) │             │ Plane API  │            │ + objects │
 └──────────┘             └─┬───┬──┬───┘            └───────────┘
@@ -24,12 +24,18 @@ Four runtime planes cooperate:
 ```
 
 - **Control plane (`apps/api`)** — owns REST `/v1`, auth, capability authz,
-  policy gates, the trace ledger, and task orchestration.
-- **Worker (`apps/worker`)** — executes seeded tasks step-by-step: observe →
-  model.invoke → verify → act → record. One task = one session = one VM.
-- **Inference (`ml/inference/server.py`)** — screenshot+context → ActionIR
-  JSON with confidence. Stdlib-only HTTP service with `/health`, `/ready`,
-  `/metrics`, `/infer`, bounded queue, and degraded heuristic mode.
+  policy gates, the trace ledger (SHA-256 chained), and task orchestration.
+- **Worker (`apps/worker`)** — a control-plane orchestrator, not an agent:
+  lease → fresh real percept → inference suggestion → server-side act
+  (grounding/safety/stale enforcement) → evidence steps written by the
+  plane. It synthesizes nothing and refuses synthetic backends. One task =
+  one session = one VM.
+- **Inference (`ml/inference/server.py`)** — ModelRuntime: verified weights
+  (or explicit `--allow-heuristic`) → full-identity results
+  (`model_id/version/sha256`, architecture, device, `action_source`,
+  `degraded`, `weights_verified`). Stdlib-only HTTP service with `/health`,
+  `/ready`, `/metrics`, `/model-info`, `/infer`, bearer auth when
+  configured, bounded queue. Unready planes answer 503, never fake output.
 - **VM fleet** — QEMU guests built by `infra/vm-images/build.sh` from a
   pinned base image + cloud-init seed; snapshots give clean-room starts.
 
@@ -51,7 +57,7 @@ Four runtime planes cooperate:
 - `protocol` — zod schemas only, no logic. Imported by every other package.
 - `core` — `uid`, `nowIso`, `EveError`, seeded `prng` (mulberry32),
   generic audited `StateMachine`, `VM_TRANSITIONS`.
-- `mcp-shared` — MCP tool input schemas (`TOOL_SCHEMAS`, version `mcp/1`)
+- `mcp-shared` — EVE-X tool input schemas (`TOOL_SCHEMAS`, contract `evex-tools/1`)
   plus `ControlPlaneClient`: fetch wrapper with Bearer auth, per-request
   `AbortController` timeouts, idempotency-key header, typed helpers per route.
 - `skills` — skill installer/verifier: manifest validation, platform-path

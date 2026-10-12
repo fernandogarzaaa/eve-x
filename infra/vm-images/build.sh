@@ -44,14 +44,17 @@ fi
 BASE_SHA="$(sha256sum "${BASE_IMG}" | awk '{print $1}')"
 echo "base sha256: ${BASE_SHA}"
 
-# cloud-init seed: locked-down guest agent account, desktop packages on first boot.
+# cloud-init seed: unprivileged guest agent account, desktop packages on
+# first boot. Privilege separation: eveagent has NO sudo (sudo: false);
+# privileged maintenance runs via the root QGA channel, never the agent
+# account. There is intentionally no NOPASSWD blanket grant.
 cat > "${SEED_DIR}/user-data" <<'EOF'
 #cloud-config
 hostname: eve-guest
 manage_etc_hosts: true
 users:
   - name: eveagent
-    sudo: ALL=(ALL) NOPASSWD:ALL
+    sudo: false
     shell: /bin/bash
     lock_passwd: true
 packages:

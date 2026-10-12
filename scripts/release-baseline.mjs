@@ -1,18 +1,25 @@
 #!/usr/bin/env node
-// Release baseline capture (§1): immutable starting-state report.
+// Release baseline capture: immutable starting-state report.
 // Writes artifacts/release/baseline.json (gitignored local evidence).
+// Portable: derives ROOT from the script location (no hardcoded paths),
+// version from package.json (no hardcoded releases).
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { gitEnv } from "./git-safe.mjs";
 
-const ROOT = "E:\\eve-x";
-const sh = (cmd) => execSync(cmd, { cwd: ROOT, encoding: "utf8" }).trim();
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const sh = (cmd) => {
+  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: gitEnv() }).trim(); }
+  catch { return ""; }
+};
 const sha = (p) => createHash("sha256").update(readFileSync(join(ROOT, p))).digest("hex");
 
 const baseline = {
   product: "eve-x",
-  release: "1.0.0",
+  release: JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version,
   capturedAt: new Date().toISOString(),
   git: {
     head: sh("git rev-parse HEAD"),
@@ -25,8 +32,8 @@ const baseline = {
   toolchain: {
     node: sh("node --version"),
     npm: sh("npm --version"),
-    python: sh("python --version"),
-    os: "Windows 11 Pro (build host) + WSL2 Ubuntu 24.04 (KVM host)",
+    python: sh("python --version") || sh("python3 --version"),
+    os: process.platform,
   },
   lockfiles: {
     "package-lock.json": sha("package-lock.json"),

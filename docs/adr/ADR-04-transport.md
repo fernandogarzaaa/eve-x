@@ -10,7 +10,7 @@ surface. Two transports risk two divergent contracts.
 
 ## Decision
 
-Expose REST `/v1` (defined in `apps/api/openapi.json`) and MCP `mcp/1`
+Expose REST `/v1` (defined in `apps/api/openapi.json`) and MCP `evex-tools/1`
 tools side by side, both validated by the same zod schemas owned by
 `packages/protocol` (wire types) and `packages/mcp-shared` (tool inputs +
 `ControlPlaneClient`).

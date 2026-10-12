@@ -1,3 +1,8 @@
+---
+name: eve-computer
+description: Drive an EVE-X isolated desktop over the computer-use loop — observe, ground, act, re-observe, verify, stop. Use for any task that needs a real GUI.
+---
+
 # eve-computer
 
 Drive an EVE-X isolated desktop over the computer-use loop: observe, ground,
@@ -10,18 +15,26 @@ act, verify. Use for any task that needs a real GUI (browser, IDE, OS dialogs).
 
 ## Loop (always)
 
-1. `observe` → screenshot + regions (`eve_computer_observe`, or
-   `GET /v1/computer/{sessionId}/observe`).
+1. `observe` — screenshot + regions (`eve_computer_observe`, or
+   `GET /v1/computer/{sessionId}/observe`). Record the `frameId`.
 2. Ground the target to a `regionId` + bbox; never click raw coordinates you
-   did not just observe.
+   did not just observe. Grounding is evidence: the acted point must fall
+   inside a region of the exact frame you observed.
 3. `act` with one flat-form action (`eve_computer_act`, or
    `POST /v1/computer/{sessionId}/act` with `{type, x?, y?, text?, keys?,
    ms?, confidence?, frameId?, idempotencyKey?}`); include `confidence`.
-4. Re-observe; confirm the expected change before the next act. Pass the
-   `frameId` you grounded against as `frameId` — the plane rejects stale
-   perception with `409 stale_perception`.
-5. Stop conditions: goal achieved, budget exhausted, destructive or credential
-   action needing approval → `eve_human_request`.
+   Always pass the `frameId` you grounded against.
+4. Re-observe; confirm the expected change before the next act. A `409
+   stale_perception` means the desktop moved under you: re-observe and
+   re-ground, never retry blindly against the old frame.
+5. Verify independently: the trace step carries server-written `grounding`
+   and `verification` records. Your own confidence is a claim, not proof —
+   check the step (`eve_trace_get`) when success matters.
+6. Stop conditions: goal achieved AND verified, budget exhausted,
+   destructive or credential action needing approval — `eve_human_request`.
+   Never declare success from your own output alone; task validation
+   (`eve_task_validate` with an evidence bundle) or a human judgment
+   decides success.
 
 See `references/action-ir.md` for the action schema, `references/policy.md`
 for approval rules, `references/replay.md` for deterministic replay, and

@@ -1,6 +1,10 @@
-# EVE-X inference image (stdlib-only server; torch optional for CUDA probe).
+# EVE-X inference image (stdlib-only server; torch optional for model load).
+# Fail-closed default: no weights + no --allow-heuristic -> /ready 503,
+# /infer 503. Production mounts weights + expected sha256 (see
+# ml/inference/server.py flags); dev compose opts into --allow-heuristic
+# explicitly (always degraded=true, never a trained model).
 # Build from the repo root: docker build -f infra/docker/Dockerfile.inference .
-FROM python:3.11-slim@sha256:bab1b7ef4b450c81002278d035eff85ebe394ae94df904f7a3ba14f7e16e487b AS base
+FROM python:3.11-slim@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     INFERENCE_PORT=8090

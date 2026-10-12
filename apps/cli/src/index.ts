@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync, accessSync, constants as fsConstants } from "node:fs";
 import { join, resolve } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { createConnection } from "node:net";
 import { totalmem } from "node:os";
 
@@ -11,7 +12,7 @@ import { totalmem } from "node:os";
 import { evaluateProduction } from "../../../packages/security/src/index.js";
 import { releaseIdentity, assertReleaseCommit } from "../../../packages/core/src/index.js";
 
-const VERSION = "1.0.3";
+const VERSION = "1.1.1";
 const ROOT = process.cwd();
 
 function apiBase(): string {
@@ -150,7 +151,7 @@ async function doctor(): Promise<number> {
   for (const p of [8080, 8091, 3000]) {
     const free = await portFree(p);
     checks.push({
-      name: `port :${p}`, ok: true, detail: free ? "free" : "in use",
+      name: `port :${p}`, ok: free, detail: free ? "free" : "in use",
       fix: free ? "" : `Port ${p} busy — set PORT/MCP_PORT/CONSOLE_PORT or stop the holder`,
     });
   }
@@ -167,9 +168,9 @@ async function doctor(): Promise<number> {
   const imgDir = resolve(process.env["EVEX_IMAGES"] ?? "./images");
   const hasImg = existsSync(imgDir) && existsSync(join(imgDir, "ubuntu-desktop-v1.qcow2"));
   checks.push({
-    name: "images", ok: true,
-    detail: hasImg ? `base image present (${imgDir})` : `base image not staged (${imgDir}/ubuntu-desktop-v1.qcow2) — VMs boot from synthetic backend until staged`,
-    fix: "",
+    name: "images", ok: hasImg,
+    detail: hasImg ? `base image present (${imgDir})` : `no base image staged (${imgDir}/ubuntu-desktop-v1.qcow2) — real guests cannot boot; only the synthetic backend serves`,
+    fix: hasImg ? "" : "Stage a sealed base image (infra/vm-images/build.sh) or set EVEX_IMAGES",
   });
 
   let fail = 0;
@@ -291,6 +292,8 @@ async function doctorProduction(): Promise<number> {
     vmBackend: process.env["VM_BACKEND"],
     publicUrl: process.env["EVEX_PUBLIC_URL"],
     objectEndpoint: objUrl,
+    mode: "production",
+    filePrimaryAck: (process.env["EVEX_FILE_PRIMARY_ACK"] ?? "") === "1",
   });
   for (const f of findings) {
     out(`[${f.status.toUpperCase()}] ${f.name}: ${f.detail}`);
@@ -335,10 +338,15 @@ async function main(): Promise<number> {
         mkdirSync(join(dir, "images"), { recursive: true });
         const envPath = join(dir, ".env");
         if (!existsSync(envPath)) {
-          let tpl = "PORT=8080\nEVEX_AUTH_TOKEN=change-me\nDATA_DIR=./data\n";
+          // Generated credentials, never weak stand-ins: a fresh random
+          // bearer token is minted per init. Production still requires
+          // explicit review (see doctor --production).
+          const fresh = randomBytes(32).toString("hex");
+          let tpl = `PORT=8080\nEVEX_AUTH_TOKEN=${fresh}\nDATA_DIR=./data\n`;
           try {
-            tpl = readFileSync(join(ROOT, ".env.example"), "utf8");
-          } catch { /* keep default template */ }
+            const example = readFileSync(join(ROOT, ".env.example"), "utf8");
+            tpl = example.replace(/^EVEX_AUTH_TOKEN=.*$/m, `EVEX_AUTH_TOKEN=${fresh}`);
+          } catch { /* keep generated template */ }
           writeFileSync(envPath, tpl, "utf8");
         }
         out(`initialized at ${dir}`);

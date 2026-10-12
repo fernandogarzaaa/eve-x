@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { EveError, nowIso, sha1hex, uid } from "../../core/src/index.js";
+import { EveError, canonicalJson, nowIso, sha256hex, uid } from "../../core/src/index.js";
 import { TraceStep, type TraceStep as TraceStepType } from "../../protocol/src/index.js";
 
 // ── Deterministic timeline player: load JSONL, play/pause/step/seek/speed,
@@ -33,9 +33,16 @@ const StoredLineSchema = TraceStep.extend({
   digest: z.string().optional(),
 });
 
+/** Chain digest over the FULL canonical step body (not a reduced projection):
+ *  any mutation, deletion, or reorder evidence breaks the chain. */
 function digestFor(step: TraceStepType, prev: string): string {
-  return sha1hex(`${prev}.${JSON.stringify({ sid: step.step_id, seq: step.seq, out: step.outcome ?? "", after: step.screen_after ?? "" })}`);
+  const { prevDigest: _pd, digest: _dg, ...body } = step as TraceStepType & { prevDigest?: unknown; digest?: unknown };
+  void _pd;
+  void _dg;
+  return sha256hex(`${prev}.${canonicalJson(body)}`);
 }
+
+const GENESIS_DIGEST = "0".repeat(64);
 
 function isErrorStep(s: TraceStepType): boolean {
   const o = (s.outcome ?? "").toLowerCase();
@@ -61,7 +68,7 @@ export class TimelinePlayer {
     if (lines.length === 0) throw new EveError("EMPTY_TIMELINE", "JSONL timeline has no steps");
     const steps: TraceStepType[] = [];
     const digests: string[] = [];
-    let prev = "0".repeat(40);
+    let prev = GENESIS_DIGEST;
     for (const line of lines) {
       let raw: unknown;
       try {
@@ -69,16 +76,35 @@ export class TimelinePlayer {
       } catch {
         throw new EveError("BAD_JSONL", "Timeline JSONL contains an unparsable line");
       }
-      const step = TraceStep.parse((StoredLineSchema.parse(raw) as { step_id: string } & Record<string, unknown>) as unknown);
-      void StoredLineSchema;
+      const parsed = StoredLineSchema.parse(raw) as TraceStepType & { prevDigest?: string; digest?: string };
+      // Session identity first: a merged log is a session split, reported
+      // as such even though its chained digests also break. Digest
+      // verification follows for same-session lines.
+      if (steps.length > 0 && parsed.session_id !== steps[0]?.session_id) {
+        throw new EveError("SESSION_SPLIT", "Timeline mixes session_ids; fork instead of merging");
+      }
+      // Stored digests are EVIDENCE, not decoration: when a line carries a
+      // chained digest it must verify against the running chain AND the full
+      // canonical body. A forged/modified/deleted/duplicated step breaks here.
+      if (parsed.digest !== undefined || parsed.prevDigest !== undefined) {
+        if (typeof parsed.digest !== "string" || typeof parsed.prevDigest !== "string") {
+          throw new EveError("CHAIN_BROKEN", "Timeline carries a partial digest record — refusing to replay");
+        }
+        if (parsed.prevDigest !== prev) {
+          throw new EveError("CHAIN_BROKEN", `Timeline prevDigest mismatch at seq ${String(parsed.seq)} — reorder/deletion suspected`);
+        }
+        const recomputed = digestFor(parsed, prev);
+        if (recomputed !== parsed.digest) {
+          throw new EveError("CHAIN_BROKEN", `Timeline digest mismatch at seq ${String(parsed.seq)} — step was mutated`);
+        }
+        prev = parsed.digest;
+      }
+      const step = TraceStep.parse(parsed as unknown);
       if (steps.length > 0 && step.seq !== steps.length) {
         throw new EveError("SEQ_GAP", `Timeline seq gap: expected ${steps.length}, got ${step.seq}`);
       }
-      if (steps.length > 0 && step.session_id !== steps[0]?.session_id) {
-        throw new EveError("SESSION_SPLIT", "Timeline mixes session_ids; fork instead of merging");
-      }
-      const d = digestFor(step, prev);
-      prev = d;
+      const d = typeof parsed.digest === "string" ? parsed.digest : digestFor(step, prev);
+      if (typeof parsed.digest !== "string") prev = d;
       steps.push(step);
       digests.push(d);
     }
@@ -182,7 +208,7 @@ export class TimelinePlayer {
     const s = this.steps[this.cursor] as TraceStepType;
     const d = this.digests[this.cursor] as string;
     return SnapshotSchema.parse({
-      snapshotId: `snap-${sha1hex(`${s.session_id}:${s.seq}:${d}`).slice(0, 12)}`,
+      snapshotId: `snap-${sha256hex(`${s.session_id}:${s.seq}:${d}`).slice(0, 12)}`,
       sessionId: s.session_id,
       seq: s.seq,
       stepId: s.step_id,
@@ -193,7 +219,9 @@ export class TimelinePlayer {
 
   /**
    * Branch: fork a child timeline starting at `atSeq` with a new session id.
-   * Child steps keep parent provenance; child session prefix diverges.
+   * The copied prefix KEEPS the parent session_id — it is parent history,
+   * and rewriting it would forge provenance. The child diverges only in the
+   * link record (childSessionId) and in steps appended after the fork.
    */
   fork(newSessionIdInput: unknown, atSeqInput: unknown): { child: TimelinePlayer; link: ProvenanceLink } {
     const newSessionId = z.string().min(1).parse(newSessionIdInput);
@@ -203,7 +231,7 @@ export class TimelinePlayer {
     const forkStep = this.steps[atSeq] as TraceStepType;
     const forkDigest = this.digests[atSeq] as string;
     const child = new TimelinePlayer();
-    child.steps = this.steps.slice(0, atSeq + 1).map((s, i) => (i === atSeq ? { ...s } : { ...s }));
+    child.steps = this.steps.slice(0, atSeq + 1).map((s) => ({ ...s }));
     child.digests = this.digests.slice(0, atSeq + 1);
     child.cursor = atSeq;
     child.status = "paused";
@@ -217,7 +245,6 @@ export class TimelinePlayer {
     });
     child.branchHistory = [...this.branchHistory, link];
     this.branchHistory.push(link);
-    void newSessionId;
     return { child, link };
   }
 

@@ -13,21 +13,24 @@ scores the experience with statistical rigor plus blinded human judgment.
    backend, so the platform runs against the synthetic/process fallback —
    guest isolation there is *not* VM-grade. Do not treat dev-host runs as
    isolation evidence.
-2. **Drives computer use** — the agent observes screenshots with detected UI
-   regions and emits `ActionIR` actions (click, type, drag, …) that the
-   verifier grounds before execution (see `COMPUTER_USE.md`).
-3. **Records everything** — an append-only trace ledger captures percepts,
-   candidate actions, grounding, verification, and outcomes (see `ARCHITECTURE.md`).
-4. **Validates the experience** — seeded population studies, blinded human
-   review, and benchmark gates decide ship / no-ship (see `HUMAN_VALIDATION.md`,
-   `BENCHMARKS.md`).
+2. **Drives computer use** — the worker orchestrates real sessions through
+   the control plane: fresh screenshot in, inference suggestion, server-side
+   grounding/safety/stale checks, actuation, post-action re-observation
+   (see `COMPUTER_USE.md`). The worker synthesizes nothing.
+3. **Records everything** — an append-only SHA-256-chained trace ledger
+   captures percepts, candidate actions, grounding, verification, and
+   outcomes (see `ARCHITECTURE.md`).
+4. **Validates the experience** — evidence-required task validation, blinded
+   human review, real-execution benchmarks with verdict counts and Wilson
+   intervals, and promotion gates decide ship / no-ship (see
+   `HUMAN_VALIDATION.md`, `BENCHMARKS.md`).
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `packages/protocol` | Canonical zod schemas: ActionIR, percepts, traces, VM/task specs |
-| `packages/core` | IDs, deterministic PRNG, audited state machines, error type |
+| `packages/protocol` | Canonical zod schemas: ActionIR, percepts, traces, VM/task specs, validation verdicts |
+| `packages/core` | IDs, audited state machines, SHA-256 chain digests, release identity, error type |
 | `packages/mcp-shared` | Shared MCP tool schemas + control-plane HTTP client |
 | `packages/skills` | Agent-skill installer / verifier |
 | `packages/model-registry` | Versioned model records, gated promotion |
@@ -52,11 +55,14 @@ npm run typecheck
 # 2. Run the test suites (pretest compiles; never runs stale dist)
 npm test
 
-# 3. Reproducible local deploy
-cp .env.example .env   # set EVEX_AUTH_TOKEN, POSTGRES_PASSWORD
+# 3. ML self-tests (stdlib-only; stub-torch load paths + live HTTP checks)
+npm run ml:test
+
+# 4. Reproducible local deploy
+cp .env.example .env   # SET EVEX_AUTH_TOKEN (>=32 random chars) + POSTGRES_PASSWORD (both required)
 docker compose -f infra/deployment/docker-compose.yml up --build
 
-# 4. ML smoke test (CPU-only, <60s, no dataset needed)
+# 5. ML smoke test (CPU-only, <60s, no dataset needed)
 python ml/training/train.py --smoke --out out/smoke
 python --version  # sanity: scripts target stock Python 3.10+
 ```
@@ -88,7 +94,7 @@ Release story: `CHANGELOG.md` + `release-manifest.json` +
 - **Agent Skills:** install/verify for claude-code, codex, opencode,
   cursor, windsurf; `integrations/` ships `mcp.json` for seven platforms;
   skill scripts drive observe/act/replay. See `AGENT_SKILL.md`.
-- **MCP:** 21 tools over stdio + StreamableHTTP (`mcp/1`). See `MCP.md`.
+- **MCP:** 21 tools over stdio + dual-era StreamableHTTP (`evex-tools/1` tool contract; 2026-07-28 modern + 2025-era legacy). See `MCP.md`.
 - **EVE-CUA:** observe → regions → point→region grounding → verifier →
   act → re-observe, with stale-409s and epoch fencing. See
   `COMPUTER_USE.md`, `MODEL.md`, `TRAINING.md`.

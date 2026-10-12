@@ -1,6 +1,18 @@
 # MCP (Model Context Protocol Surface)
 
-Version: `mcp/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`).
+Three versions, independent by design:
+
+| Version | Meaning | Value / source |
+|---|---|---|
+| Tool contract | OUR tool surface: names + JSON shapes of the 21 `eve_*` tools | `evex-tools/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`) |
+| Wire protocol | Negotiated per connection | `2026-07-28` modern (stateless) or 2025-era legacy (sessionful); observable via `x-evex-protocol-era` |
+| SDK | Pinned implementation | `@modelcontextprotocol/server` + `/node` v2 lines (runtime), `/client` v2 (tests); zod v4 |
+
+History: 1.1.0 shipped SDK 1.31 (2025-era only) because no v2 line
+existed upstream at the time. The v2 line is real (verified against the
+registry + official migration docs); 1.1.1 migrates deliberately (see
+ADR-15). The old `mcp/1` tool-contract label was renamed to
+`evex-tools/1` so it can never be mistaken for a protocol version.
 
 ## Tools
 
@@ -21,11 +33,11 @@ Version: `mcp/1` (`MCP_TOOL_VERSION` in `packages/mcp-shared`).
 | `eve_human_release` | sessionId | `POST /v1/human/release` |
 | `eve_task_start` | goal (≤2000), persona, seed | `POST /v1/tasks/start` |
 | `eve_task_status` | taskId | `GET /v1/tasks/:id/status` |
-| `eve_task_validate` | taskId | `POST /v1/tasks/:id/validate` |
+| `eve_task_validate` | taskId, evidence bundle | `POST /v1/tasks/:id/validate` (evidence-required; verdicts PASS/FAILED/INCONCLUSIVE/INVALID_EVIDENCE) |
 | `eve_trace_get` | sessionId | `GET /v1/trace/:sessionId` |
 | `eve_replay` | sessionId, seed | `POST /v1/replay/:sessionId` |
 | `eve_report` | sessionId | `GET /v1/report/:sessionId` |
-| `eve_benchmark` | name, size | `POST /v1/benchmarks` |
+| `eve_benchmark` | name, size, agent?, testOnly? | `POST /v1/benchmarks` (real execution; mock requires testOnly) |
 | `eve_model_status` | (none) | `GET /v1/models/status` |
 
 All inputs are strict zod schemas in `TOOL_SCHEMAS`; unknown fields, wrong
@@ -38,15 +50,25 @@ exactly one definition.
 
 ## Transport & auth
 
-- Default transport is `stdio`: `node dist/apps/mcp/src/index.js`. Stdio
-  tools authenticate to the control plane with the server-side
-  `EVEX_AUTH_TOKEN`.
-- `http` argv (`node …/index.js http`, `MCP_PORT` override, default `:8091`)
-  serves StreamableHTTP at `/mcp` plus a public `GET /health` probe.
+- Default transport is `stdio` (`serveStdio` serves both eras).
+- `http` argv serves dual-era StreamableHTTP at `/mcp` plus a public `GET
+  /health` probe. POST routing: modern envelopes (2026-07-28 claims) go to a
+  per-request stateless server (`createMcpHandler`, `legacy: 'reject'`);
+  everything else keeps the explicit sessionful legacy path (stable session
+  ids via `mcp-session-id`, `DELETE /mcp` closes, unknown sessions 400).
+  GET carries legacy SSE streams. Every served response carries
+  `x-evex-protocol-era: modern|legacy`.
+- Argument validation is server-side-ours, always: the SDK advertises
+  input schemas but does not validate tool calls, so every handler parses
+  with the strict zod `TOOL_SCHEMAS` first (`invalid-params` results
+  before any control-plane fetch).
 - HTTP `/mcp` requires an `Authorization` bearer matching
   `EVEX_MCP_TOKEN ?? EVEX_AUTH_TOKEN` whenever either is set (401
-  otherwise). When neither is set the endpoint stays open for single-user
-  local use and stamps `x-evex-dev: 1` on responses.
+  otherwise) — checked BEFORE era routing, and outside development mode
+  even when no token is configured. When neither is set the endpoint stays
+  open for single-user local use and stamps `x-evex-dev: 1` on responses.
+- `/mcp` has a per-caller fixed-window rate limit (`EVEX_MCP_RATE_LIMIT`,
+  default 600/min; 429 + Retry-After; `/health` never limited).
 - The CALLER's bearer is forwarded to the control plane on every tool call;
   only when the caller sent none is `EVEX_AUTH_TOKEN` used as a fallback.
   Token values are never logged.
@@ -80,9 +102,11 @@ Fetch-based, no SDK:
   `WS /v1/stream/:sessionId`. `act()` sends the `idempotency-key` header;
   ids are charset-validated before sending.
 
-## Versioning (ADR-10)
+## Versioning (ADR-10, superseded in part by ADR-15)
 
-Tool schemas are additive within `mcp/1`: new optional fields are allowed,
-renames and semantic changes require `mcp/2` with a compat-tested migration.
-`ModelRecord.compat.mcpVersion` records which version each model was
-validated against, and `checkCompat` refuses mismatches with reasons.
+Tool schemas are additive within `evex-tools/1`: new optional fields are
+allowed, renames and semantic changes require `evex-tools/2` with a
+compat-tested migration. `ModelRecord.compat.mcpVersion` records which
+tool-contract version each model was validated against, and `checkCompat`
+refuses mismatches with reasons. (ADR-10's `mcp/1` label is renamed, not
+its additive-compatibility rule.)

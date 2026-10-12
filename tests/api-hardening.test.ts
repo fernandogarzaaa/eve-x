@@ -229,11 +229,39 @@ describe("api hardening", () => {
     assert.equal(taskCross.status, 403);
   });
 
+  it("production mode refuses synthetic dev-backend perception/actuation", async () => {
+    const sess = await createSession(MASTER, "prod dev refusal");
+    const prevMode = process.env["EVEX_MODE"];
+    try {
+      process.env["EVEX_MODE"] = "production";
+      const o = await api("GET", `/v1/computer/${sess}/observe`, MASTER);
+      assert.equal(o.status, 503);
+      assert.equal(o.json.error, "synthetic_backend_refused");
+      const a = await api("POST", `/v1/computer/${sess}/act`, MASTER, { type: "wait", ms: 5, confidence: 0.5 });
+      assert.equal(a.status, 503);
+      assert.equal(a.json.error, "synthetic_backend_refused");
+      // No trajectory advance on refusal.
+      const tr = await api("GET", `/v1/trace/${sess}`, MASTER);
+      assert.equal((tr.json.steps as unknown[]).length, 1, "only the session-create step may exist");
+    } finally {
+      if (prevMode === undefined) delete process.env["EVEX_MODE"];
+      else process.env["EVEX_MODE"] = prevMode;
+    }
+  });
   it("judgment duplicates on (stepId, reviewer) return 409", async () => {
+    // Judgments bind to real, owned steps: unknown steps fail closed (404).
+    const sess = await createSession(MASTER, "judgment dedupe case");
+    const act = await api("POST", `/v1/computer/${sess}/act`, MASTER, { type: "wait", ms: 10, confidence: 0.9 });
+    assert.equal(act.status, 200);
+    const tr = await api("GET", `/v1/trace/${sess}`, MASTER);
+    const steps = tr.json.steps as Array<{ step_id: string }>;
+    assert.ok(steps.length > 0);
     const body = {
-      stepId: "step-dedupe-1", reviewer: "r1",
+      stepId: String(steps[0]?.step_id), sessionId: sess, reviewer: "r1",
       reasonable: true, targetCorrect: true, understandable: true, expected: true, recoveryOk: true,
     };
+    const unknown = await api("POST", "/v1/judgments", MASTER, { ...body, stepId: "step-ghost-xyz" });
+    assert.equal(unknown.status, 404);
     const first = await api("POST", "/v1/judgments", MASTER, body);
     assert.equal(first.status, 201);
     const dup = await api("POST", "/v1/judgments", MASTER, body);
@@ -273,15 +301,33 @@ describe("api hardening", () => {
 
   it("persisted docs survive a restart (clear + hydrate)", async () => {
     const sess = await createSession(MASTER, "restart case");
+    const act = await api("POST", `/v1/computer/${sess}/act`, MASTER, { type: "wait", ms: 10, confidence: 0.9 });
+    assert.equal(act.status, 200);
+    const tr = await api("GET", `/v1/trace/${sess}`, MASTER);
+    const steps = tr.json.steps as Array<{ step_id: string }>;
+    assert.ok(steps.length > 0);
+    const stepId = String(steps[0]?.step_id);
+    const first = await api("POST", "/v1/judgments", MASTER, {
+      stepId, sessionId: sess, reviewer: "r-restart",
+      reasonable: true, targetCorrect: true, understandable: true, expected: true, recoveryOk: true,
+    });
+    assert.equal(first.status, 201);
     __clearMemory();
     const counts = hydrateFromDisk();
     assert.ok(counts.sessions >= 1, `expected hydrated sessions, got ${JSON.stringify(counts)}`);
     const got = await api("GET", `/v1/sessions/${sess}`, MASTER);
     assert.equal(got.status, 200);
-    assert.equal(got.json.status, "RUNNING");
+    // Recovery honesty: in-flight RUNNING is demoted to PAUSED on restart —
+    // execution is never resurrected without proof. Explicit resume re-arms.
+    assert.equal(got.json.status, "PAUSED");
+    const badResume = await api("POST", `/v1/sessions/${sess}/resume`, MASTER, {});
+    assert.equal(badResume.status, 200);
+    assert.equal(badResume.json.status, "RUNNING");
+    const resumeAgain = await api("POST", `/v1/sessions/${sess}/resume`, MASTER, {});
+    assert.equal(resumeAgain.status, 409);
     // Dedupe state also survives: the earlier judgment is still a duplicate.
     const dup = await api("POST", "/v1/judgments", MASTER, {
-      stepId: "step-dedupe-1", reviewer: "r1",
+      stepId, sessionId: sess, reviewer: "r-restart",
       reasonable: true, targetCorrect: true, understandable: true, expected: true, recoveryOk: true,
     });
     assert.equal(dup.status, 409);

@@ -1,12 +1,36 @@
-"""EVE-X benchmark evaluation runner.
+"""EVE-X benchmark evaluation runner (eval-v2 scoring).
 
 Loads a benchmark registry JSON (task list + split assignments) plus a model
-predictions JSONL file, computes grounding accuracy / task success / recovery
-rate strictly from those inputs, and writes an artifact JSON with digests.
+predictions JSONL file, scores them, and writes an artifact JSON with digests.
 
-It never fabricates numbers: missing predictions are counted as failures and
-reported, never imputed; unknown task ids in predictions are reported and
-ignored for scoring.
+Scoring rules (scientific integrity over point estimates):
+
+* DECISION-POINT GROUNDING: credit is computed for the ACTED prediction
+  only — never best-bbox across arbitrary predictions. A task with a single
+  prediction scores that lone decision. A task with several predictions must
+  mark exactly one with "acted": true; otherwise grounding is INDETERMINATE
+  (reported, excluded from the grounding denominator, never credited).
+* VERIFIED SUCCESS: a task counts as success only for success:true backed by
+  verified:true (independent server-side verification). success:true with
+  verified:false is CONTRADICTED (failure). success:true with no
+  verification evidence is UNVERIFIED (inconclusive — uncertainty is never
+  collapsed into success or silently discarded).
+* TEMPORAL RECOVERY: a failure at step i counts as recovered only with a
+  later verified success AND a recovered:true marker LINKING them
+  (first_fail < marker <= first later success). Floating markers do not
+  link (failure -> corrective behavior -> later success, evidentially linked).
+* TWO SUCCESS RATES, both labeled: success_rate over ALL samples (missing
+  counts as failure — the headline) and scored_success_rate over scored
+  tasks only. Missing tasks can never inflate the headline.
+* INCONCLUSIVE is a UNION of task ids (missing/indeterminate/unverified):
+  one task counts once, never twice. Tasks without a bbox expectation
+  record grounded:null (not True) so per-task averaging cannot inflate.
+* MISSING/INVALID/UNKNOWN: tasks with no predictions are inconclusive
+  (missing, reported — not scored as failures); malformed JSONL lines are
+  invalid (counted, attributed when a task_id is recoverable); predictions
+  for unknown task ids are reported and ignored for scoring, never imputed.
+
+It never fabricates numbers: every metric is computed from the inputs above.
 
 Usage:
     python ml/evaluation/eval.py --registry benchmarks/registry.json \\
@@ -17,7 +41,10 @@ Registry format:
       "goal": ..., "expect": {"success": true, "bbox": [x1,y1,x2,y2]}}]}
 Predictions format (JSONL, one per line):
     {"task_id": ..., "step_id": ..., "bbox": [x1,y1,x2,y2] | null,
-     "success": true|false, "recovered": true|false, "step": n, "total_steps": m}
+     "acted": true, "success": true|false, "verified": true|false|null,
+     "recovered": true|false, "step": n, "total_steps": m}
+Only task_id is required; acted/verified/step default to null and are
+treated as absent evidence (see rules above).
 """
 from __future__ import annotations
 
@@ -27,6 +54,8 @@ import json
 import os
 import sys
 import time
+
+SCORING_RULES = "eval-v2/decision-point+verified-success+temporal-recovery"
 
 
 def sha256_file(path: str) -> str:
@@ -53,6 +82,13 @@ def iou(a: list, b: list) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def step_no(p: dict) -> float:
+    try:
+        return float(p.get("step", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description="EVE-X benchmark eval runner")
     ap.add_argument("--registry", required=True)
@@ -74,6 +110,7 @@ def main(argv: list | None = None) -> int:
 
     preds_by_task: dict[str, list[dict]] = {}
     pred_lines = 0
+    invalid_lines = 0
     with open(args.predictions, "r", encoding="utf-8") as f:
         for ln, line in enumerate(f, 1):
             line = line.strip()
@@ -83,17 +120,26 @@ def main(argv: list | None = None) -> int:
             try:
                 p = json.loads(line)
             except json.JSONDecodeError:
-                print(f"WARN predictions line {ln}: invalid JSON, counted as failure input",
+                invalid_lines += 1
+                print(f"WARN predictions line {ln}: invalid JSON, counted as invalid input",
                       file=sys.stderr)
                 continue
             if isinstance(p, dict) and p.get("task_id") is not None:
                 preds_by_task.setdefault(str(p["task_id"]), []).append(p)
+            else:
+                invalid_lines += 1
+                print(f"WARN predictions line {ln}: no task_id, counted as invalid input",
+                      file=sys.stderr)
 
     known = {str(t.get("task_id")) for t in tasks}
     unknown_ids = sorted(set(preds_by_task) - known)
     ground_hits = 0
     ground_total = 0
+    indeterminate = 0
     success = 0
+    scored = 0
+    unverified_successes = 0
+    contradicted = 0
     recovery_ok = 0
     recovery_total = 0
     missing = 0
@@ -107,45 +153,101 @@ def main(argv: list | None = None) -> int:
             per_task.append({"task_id": tid, "status": "missing",
                              "success": False, "grounded": False})
             continue
-        # Grounding: best IoU over predicted bboxes vs expected bbox.
+        scored += 1
+        ordered = sorted(preds, key=step_no)
+        # Decision-point grounding: the acted prediction, or the lone
+        # prediction when unambiguous. Anything else is indeterminate.
+        acted = [p for p in ordered if p.get("acted") is True]
+        decision = None
+        det_status = "scored"
+        if len(acted) == 1:
+            decision = acted[0]
+        elif len(ordered) == 1 and not acted:
+            decision = ordered[0]
+        else:
+            det_status = "indeterminate"
+            indeterminate += 1
         exp_box = expect.get("bbox")
         best = 0.0
-        for p in preds:
-            if isinstance(p.get("bbox"), list) and isinstance(exp_box, list):
-                best = max(best, iou(p["bbox"], exp_box))
-        if isinstance(exp_box, list):
+        hit = False
+        if isinstance(exp_box, list) and decision is not None:
+            if isinstance(decision.get("bbox"), list):
+                best = iou(decision["bbox"], exp_box)
             ground_total += 1
             hit = best >= args.iou_threshold
             ground_hits += 1 if hit else 0
+        elif not isinstance(exp_box, list):
+            hit = None  # no bbox expectation: grounding not applicable (null, not True — averaging must skip)
+        # Verified success: success:true needs verified:true. Contradicted
+        # (verified:false) is failure; absent verification is inconclusive.
+        succ_flags = [p.get("success") is True for p in ordered]
+        ver_flags = [p.get("verified") for p in ordered]
+        verified_ok = any(s and v is True for s, v in zip(succ_flags, ver_flags))
+        contradicted_here = any(s and v is False for s, v in zip(succ_flags, ver_flags))
+        unverified_here = any(succ_flags) and not verified_ok and not contradicted_here
+        if verified_ok:
+            ok = True
+            success += 1
+        elif contradicted_here:
+            ok = False
+            contradicted += 1
+        elif unverified_here:
+            ok = False
+            unverified_successes += 1
         else:
-            hit = True  # no bbox expectation: grounding not applicable, not counted
-        ok = any(p.get("success") is True for p in preds)
-        success += 1 if ok else 0
-        # Recovery: among tasks with an early failure flag that later succeed.
-        failed_first = any(p.get("success") is False for p in preds)
-        if failed_first:
+            ok = False
+        # Temporal recovery: a failure at step i, then a later verified
+        # success, with a recovered:true marker LINKING them (between the
+        # failure and the first later success). A floating marker elsewhere
+        # does not establish recovery.
+        fail_steps = [step_no(p) for p in ordered if p.get("success") is False]
+        succ_steps = [step_no(p) for p in ordered if p.get("success") is True and p.get("verified") is True]
+        rec_steps = [step_no(p) for p in ordered if p.get("recovered") is True]
+        if fail_steps:
             recovery_total += 1
-            rec = ok and any(p.get("recovered") is True for p in preds)
-            recovery_ok += 1 if rec else 0
-        per_task.append({"task_id": tid, "status": "scored", "success": ok,
+            first_fail = min(fail_steps)
+            later_succ = [s for s in succ_steps if s > first_fail]
+            linked = bool(later_succ) and any(first_fail < r <= min(later_succ) for r in rec_steps)
+            recovery_ok += 1 if linked else 0
+        status = det_status
+        if det_status == "scored" and unverified_here:
+            status = "unverified"
+        per_task.append({"task_id": tid, "status": status, "success": ok,
                          "grounded": hit, "best_iou": best,
                          "predictions": len(preds)})
 
     total = len(tasks)
+    # Union of non-scored task ids: a task that is both indeterminate AND
+    # unverified counts once (no double-counting of uncertainty).
+    inconclusive_tasks = sorted({p["task_id"] for p in per_task if p.get("status") != "scored"})
     artifact = {
         "benchmark": args.benchmark,
         "split": args.split,
         "samples": total,
+        "scoring_rules": SCORING_RULES,
         "metrics": {
             "grounding_accuracy": (ground_hits / ground_total) if ground_total else 0.0,
             "grounding_hits": ground_hits,
             "grounding_total": ground_total,
+            "grounding_basis": "task-decision",
+            "indeterminate_grounding": indeterminate,
+            # Two success rates, both labeled: scored-only (comparable runs)
+            # and over-all-samples (missing counts as failure). The headline
+            # is total_success_rate — scored-only inflates when hard tasks
+            # go missing.
             "success_rate": success / total if total else 0.0,
+            "scored_success_rate": success / scored if scored else 0.0,
             "successes": success,
+            "scored_total": scored,
+            "unverified_successes": unverified_successes,
+            "contradicted": contradicted,
+            "inconclusive": len(inconclusive_tasks),
+            "inconclusive_task_ids": inconclusive_tasks,
+            "missing_predictions": missing,
+            "invalid_lines": invalid_lines,
             "recovery_rate": (recovery_ok / recovery_total) if recovery_total else 0.0,
             "recovery_ok": recovery_ok,
             "recovery_total": recovery_total,
-            "missing_predictions": missing,
             "unknown_task_ids_ignored": unknown_ids,
         },
         "per_task": per_task,
@@ -166,8 +268,10 @@ def main(argv: list | None = None) -> int:
         json.dump(artifact, f, indent=2)
     m = artifact["metrics"]
     print(f"done benchmark={args.benchmark} split={args.split} n={total} "
-          f"success={m['success_rate']:.3f} grounding={m['grounding_accuracy']:.3f} "
-          f"recovery={m['recovery_rate']:.3f} missing={missing}")
+          f"success_total={m['success_rate']:.3f} success_scored={m['scored_success_rate']:.3f} "
+          f"grounding={m['grounding_accuracy']:.3f} "
+          f"recovery={m['recovery_rate']:.3f} missing={missing} "
+          f"inconclusive={m['inconclusive']} invalid={invalid_lines}")
     return 0
 
 
