@@ -8,6 +8,10 @@ updates:
     directory: /ml
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
+    ignore:
+      # torch comes from the PyTorch CPU index (--extra-index-url); Dependabot
+      # can't resolve those wheels, so torch is bumped by hand.
+      - dependency-name: "torch"
   - package-ecosystem: docker
     directories: ["/infra/docker", "/infra/qualification"]
     schedule: { interval: weekly }
