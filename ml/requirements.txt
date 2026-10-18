@@ -7,5 +7,5 @@
 # resolver. The extra index above still serves the CPU build (pip prefers the
 # `+cpu` local version when versions are otherwise equal).
 torch>=2.14.1,<3.0
-numpy>=2.5.3,<3.0
+numpy>=2.5.4,<3.0
 pillow>=12.3.0,<13.0
