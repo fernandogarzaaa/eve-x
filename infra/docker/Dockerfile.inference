@@ -4,7 +4,7 @@
 # ml/inference/server.py flags); dev compose opts into --allow-heuristic
 # explicitly (always degraded=true, never a trained model).
 # Build from the repo root: docker build -f infra/docker/Dockerfile.inference .
-FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS base
+FROM python:3.15-slim@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913 AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     INFERENCE_PORT=8090
